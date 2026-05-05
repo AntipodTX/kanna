@@ -116,7 +116,15 @@ export type ClientCommand =
       editor?: EditorOpenSettings
     }
   | { type: "chat.create"; projectId: string }
-  | { type: "chat.fork"; chatId: string }
+  | {
+      type: "chat.fork"
+      chatId: string
+      messageId?: string
+      model?: string
+      modelOptions?: ModelOptions
+      effort?: string
+      planMode?: boolean
+    }
   | { type: "chat.rename"; chatId: string; title: string }
   | { type: "chat.archive"; chatId: string }
   | { type: "chat.unarchive"; chatId: string }

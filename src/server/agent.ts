@@ -114,6 +114,8 @@ interface AgentCoordinatorArgs {
     planMode: boolean
     sessionToken: string | null
     forkSession: boolean
+    resumeSessionAt?: string
+    resetSession?: boolean
     onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
   }) => Promise<ClaudeSessionHandle>
 }
@@ -239,6 +241,21 @@ export function buildPromptText(content: string, attachments: ChatAttachment[]) 
     trimmed || "Please inspect the attached files.",
     attachmentHint,
   ].join("\n\n").trim()
+}
+
+function countUserPrompts(entries: TranscriptEntry[]) {
+  return entries.filter((entry) => entry.kind === "user_prompt").length
+}
+
+function findPreviousClaudeAssistantMessageId(entries: TranscriptEntry[], beforeIndex: number) {
+  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+    const entry = entries[index]
+    if (!entry?.messageId) continue
+    if (entry.kind === "assistant_text" || entry.kind === "tool_call") {
+      return entry.messageId
+    }
+  }
+  return null
 }
 
 function discardedToolResult(
@@ -561,6 +578,8 @@ async function startClaudeSession(args: {
   planMode: boolean
   sessionToken: string | null
   forkSession: boolean
+  resumeSessionAt?: string
+  resetSession?: boolean
   onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
 }): Promise<ClaudeSessionHandle> {
   const canUseTool: CanUseTool = async (toolName, input, options) => {
@@ -627,6 +646,7 @@ async function startClaudeSession(args: {
       model: args.model,
       effort: args.effort as "low" | "medium" | "high" | "max" | undefined,
       resume: args.sessionToken ?? undefined,
+      resumeSessionAt: args.resumeSessionAt,
       forkSession: args.forkSession,
       permissionMode: args.planMode ? "plan" : "acceptEdits",
       canUseTool,
@@ -846,6 +866,10 @@ export class AgentCoordinator {
     planMode: boolean
     appendUserPrompt: boolean
     steered?: boolean
+    sessionToken?: string | null
+    forkSession?: boolean
+    resumeSessionAt?: string
+    resetSession?: boolean
     profile?: SendToStartingProfile | null
   }) {
     logSendToStartingProfile(args.profile, "start_turn.begin", {
@@ -948,8 +972,10 @@ export class AgentCoordinator {
         model: args.model,
         effort: args.effort,
         planMode: args.planMode,
-        sessionToken: chat.pendingForkSessionToken ?? chat.sessionToken,
-        forkSession: Boolean(chat.pendingForkSessionToken),
+        sessionToken: args.sessionToken !== undefined ? args.sessionToken : (chat.pendingForkSessionToken ?? chat.sessionToken),
+        forkSession: args.forkSession ?? Boolean(chat.pendingForkSessionToken),
+        resumeSessionAt: args.resumeSessionAt,
+        resetSession: args.resetSession,
         onToolRequest,
       })
       logSendToStartingProfile(args.profile, "start_turn.provider_boot.ready", {
@@ -968,7 +994,7 @@ export class AgentCoordinator {
         cwd: project.localPath,
         model: args.model,
         serviceTier: args.serviceTier,
-        sessionToken: chat.sessionToken,
+        sessionToken: args.sessionToken !== undefined ? args.sessionToken : chat.sessionToken,
         pendingForkSessionToken: chat.pendingForkSessionToken,
       })
       if (chat.pendingForkSessionToken && sessionToken) {
@@ -1077,6 +1103,8 @@ export class AgentCoordinator {
     planMode: boolean
     sessionToken: string | null
     forkSession: boolean
+    resumeSessionAt?: string
+    resetSession?: boolean
     onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
   }): Promise<HarnessTurn> {
     let session = this.claudeSessions.get(args.chatId)
@@ -1094,6 +1122,8 @@ export class AgentCoordinator {
         planMode: args.planMode,
         sessionToken: args.sessionToken,
         forkSession: args.forkSession,
+        resumeSessionAt: args.resumeSessionAt,
+        resetSession: args.resetSession,
         onToolRequest: args.onToolRequest,
       })
       this.refreshClaudeModelCatalog(started)
@@ -1246,7 +1276,16 @@ export class AgentCoordinator {
     await this.store.removeQueuedMessage(command.chatId, command.queuedMessageId)
   }
 
-  async forkChat(chatId: string) {
+  async forkChat(commandOrChatId: string | Extract<ClientCommand, { type: "chat.fork" }>) {
+    const command = typeof commandOrChatId === "string"
+      ? { type: "chat.fork" as const, chatId: commandOrChatId }
+      : commandOrChatId
+
+    if (command.messageId) {
+      return await this.forkChatAtUserPrompt(command)
+    }
+
+    const chatId = command.chatId
     const chat = this.store.requireChat(chatId)
     if (this.activeTurns.has(chatId) || this.drainingStreams.has(chatId)) {
       throw new Error("Chat must be idle before forking")
@@ -1260,6 +1299,109 @@ export class AgentCoordinator {
 
     const forked = await this.store.forkChat(chatId)
     this.analytics.track("chat_created")
+    return { chatId: forked.id }
+  }
+
+  private async forkChatAtUserPrompt(command: Extract<ClientCommand, { type: "chat.fork" }>) {
+    if (this.activeTurns.has(command.chatId) || this.drainingStreams.has(command.chatId)) {
+      throw new Error("Chat must be idle before forking history")
+    }
+
+    const chat = this.store.requireChat(command.chatId)
+    if (!chat.provider) {
+      throw new Error("Chat has no provider")
+    }
+    const project = this.store.getProject(chat.projectId)
+    if (!project) {
+      throw new Error("Project not found")
+    }
+
+    const messages = this.store.getMessages(command.chatId)
+    const targetIndex = messages.findIndex((entry) => entry._id === command.messageId)
+    const target = messages[targetIndex]
+    if (!target || target.kind !== "user_prompt") {
+      throw new Error("User message not found")
+    }
+
+    const prefix = messages.slice(0, targetIndex)
+    const affectedTurns = countUserPrompts(messages.slice(targetIndex))
+    if (affectedTurns < 1) {
+      throw new Error("No chat turns found to fork")
+    }
+
+    let sessionToken: string | null | undefined
+    let forkSession: boolean | undefined
+    let resumeSessionAt: string | undefined
+    let resetSession: boolean | undefined
+    const sourceSessionToken = chat.sessionToken ?? chat.pendingForkSessionToken ?? null
+
+    if (chat.provider === "codex") {
+      if (!sourceSessionToken) {
+        throw new Error("Chat has no Codex session to fork")
+      }
+    } else {
+      const hasPriorPrompt = countUserPrompts(prefix) > 0
+      const previousAssistantMessageId = findPreviousClaudeAssistantMessageId(messages, targetIndex)
+      if (previousAssistantMessageId && sourceSessionToken) {
+        sessionToken = sourceSessionToken
+        forkSession = true
+        resumeSessionAt = previousAssistantMessageId
+        resetSession = true
+      } else {
+        if (hasPriorPrompt) {
+          throw new Error("Chat has no Claude resume point before this message")
+        }
+        sessionToken = null
+        forkSession = false
+        resetSession = true
+      }
+    }
+
+    const settings = this.getProviderSettings(chat.provider, command)
+    const forked = await this.store.forkChat(command.chatId, {
+      transcriptEntries: prefix,
+      pendingForkSessionToken: null,
+    })
+    this.analytics.track("chat_created")
+
+    if (chat.provider === "codex") {
+      sessionToken = await this.codexManager.startSession({
+        chatId: forked.id,
+        cwd: project.localPath,
+        model: settings.model,
+        serviceTier: settings.serviceTier,
+        sessionToken: null,
+        pendingForkSessionToken: sourceSessionToken,
+      }) ?? null
+      if (!sessionToken) {
+        throw new Error("Codex did not return a forked session")
+      }
+      await this.store.setSessionToken(forked.id, sessionToken)
+      await this.codexManager.rollbackThread({
+        chatId: forked.id,
+        cwd: project.localPath,
+        threadId: sessionToken,
+        numTurns: affectedTurns,
+      })
+    }
+
+    this.analytics.track("message_sent")
+    await this.startTurnForChat({
+      chatId: forked.id,
+      provider: chat.provider,
+      content: target.content,
+      attachments: target.attachments ?? [],
+      model: settings.model,
+      effort: settings.effort,
+      serviceTier: settings.serviceTier,
+      planMode: settings.planMode,
+      appendUserPrompt: true,
+      sessionToken,
+      forkSession,
+      resumeSessionAt,
+      resetSession,
+    })
+
     return { chatId: forked.id }
   }
 

@@ -44,6 +44,21 @@ export {
   shouldAutoFollowTranscriptResize,
 } from "./utils"
 
+export function resolveTranscriptEditUserPromptControls(args: {
+  isProcessing: boolean
+  isDraining: boolean
+  handleEditUserPrompt: KannaState["handleEditUserPrompt"]
+  handleForkUserPrompt: KannaState["handleForkUserPrompt"]
+}) {
+  const isDisabled = args.isProcessing || args.isDraining
+  return {
+    onEditUserPrompt: args.handleEditUserPrompt,
+    isEditUserPromptDisabled: isDisabled,
+    onForkUserPrompt: args.handleForkUserPrompt,
+    isForkUserPromptDisabled: isDisabled,
+  }
+}
+
 function useEmptyStateTyping(showEmptyState: boolean, activeChatId: string | null) {
   const [typedEmptyStateText, setTypedEmptyStateText] = useState("")
   const [isEmptyStateTypingComplete, setIsEmptyStateTypingComplete] = useState(false)
@@ -906,6 +921,13 @@ export function ChatPage() {
     isMobileRightSidebarOverlay,
   ])
 
+  const transcriptEditUserPromptControls = resolveTranscriptEditUserPromptControls({
+    isProcessing: state.isProcessing,
+    isDraining: state.isDraining,
+    handleEditUserPrompt: state.handleEditUserPrompt,
+    handleForkUserPrompt: state.handleForkUserPrompt,
+  })
+
   const chatCard = (
     <Card
       ref={chatCardRef}
@@ -967,6 +989,10 @@ export function ChatPage() {
           platform={state.localProjects?.machine.platform}
           onAskUserQuestionSubmit={state.handleAskUserQuestion}
           onExitPlanModeConfirm={state.handleExitPlanMode}
+          onEditUserPrompt={transcriptEditUserPromptControls.onEditUserPrompt}
+          isEditUserPromptDisabled={transcriptEditUserPromptControls.isEditUserPromptDisabled}
+          onForkUserPrompt={transcriptEditUserPromptControls.onForkUserPrompt}
+          isForkUserPromptDisabled={transcriptEditUserPromptControls.isForkUserPromptDisabled}
           showScrollButton={showScrollToBottom && state.messages.length > 0}
           onIsAtEndChange={onIsAtEndChange}
           scrollToBottom={() => scrollToTranscriptEnd(true)}

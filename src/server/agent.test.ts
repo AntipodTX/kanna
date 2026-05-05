@@ -208,6 +208,287 @@ describe("attachment prompt helpers", () => {
 })
 
 describe("AgentCoordinator codex integration", () => {
+  test("forks a Codex chat from the selected user prompt into a new visible chat", async () => {
+    const startSessionCalls: Array<{
+      chatId: string
+      cwd: string
+      model: string
+      serviceTier?: "fast"
+      sessionToken: string | null
+      pendingForkSessionToken?: string | null
+    }> = []
+    const rollbackCalls: Array<{ chatId?: string; cwd: string; threadId: string; numTurns: number }> = []
+    const startedTurns: string[] = []
+    const fakeCodexManager = {
+      async startSession(args: {
+        chatId: string
+        cwd: string
+        model: string
+        serviceTier?: "fast"
+        sessionToken: string | null
+        pendingForkSessionToken?: string | null
+      }) {
+        startSessionCalls.push(args)
+        return args.pendingForkSessionToken ? "thread-fork-1" : undefined
+      },
+      async rollbackThread(args: { chatId?: string; cwd: string; threadId: string; numTurns: number }) {
+        rollbackCalls.push(args)
+      },
+      async startTurn(args: { content: string }): Promise<HarnessTurn> {
+        startedTurns.push(args.content)
+        async function* stream() {
+          yield {
+            type: "transcript" as const,
+            entry: timestamped({
+              kind: "result",
+              subtype: "success",
+              isError: false,
+              durationMs: 0,
+              result: "done",
+            }),
+          }
+        }
+
+        return {
+          provider: "codex",
+          stream: stream(),
+          interrupt: async () => {},
+          close: () => {},
+        }
+      },
+    }
+    const store = createForkableFakeStore("codex", {
+      title: "Debug Session",
+      sessionToken: "thread-1",
+    })
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "second task" })
+    const thirdPrompt = timestamped({ kind: "user_prompt", content: "third task" })
+    store.setMessages("chat-1", [
+      firstPrompt,
+      timestamped({ kind: "assistant_text", text: "first answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      thirdPrompt,
+      timestamped({ kind: "assistant_text", text: "third answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ])
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      codexManager: fakeCodexManager as never,
+      onStateChange: () => {},
+    })
+
+    const result = await coordinator.forkChat({
+      type: "chat.fork",
+      chatId: "chat-1",
+      messageId: secondPrompt._id,
+    })
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(result).toEqual({ chatId: "chat-fork-1" })
+    expect(store.requireChat("chat-fork-1")).toMatchObject({
+      title: "Debug Session (forked)",
+      provider: "codex",
+      sessionToken: "thread-fork-1",
+      pendingForkSessionToken: null,
+    })
+    expect(startSessionCalls).toEqual([
+      {
+        chatId: "chat-fork-1",
+        cwd: "/tmp/project",
+        model: "gpt-5.5",
+        serviceTier: undefined,
+        sessionToken: null,
+        pendingForkSessionToken: "thread-1",
+      },
+      {
+        chatId: "chat-fork-1",
+        cwd: "/tmp/project",
+        model: "gpt-5.5",
+        serviceTier: undefined,
+        sessionToken: "thread-fork-1",
+        pendingForkSessionToken: null,
+      },
+    ])
+    expect(rollbackCalls).toEqual([{
+      chatId: "chat-fork-1",
+      cwd: "/tmp/project",
+      threadId: "thread-fork-1",
+      numTurns: 2,
+    }])
+    expect(startedTurns).toEqual(["second task"])
+    expect(store.getMessages("chat-1").some((entry) => entry.kind === "user_prompt" && entry.content === "third task")).toBe(true)
+    expect(store.getMessages("chat-fork-1").map((entry) => entry.kind)).toEqual([
+      "user_prompt",
+      "assistant_text",
+      "result",
+      "user_prompt",
+      "result",
+    ])
+    expect(store.getMessages("chat-fork-1")[3]).toMatchObject({ kind: "user_prompt", content: "second task" })
+  })
+
+  test("forks a pending Codex fork from the selected user prompt using its pending source thread", async () => {
+    const startSessionCalls: Array<{
+      pendingForkSessionToken?: string | null
+    }> = []
+    const fakeCodexManager = {
+      async startSession(args: { pendingForkSessionToken?: string | null }) {
+        startSessionCalls.push(args)
+        return args.pendingForkSessionToken ? "thread-fork-2" : undefined
+      },
+      async rollbackThread() {},
+      async startTurn(): Promise<HarnessTurn> {
+        async function* stream() {
+          yield {
+            type: "transcript" as const,
+            entry: timestamped({
+              kind: "result",
+              subtype: "success",
+              isError: false,
+              durationMs: 0,
+              result: "done",
+            }),
+          }
+        }
+
+        return {
+          provider: "codex",
+          stream: stream(),
+          interrupt: async () => {},
+          close: () => {},
+        }
+      },
+    }
+    const store = createForkableFakeStore("codex", {
+      title: "Pending Fork",
+      sessionToken: null,
+      pendingForkSessionToken: "thread-pending",
+    })
+    const prompt = timestamped({ kind: "user_prompt", content: "first task" })
+    store.setMessages("chat-1", [
+      prompt,
+      timestamped({ kind: "assistant_text", text: "first answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ])
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      codexManager: fakeCodexManager as never,
+      onStateChange: () => {},
+    })
+
+    await coordinator.forkChat({
+      type: "chat.fork",
+      chatId: "chat-1",
+      messageId: prompt._id,
+    })
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(startSessionCalls[0]).toMatchObject({ pendingForkSessionToken: "thread-pending" })
+    expect(store.requireChat("chat-fork-1").sessionToken).toBe("thread-fork-2")
+  })
+
+  test("forks a Claude chat from the selected user prompt using the previous assistant resume point", async () => {
+    const events = new AsyncEventQueue<any>()
+    const startSessionCalls: Array<{
+      sessionToken: string | null
+      forkSession: boolean
+      resumeSessionAt?: string
+      resetSession?: boolean
+    }> = []
+    const prompts: string[] = []
+    const store = createForkableFakeStore("claude", {
+      title: "Claude Debug",
+      sessionToken: "claude-session-1",
+    })
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "second task" })
+    store.setMessages("chat-1", [
+      firstPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-1", text: "first answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ])
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          sessionToken: args.sessionToken,
+          forkSession: args.forkSession,
+          resumeSessionAt: args.resumeSessionAt,
+          resetSession: args.resetSession,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-fork-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    const result = await coordinator.forkChat({
+      type: "chat.fork",
+      chatId: "chat-1",
+      messageId: secondPrompt._id,
+    })
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(result).toEqual({ chatId: "chat-fork-1" })
+    expect(startSessionCalls).toEqual([{
+      sessionToken: "claude-session-1",
+      forkSession: true,
+      resumeSessionAt: "assistant-msg-1",
+      resetSession: true,
+    }])
+    expect(prompts).toEqual(["second task"])
+    expect(store.requireChat("chat-fork-1")).toMatchObject({
+      title: "Claude Debug (forked)",
+      provider: "claude",
+      sessionToken: "claude-fork-session",
+      pendingForkSessionToken: null,
+    })
+    expect(store.hiddenProviderSessions).toEqual([])
+    expect(store.getMessages("chat-1").length).toBe(6)
+    expect(store.getMessages("chat-fork-1").map((entry) => entry.kind)).toEqual([
+      "user_prompt",
+      "assistant_text",
+      "result",
+      "user_prompt",
+      "result",
+    ])
+    expect(store.getMessages("chat-fork-1")[3]).toMatchObject({ kind: "user_prompt", content: "second task" })
+
+    events.close()
+  })
+
   test("generates a chat title in the background on the first user message", async () => {
     let releaseTitle!: () => void
     const titleGate = new Promise<void>((resolve) => {
@@ -1588,6 +1869,7 @@ describe("AgentCoordinator claude integration", () => {
     expect(store.chat.pendingForkSessionToken).toBeNull()
     events.close()
   })
+
 })
 
 function createFakeStore() {
@@ -1636,6 +1918,9 @@ function createFakeStore() {
     async appendMessage(_chatId: string, entry: TranscriptEntry) {
       this.messages.push(entry)
     },
+    async replaceTranscript(_chatId: string, entries: TranscriptEntry[]) {
+      this.messages = [...entries]
+    },
     async recordTurnStarted() {},
     async recordTurnFinished() {
       this.turnFinishedCount += 1
@@ -1657,7 +1942,7 @@ function createFakeStore() {
       return {
         ...chat,
         id: "chat-fork-1",
-        title: "Fork: New Chat",
+        title: "New Chat (forked)",
         sessionToken: null,
         pendingForkSessionToken: chat.sessionToken ?? chat.pendingForkSessionToken,
       }
@@ -1684,6 +1969,109 @@ function createFakeStore() {
     },
     async removeQueuedMessage(_chatId: string, queuedMessageId: string) {
       this.queuedMessages = this.queuedMessages.filter((entry) => entry.id !== queuedMessageId)
+    },
+  }
+}
+
+function createForkableFakeStore(
+  provider: "claude" | "codex",
+  options: { title: string; sessionToken: string | null; pendingForkSessionToken?: string | null }
+) {
+  const sourceChat = {
+    id: "chat-1",
+    projectId: "project-1",
+    title: options.title,
+    provider,
+    planMode: false,
+    sessionToken: options.sessionToken,
+    pendingForkSessionToken: options.pendingForkSessionToken ?? null,
+  }
+  const project = {
+    id: "project-1",
+    localPath: "/tmp/project",
+  }
+  const chatsById = new Map<string, typeof sourceChat>([["chat-1", sourceChat]])
+  const messagesByChatId = new Map<string, TranscriptEntry[]>([["chat-1", []]])
+
+  return {
+    chat: sourceChat,
+    turnFinishedCount: 0,
+    hiddenProviderSessions: [] as Array<{
+      provider: "claude" | "codex"
+      sessionToken: string
+    }>,
+    setMessages(chatId: string, entries: TranscriptEntry[]) {
+      messagesByChatId.set(chatId, [...entries])
+    },
+    requireChat(chatId: string) {
+      const chat = chatsById.get(chatId)
+      if (!chat) {
+        throw new Error(`Missing chat ${chatId}`)
+      }
+      return chat
+    },
+    getChat(chatId: string) {
+      return chatsById.get(chatId) ?? null
+    },
+    getProject(projectId: string) {
+      expect(projectId).toBe("project-1")
+      return project
+    },
+    getMessages(chatId: string) {
+      return messagesByChatId.get(chatId) ?? []
+    },
+    async setChatProvider(chatId: string, nextProvider: "claude" | "codex") {
+      this.requireChat(chatId).provider = nextProvider
+    },
+    async setPlanMode(chatId: string, planMode: boolean) {
+      this.requireChat(chatId).planMode = planMode
+    },
+    async renameChat(chatId: string, title: string) {
+      this.requireChat(chatId).title = title
+    },
+    async appendMessage(chatId: string, entry: TranscriptEntry) {
+      messagesByChatId.set(chatId, [...this.getMessages(chatId), entry])
+    },
+    async replaceTranscript(chatId: string, entries: TranscriptEntry[]) {
+      messagesByChatId.set(chatId, [...entries])
+    },
+    async recordTurnStarted() {},
+    async recordTurnFinished() {
+      this.turnFinishedCount += 1
+    },
+    async recordTurnFailed() {
+      throw new Error("Did not expect turn failure")
+    },
+    async recordTurnCancelled() {},
+    async setSessionToken(chatId: string, sessionToken: string | null) {
+      this.requireChat(chatId).sessionToken = sessionToken
+    },
+    async hideProviderSession(nextProvider: "claude" | "codex", sessionToken: string) {
+      this.hiddenProviderSessions.push({ provider: nextProvider, sessionToken })
+    },
+    async setPendingForkSessionToken(chatId: string, pendingForkSessionToken: string | null) {
+      this.requireChat(chatId).pendingForkSessionToken = pendingForkSessionToken
+    },
+    async forkChat(sourceChatId: string, forkOptions?: {
+      transcriptEntries?: TranscriptEntry[]
+      pendingForkSessionToken?: string | null
+    }) {
+      const source = this.requireChat(sourceChatId)
+      const forked = {
+        ...source,
+        id: "chat-fork-1",
+        title: `${source.title} (forked)`,
+        sessionToken: null,
+        pendingForkSessionToken: forkOptions && "pendingForkSessionToken" in forkOptions
+          ? forkOptions.pendingForkSessionToken ?? null
+          : source.sessionToken ?? source.pendingForkSessionToken,
+      }
+      chatsById.set(forked.id, forked)
+      messagesByChatId.set(forked.id, [...(forkOptions?.transcriptEntries ?? this.getMessages(sourceChatId))])
+      return forked
+    },
+    getQueuedMessages() {
+      return []
     },
   }
 }

@@ -1249,7 +1249,7 @@ export function createWsRouter({
           return
         }
         case "chat.fork": {
-          const result = await agent.forkChat(command.chatId)
+          const result = await agent.forkChat(command)
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
           await broadcastFilteredSnapshots({ includeSidebar: true })
           return

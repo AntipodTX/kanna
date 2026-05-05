@@ -555,7 +555,7 @@ describe("EventStore", () => {
     const forked = await store.forkChat(source.id)
 
     expect(forked.id).not.toBe(source.id)
-    expect(forked.title).toBe("Fork: New Chat")
+    expect(forked.title).toBe("New Chat (forked)")
     expect(forked.provider).toBe("claude")
     expect(forked.planMode).toBe(true)
     expect(forked.sessionToken).toBeNull()
@@ -563,6 +563,35 @@ describe("EventStore", () => {
     expect(forked.lastTurnOutcome).toBeNull()
     expect(forked.lastMessageAt).toBeUndefined()
     expect(store.getMessages(forked.id)).toEqual(store.getMessages(source.id))
+  })
+
+  test("forks a chat with a selected transcript prefix", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const source = await store.createChat(project.id, { title: "Debug Session" })
+    await store.setChatProvider(source.id, "codex")
+    await store.setSessionToken(source.id, "thread-1")
+    const first = entry("user_prompt", source.createdAt + 1, { content: "first" })
+    const second = entry("assistant_text", source.createdAt + 2, { text: "done" })
+    const third = entry("user_prompt", source.createdAt + 3, { content: "second" })
+    await store.appendMessage(source.id, first)
+    await store.appendMessage(source.id, second)
+    await store.appendMessage(source.id, third)
+
+    const forked = await store.forkChat(source.id, {
+      transcriptEntries: [first, second],
+      pendingForkSessionToken: null,
+    })
+
+    expect(forked.id).not.toBe(source.id)
+    expect(forked.title).toBe("Debug Session (forked)")
+    expect(forked.provider).toBe("codex")
+    expect(forked.sessionToken).toBeNull()
+    expect(forked.pendingForkSessionToken).toBeNull()
+    expect(store.getMessages(forked.id)).toEqual([first, second])
   })
 
   test("reopening a removed project restores its existing chats", async () => {

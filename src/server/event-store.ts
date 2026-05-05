@@ -137,8 +137,7 @@ function getHistorySnapshot(page: TranscriptPageResult, recentLimit: number): Ch
 
 function getForkedChatTitle(title: string) {
   const trimmed = title.trim()
-  if (!trimmed) return "Fork: New Chat"
-  return trimmed.startsWith("Fork: ") ? trimmed : `Fork: ${trimmed}`
+  return `${trimmed || "New Chat"} (forked)`
 }
 
 export class EventStore {
@@ -725,7 +724,7 @@ export class EventStore {
     return this.writeChain
   }
 
-  async createChat(projectId: string) {
+  async createChat(projectId: string, options: { title?: string } = {}) {
     const project = this.state.projectsById.get(projectId)
     if (!project || project.deletedAt) {
       throw new Error("Project not found")
@@ -737,16 +736,25 @@ export class EventStore {
       timestamp: Date.now(),
       chatId,
       projectId,
-      title: "New Chat",
+      title: options.title ?? "New Chat",
     }
     await this.append(this.chatsLogPath, event)
     return this.state.chatsById.get(chatId)!
   }
 
-  async forkChat(sourceChatId: string) {
+  async forkChat(
+    sourceChatId: string,
+    options: {
+      transcriptEntries?: TranscriptEntry[]
+      pendingForkSessionToken?: string | null
+    } = {}
+  ) {
     const sourceChat = this.requireChat(sourceChatId)
     const sourceSessionToken = sourceChat.sessionToken ?? sourceChat.pendingForkSessionToken ?? null
-    if (!sourceChat.provider || !sourceSessionToken) {
+    const pendingForkSessionToken = options.pendingForkSessionToken !== undefined
+      ? options.pendingForkSessionToken
+      : sourceSessionToken
+    if (!sourceChat.provider || (!sourceSessionToken && options.pendingForkSessionToken === undefined)) {
       throw new Error("Chat cannot be forked")
     }
 
@@ -763,9 +771,9 @@ export class EventStore {
     await this.append(this.chatsLogPath, createEvent)
     await this.setChatProvider(chatId, sourceChat.provider)
     await this.setPlanMode(chatId, sourceChat.planMode)
-    await this.setPendingForkSessionToken(chatId, sourceSessionToken)
+    await this.setPendingForkSessionToken(chatId, pendingForkSessionToken)
 
-    const sourceEntries = this.getMessages(sourceChatId)
+    const sourceEntries = options.transcriptEntries ?? this.getMessages(sourceChatId)
     if (sourceEntries.length > 0) {
       const transcriptPath = this.transcriptPath(chatId)
       const payload = sourceEntries.map((entry) => JSON.stringify(entry)).join("\n")
