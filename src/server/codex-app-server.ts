@@ -4,6 +4,8 @@ import { createInterface } from "node:readline"
 import type { Readable, Writable } from "node:stream"
 import type {
   AskUserQuestionItem,
+  CodexApprovalDecision,
+  CodexApprovalToolCall,
   CodexReasoningEffort,
   ContextWindowUsageSnapshot,
   ServiceTier,
@@ -52,6 +54,8 @@ import {
   isServerNotification,
   isServerRequest,
 } from "./codex-app-server-protocol"
+
+const CODEX_APPROVAL_POLICY = "on-failure"
 
 interface CodexAppServerProcess {
   stdin: Writable
@@ -230,6 +234,55 @@ function toToolRequestUserInputResponse(raw: unknown, questions: ToolRequestUser
   return { answers }
 }
 
+function toCodexApprovalTool(args:
+  | { kind: "command_execution"; params: CommandExecutionRequestApprovalParams }
+  | { kind: "file_change"; params: FileChangeRequestApprovalParams }
+): CodexApprovalToolCall {
+  const approvalId = args.kind === "command_execution" ? args.params.approvalId : null
+  const toolId = approvalId || `${args.params.itemId}:approval`
+  if (args.kind === "command_execution") {
+    return {
+      kind: "tool",
+      toolKind: "codex_approval",
+      toolName: "CodexApproval",
+      toolId,
+      input: {
+        approvalKind: args.kind,
+        command: args.params.command ?? undefined,
+        cwd: args.params.cwd ?? undefined,
+        reason: args.params.reason ?? undefined,
+        approvalId: args.params.approvalId ?? undefined,
+      },
+      rawInput: { ...args.params, approvalKind: args.kind },
+    }
+  }
+
+  return {
+    kind: "tool",
+    toolKind: "codex_approval",
+    toolName: "CodexApproval",
+    toolId,
+    input: {
+      approvalKind: args.kind,
+      grantRoot: args.params.grantRoot ?? undefined,
+      reason: args.params.reason ?? undefined,
+    },
+    rawInput: { ...args.params, approvalKind: args.kind },
+  }
+}
+
+function toCodexApprovalDecision(raw: unknown, allowCancel: boolean): CodexApprovalDecision {
+  const record = asRecord(raw)
+  const decision = record?.decision
+  if (decision === "accept" || decision === "acceptForSession" || decision === "decline") {
+    return decision
+  }
+  if (allowCancel && decision === "cancel") {
+    return decision
+  }
+  return "decline"
+}
+
 function contentFromMcpResult(item: McpToolCallItem): unknown {
   if (item.error?.message) {
     return { error: item.error.message }
@@ -283,23 +336,43 @@ function normalizeCodexTokenUsage(
   }
 }
 
+function normalizePlanStatus(status: unknown): TurnPlanStep["status"] {
+  if (status === "completed") return "completed"
+  if (status === "inProgress" || status === "in_progress") return "inProgress"
+  return "pending"
+}
+
 function todoStatus(status: TurnPlanStep["status"]): TodoItem["status"] {
   if (status === "completed") return "completed"
-  if (status === "inProgress") return "in_progress"
+  if (normalizePlanStatus(status) === "inProgress") return "in_progress"
   return "pending"
 }
 
 function planStepsToTodos(steps: TurnPlanStep[]): TodoItem[] {
   return steps.map((step) => ({
     content: step.step,
-    status: todoStatus(step.status),
+    status: todoStatus(normalizePlanStatus(step.status)),
     activeForm: step.step,
   }))
 }
 
+function completeActivePlanSteps(steps: TurnPlanStep[]): TurnPlanStep[] {
+  return steps.map((step) => {
+    const status = normalizePlanStatus(step.status)
+    return {
+      ...step,
+      status: status === "inProgress" ? "completed" : status,
+    }
+  })
+}
+
+function hasActivePlanStep(steps: TurnPlanStep[]) {
+  return steps.some((step) => normalizePlanStatus(step.status) === "inProgress")
+}
+
 function renderPlanMarkdownFromSteps(steps: TurnPlanStep[]): string {
   return steps.map((step) => {
-    const checkbox = step.status === "completed" ? "[x]" : "[ ]"
+    const checkbox = normalizePlanStatus(step.status) === "completed" ? "[x]" : "[ ]"
     return `- ${checkbox} ${step.step}`
   }).join("\n")
 }
@@ -788,7 +861,7 @@ export class CodexAppServerManager {
       model: args.model,
       cwd: args.cwd,
       serviceTier: args.serviceTier,
-      approvalPolicy: "never",
+      approvalPolicy: CODEX_APPROVAL_POLICY,
       sandbox: "danger-full-access",
       experimentalRawEvents: false,
       persistExtendedHistory: false,
@@ -801,7 +874,7 @@ export class CodexAppServerManager {
         model: args.model,
         cwd: args.cwd,
         serviceTier: args.serviceTier,
-        approvalPolicy: "never",
+        approvalPolicy: CODEX_APPROVAL_POLICY,
         sandbox: "danger-full-access",
         persistExtendedHistory: false,
       } satisfies ThreadForkParams)
@@ -812,7 +885,7 @@ export class CodexAppServerManager {
           model: args.model,
           cwd: args.cwd,
           serviceTier: args.serviceTier,
-          approvalPolicy: "never",
+          approvalPolicy: CODEX_APPROVAL_POLICY,
           sandbox: "danger-full-access",
           persistExtendedHistory: false,
         } satisfies ThreadResumeParams)
@@ -872,7 +945,7 @@ export class CodexAppServerManager {
             text_elements: [],
           },
         ],
-        approvalPolicy: "never",
+        approvalPolicy: CODEX_APPROVAL_POLICY,
         model: args.model,
         effort: args.effort,
         serviceTier: args.serviceTier,
@@ -1097,15 +1170,9 @@ export class CodexAppServerManager {
           .map((entry) => asRecord(entry))
           .filter((entry): entry is Record<string, unknown> => Boolean(entry))
           .map((entry) => {
-            const status: TurnPlanStep["status"] =
-              entry.status === "completed"
-                ? "completed"
-                : entry.status === "inProgress" || entry.status === "in_progress"
-                  ? "inProgress"
-                  : "pending"
             return {
               step: typeof entry.step === "string" ? entry.step : "",
-              status,
+              status: normalizePlanStatus(entry.status),
             }
           })
           .filter((step) => step.step.length > 0)
@@ -1163,11 +1230,15 @@ export class CodexAppServerManager {
     }
 
     if (request.method === "item/commandExecution/requestApproval") {
-      const decision = await pendingTurn.onApprovalRequest?.({
-        requestId: request.id,
-        kind: "command_execution",
-        params: request.params,
-      }) ?? "decline"
+      const tool = toCodexApprovalTool({ kind: "command_execution", params: request.params })
+      const result = pendingTurn.onApprovalRequest
+        ? await pendingTurn.onApprovalRequest({
+            requestId: request.id,
+            kind: "command_execution",
+            params: request.params,
+          })
+        : await this.requestCodexApproval(pendingTurn, tool)
+      const decision = toCodexApprovalDecision(typeof result === "string" ? { decision: result } : result, true)
       this.writeMessage(context, {
         id: request.id,
         result: {
@@ -1177,17 +1248,34 @@ export class CodexAppServerManager {
       return
     }
 
-    const decision = await pendingTurn.onApprovalRequest?.({
-      requestId: request.id,
-      kind: "file_change",
-      params: request.params,
-    }) ?? "decline"
+    const tool = toCodexApprovalTool({ kind: "file_change", params: request.params })
+    const result = pendingTurn.onApprovalRequest
+      ? await pendingTurn.onApprovalRequest({
+          requestId: request.id,
+          kind: "file_change",
+          params: request.params,
+        })
+      : await this.requestCodexApproval(pendingTurn, tool)
+    const decision = toCodexApprovalDecision(typeof result === "string" ? { decision: result } : result, false)
+    const fileDecision: FileChangeApprovalDecision = decision === "cancel" ? "decline" : decision
     this.writeMessage(context, {
       id: request.id,
       result: {
-        decision,
+        decision: fileDecision,
       } satisfies FileChangeRequestApprovalResponse,
     })
+  }
+
+  private async requestCodexApproval(pendingTurn: PendingTurn, tool: CodexApprovalToolCall) {
+    pendingTurn.queue.push({
+      type: "transcript",
+      entry: timestamped({
+        kind: "tool_call",
+        tool,
+      }),
+    })
+
+    return await pendingTurn.onToolRequest({ tool })
   }
 
   private async handleNotification(context: SessionContext, notification: ServerNotification) {
@@ -1270,6 +1358,17 @@ export class CodexAppServerManager {
 
   private handleItemCompleted(pendingTurn: PendingTurn, notification: ItemCompletedNotification) {
     if (notification.item.type === "agentMessage") {
+      if (notification.item.phase === "final_answer" && hasActivePlanStep(pendingTurn.latestPlanSteps)) {
+        pendingTurn.latestPlanSteps = completeActivePlanSteps(pendingTurn.latestPlanSteps)
+        pendingTurn.todoSequence += 1
+        pendingTurn.queue.push({
+          type: "transcript",
+          entry: todoToolCall(
+            `${notification.turnId}:todo-${pendingTurn.todoSequence}`,
+            pendingTurn.latestPlanSteps
+          ),
+        })
+      }
       pendingTurn.queue.push({
         type: "transcript",
         entry: timestamped({

@@ -612,6 +612,22 @@ export interface AskUserQuestionToolCall
 export interface ExitPlanModeToolCall
   extends ToolCallBase<"exit_plan_mode", { plan?: string; summary?: string }> { }
 
+export interface CodexApprovalToolCall
+  extends ToolCallBase<"codex_approval", (
+    | {
+        approvalKind: "command_execution"
+        command?: string
+        cwd?: string
+        reason?: string
+        approvalId?: string
+      }
+    | {
+        approvalKind: "file_change"
+        grantRoot?: string
+        reason?: string
+      }
+  )> { }
+
 export interface TodoWriteToolCall
   extends ToolCallBase<"todo_write", { todos: TodoItem[] }> { }
 
@@ -654,6 +670,7 @@ export interface UnknownToolCall
 export type NormalizedToolCall =
   | AskUserQuestionToolCall
   | ExitPlanModeToolCall
+  | CodexApprovalToolCall
   | TodoWriteToolCall
   | SkillToolCall
   | GlobToolCall
@@ -957,11 +974,21 @@ export interface ExitPlanModeToolResult {
   discarded?: boolean
 }
 
+export type CodexApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel"
+
+export interface CodexApprovalToolResult {
+  decision: CodexApprovalDecision
+  discarded?: boolean
+}
+
 export type HydratedAskUserQuestionToolCall =
   HydratedToolCallBase<"ask_user_question", AskUserQuestionToolCall["input"], AskUserQuestionToolResult>
 
 export type HydratedExitPlanModeToolCall =
   HydratedToolCallBase<"exit_plan_mode", ExitPlanModeToolCall["input"], ExitPlanModeToolResult>
+
+export type HydratedCodexApprovalToolCall =
+  HydratedToolCallBase<"codex_approval", CodexApprovalToolCall["input"], CodexApprovalToolResult>
 
 export type HydratedTodoWriteToolCall =
   HydratedToolCallBase<"todo_write", TodoWriteToolCall["input"], unknown>
@@ -1021,6 +1048,7 @@ export type HydratedUnknownToolCall =
 export type HydratedToolCall =
   | HydratedAskUserQuestionToolCall
   | HydratedExitPlanModeToolCall
+  | HydratedCodexApprovalToolCall
   | HydratedTodoWriteToolCall
   | HydratedSkillToolCall
   | HydratedGlobToolCall
@@ -1089,5 +1117,5 @@ export interface KannaSnapshot {
 
 export interface PendingToolSnapshot {
   toolUseId: string
-  toolKind: "ask_user_question" | "exit_plan_mode"
+  toolKind: "ask_user_question" | "exit_plan_mode" | "codex_approval"
 }

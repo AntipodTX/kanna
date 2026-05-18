@@ -2,6 +2,7 @@ import type {
   AskUserQuestionItem,
   AskUserQuestionAnswerMap,
   AskUserQuestionToolResult,
+  CodexApprovalToolResult,
   ExitPlanModeToolResult,
   HydratedToolCall,
   NormalizedToolCall,
@@ -302,6 +303,19 @@ export function hydrateToolResult(tool: NormalizedToolCall, raw: unknown): Hydra
         message: typeof record?.message === "string" ? record.message : undefined,
         ...(record?.discarded === true ? { discarded: true } : {}),
       } satisfies ExitPlanModeToolResult
+    }
+    case "codex_approval": {
+      const record = asRecord(parsed)
+      const decision = record?.decision
+      return {
+        decision: decision === "accept"
+          || decision === "acceptForSession"
+          || decision === "cancel"
+          || decision === "decline"
+          ? decision
+          : "decline",
+        ...(record?.discarded === true ? { discarded: true } : {}),
+      } satisfies CodexApprovalToolResult
     }
     case "read_file":
       if (typeof parsed === "string") {

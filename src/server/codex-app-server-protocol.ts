@@ -131,7 +131,7 @@ export interface TurnCompletedNotification {
 
 export interface TurnPlanStep {
   step: string
-  status: "pending" | "inProgress" | "completed"
+  status: "pending" | "inProgress" | "in_progress" | "completed"
 }
 
 export interface TurnPlanUpdatedNotification {

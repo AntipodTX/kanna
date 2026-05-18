@@ -87,6 +87,19 @@ describe("hydrateToolResult", () => {
     expect(result).toEqual({ confirmed: true, clearContext: true, message: undefined })
   })
 
+  test("hydrates CodexApproval decisions", () => {
+    const tool = {
+      kind: "tool" as const,
+      toolKind: "codex_approval" as const,
+      toolName: "CodexApproval",
+      toolId: "approval-1",
+      input: { approvalKind: "command_execution" as const, command: "bun test" },
+    }
+
+    expect(hydrateToolResult(tool, { decision: "acceptForSession" })).toEqual({ decision: "acceptForSession" })
+    expect(hydrateToolResult(tool, { decision: "unexpected" })).toEqual({ decision: "decline" })
+  })
+
   test("hydrates Read file text results", () => {
     const tool = normalizeToolCall({
       toolName: "Read",
