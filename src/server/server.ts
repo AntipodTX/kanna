@@ -1,6 +1,6 @@
 import path from "node:path"
 import { stat } from "node:fs/promises"
-import { APP_NAME, getRuntimeProfile } from "../shared/branding"
+import { APP_NAME, getRuntimeProfile, LOG_PREFIX } from "../shared/branding"
 import type { ChatAttachment } from "../shared/types"
 import type { ShareMode } from "../shared/share"
 import { createAuthManager } from "./auth"
@@ -19,6 +19,7 @@ import type { UpdateInstallAttemptResult } from "./cli-runtime"
 import { createWsRouter, type ClientState } from "./ws-router"
 import { deleteProjectUpload, inferAttachmentContentType, inferProjectFileContentType, persistProjectUpload } from "./uploads"
 import { getProjectUploadDir } from "./paths"
+import { StartupSyncProgress } from "./startup-sync"
 
 const MAX_UPLOAD_FILES = 50
 const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024
@@ -90,7 +91,29 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const store = new EventStore(options.dataDir)
   const diffStore = new DiffStore(store.dataDir)
   const machineDisplayName = getMachineDisplayName()
+  const startupSync = new StartupSyncProgress()
   await store.initialize()
+  const startupRecoveryIncidents = store.getStartupRecoveryIncidents()
+  if (startupRecoveryIncidents.length > 0) {
+    startupSync.begin("storage-recovery")
+    for (const incident of startupRecoveryIncidents) {
+      const location = incident.line ? `${path.basename(incident.sourcePath)}:${incident.line}` : path.basename(incident.sourcePath)
+      const sourceName = path.basename(incident.sourcePath)
+      const backupDetail = incident.backupPath
+        ? incident.kind === "snapshot"
+          ? `and backed up to ${incident.backupPath}`
+          : `and ${sourceName} was backed up to ${incident.backupPath}`
+        : incident.kind === "snapshot"
+          ? "but could not be backed up"
+          : `but ${sourceName} could not be backed up`
+      const message = incident.kind === "snapshot"
+        ? `${LOG_PREFIX} storage recovery: snapshot ${location} was ignored ${backupDetail}; reason: ${incident.reason}`
+        : `${LOG_PREFIX} storage recovery: log event ${location} was ignored ${backupDetail}; reason: ${incident.reason}`
+      options.onMigrationProgress?.(message)
+      startupSync.append(message)
+    }
+    startupSync.complete()
+  }
   await diffStore.initialize()
   await store.migrateLegacyTranscripts(options.onMigrationProgress)
   let discoveredProjects: DiscoveredProject[] = []
@@ -155,6 +178,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     getDiscoveredProjects: () => discoveredProjects,
     machineDisplayName,
     updateManager,
+    startupSync,
   })
   const staleEmptyChatPruneInterval = setInterval(() => {
     void router.pruneStaleEmptyChats()

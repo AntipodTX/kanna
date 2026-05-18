@@ -18,6 +18,7 @@ import { killLocalHttpServer, listLocalHttpServers } from "./local-http-servers"
 import { ensureProjectDirectory, resolveLocalPath } from "./paths"
 import { readProjectQuickActions, writeProjectQuickActions } from "./project-quick-actions"
 import { writeStandaloneTranscriptExport } from "./standalone-export"
+import type { StartupSyncProgress } from "./startup-sync"
 import { TerminalManager } from "./terminal-manager"
 import type { UpdateManager } from "./update-manager"
 import { deriveChatSnapshot, deriveLocalProjectsSnapshot, deriveSidebarData } from "./read-models"
@@ -63,6 +64,7 @@ function countSubscriptionsByTopic(ws: ServerWebSocket<ClientState>) {
   let projectGit = 0
   let localProjects = 0
   let update = 0
+  let startupSync = 0
   let keybindings = 0
   let appSettings = 0
   let terminal = 0
@@ -84,6 +86,9 @@ function countSubscriptionsByTopic(ws: ServerWebSocket<ClientState>) {
       case "update":
         update += 1
         break
+      case "startup-sync":
+        startupSync += 1
+        break
       case "keybindings":
         keybindings += 1
         break
@@ -103,6 +108,7 @@ function countSubscriptionsByTopic(ws: ServerWebSocket<ClientState>) {
     projectGit,
     localProjects,
     update,
+    startupSync,
     keybindings,
     appSettings,
     terminal,
@@ -132,12 +138,14 @@ interface CreateWsRouterArgs {
   getDiscoveredProjects: () => DiscoveredProject[]
   machineDisplayName: string
   updateManager: UpdateManager | null
+  startupSync?: Pick<StartupSyncProgress, "getSnapshot" | "onChange">
 }
 
 interface SnapshotBroadcastFilter {
   includeSidebar?: boolean
   includeLocalProjects?: boolean
   includeUpdate?: boolean
+  includeStartupSync?: boolean
   includeKeybindings?: boolean
   includeAppSettings?: boolean
   chatIds?: Set<string>
@@ -386,6 +394,7 @@ export function createWsRouter({
   getDiscoveredProjects,
   machineDisplayName,
   updateManager,
+  startupSync,
 }: CreateWsRouterArgs) {
   const sockets = new Set<ServerWebSocket<ClientState>>()
   let pendingBroadcastTimer: ReturnType<typeof setTimeout> | null = null
@@ -597,6 +606,9 @@ export function createWsRouter({
     if (topic.type === "update") {
       return Boolean(filter.includeUpdate)
     }
+    if (topic.type === "startup-sync") {
+      return Boolean(filter.includeStartupSync)
+    }
     if (topic.type === "keybindings") {
       return Boolean(filter.includeKeybindings)
     }
@@ -722,6 +734,26 @@ export function createWsRouter({
             error: null,
             installAction: "restart",
             reloadRequestedAt: null,
+          },
+        },
+      }
+    }
+
+    if (topic.type === "startup-sync") {
+      return {
+        v: PROTOCOL_VERSION,
+        type: "snapshot",
+        id,
+        snapshot: {
+          type: "startup-sync",
+          data: startupSync?.getSnapshot() ?? {
+            enabled: false,
+            mode: "session-sync",
+            status: "idle",
+            messages: [],
+            startedAt: null,
+            completedAt: null,
+            error: null,
           },
         },
       }
@@ -1019,6 +1051,12 @@ export function createWsRouter({
         send(ws, envelope)
       }
     }
+  }) ?? (() => {})
+
+  const disposeStartupSyncEvents = startupSync?.onChange(() => {
+    void broadcastFilteredSnapshots({
+      includeStartupSync: true,
+    })
   }) ?? (() => {})
 
   agent.setBackgroundErrorReporter?.(broadcastError)
@@ -1641,6 +1679,7 @@ export function createWsRouter({
       disposeKeybindingEvents()
       disposeAppSettingsEvents()
       disposeUpdateEvents()
+      disposeStartupSyncEvents()
     },
   }
 }

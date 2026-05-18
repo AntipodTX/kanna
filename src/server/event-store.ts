@@ -1,4 +1,4 @@
-import { appendFile, mkdir, rename, rm, writeFile } from "node:fs/promises"
+import { appendFile, copyFile, mkdir, rename, rm, writeFile } from "node:fs/promises"
 import { existsSync, readFileSync as readFileSyncImmediate } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
@@ -74,6 +74,20 @@ interface ParsedReplayEvent {
   lineIndex: number
 }
 
+export type StartupRecoveryIncident = {
+  kind: "snapshot" | "log"
+  sourcePath: string
+  backupPath: string | null
+  line?: number
+  reason: string
+}
+
+async function writeFileAtomically(filePath: string, payload: string) {
+  const tempPath = `${filePath}.${crypto.randomUUID()}.tmp`
+  await writeFile(tempPath, payload, "utf8")
+  await rename(tempPath, filePath)
+}
+
 function getReplayEventPriority(event: StoreEvent) {
   switch (event.type) {
     case "project_opened":
@@ -145,7 +159,8 @@ export class EventStore {
   readonly dataDir: string
   readonly state: StoreState = createEmptyState()
   private writeChain = Promise.resolve()
-  private storageReset = false
+  private readonly startupRecoveryIncidents: StartupRecoveryIncident[] = []
+  private readonly recoveryBackupsByPath = new Map<string, string>()
   private readonly snapshotPath: string
   private readonly projectsLogPath: string
   private readonly chatsLogPath: string
@@ -183,7 +198,7 @@ export class EventStore {
     await this.loadSnapshot()
     await this.replayLogs()
     await this.loadSidebarProjectOrder()
-    if (!(await this.hasLegacyTranscriptData()) && await this.shouldCompact()) {
+    if (!(await this.hasLegacyTranscriptData()) && (this.startupRecoveryIncidents.length > 0 || await this.shouldCompact())) {
       await this.compact()
     }
   }
@@ -195,19 +210,41 @@ export class EventStore {
     }
   }
 
-  private async clearStorage() {
-    if (this.storageReset) return
-    this.storageReset = true
-    this.resetState()
-    this.clearLegacyTranscriptState()
-    await Promise.all([
-      Bun.write(this.snapshotPath, ""),
-      Bun.write(this.projectsLogPath, ""),
-      Bun.write(this.chatsLogPath, ""),
-      Bun.write(this.messagesLogPath, ""),
-      Bun.write(this.queuedMessagesLogPath, ""),
-      Bun.write(this.turnsLogPath, ""),
-    ])
+  private async backupRecoverySource(filePath: string) {
+    const existing = this.recoveryBackupsByPath.get(filePath)
+    if (existing) return existing
+
+    const recoveryDir = path.join(this.dataDir, "recovery")
+    await mkdir(recoveryDir, { recursive: true })
+    const parsedPath = path.parse(filePath)
+    const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-")
+    const backupPath = path.join(recoveryDir, `${parsedPath.name}-${timestamp}-${crypto.randomUUID()}${parsedPath.ext}`)
+    await copyFile(filePath, backupPath)
+    this.recoveryBackupsByPath.set(filePath, backupPath)
+    return backupPath
+  }
+
+  private async recordStartupRecoveryIncident(incident: Omit<StartupRecoveryIncident, "backupPath">) {
+    let backupPath: string | null = null
+    let reason = incident.reason
+
+    try {
+      backupPath = await this.backupRecoverySource(incident.sourcePath)
+    } catch (error) {
+      const backupError = error instanceof Error ? error.message : String(error)
+      console.warn(`${LOG_PREFIX} Failed to back up recovery source ${path.basename(incident.sourcePath)}:`, error)
+      reason = `${reason}; backup failed: ${backupError}`
+    }
+
+    this.startupRecoveryIncidents.push({
+      ...incident,
+      reason,
+      backupPath,
+    })
+  }
+
+  getStartupRecoveryIncidents() {
+    return this.startupRecoveryIncidents.map((incident) => ({ ...incident }))
   }
 
   private async loadSnapshot() {
@@ -219,8 +256,14 @@ export class EventStore {
       if (!text.trim()) return
       const parsed = JSON.parse(text) as SnapshotFile
       if (parsed.v !== STORE_VERSION) {
-        console.warn(`${LOG_PREFIX} Resetting local chat history for store version ${STORE_VERSION}`)
-        await this.clearStorage()
+        console.warn(`${LOG_PREFIX} Ignoring snapshot for incompatible store version ${STORE_VERSION}`)
+        await this.recordStartupRecoveryIncident({
+          kind: "snapshot",
+          sourcePath: this.snapshotPath,
+          reason: `incompatible store version ${String((parsed as { v?: unknown }).v)}`,
+        })
+        this.resetState()
+        this.clearLegacyTranscriptState()
         return
       }
       for (const project of parsed.projects) {
@@ -250,8 +293,14 @@ export class EventStore {
         }
       }
     } catch (error) {
-      console.warn(`${LOG_PREFIX} Failed to load snapshot, resetting local history:`, error)
-      await this.clearStorage()
+      console.warn(`${LOG_PREFIX} Failed to load snapshot, ignoring it and replaying logs:`, error)
+      await this.recordStartupRecoveryIncident({
+        kind: "snapshot",
+        sourcePath: this.snapshotPath,
+        reason: error instanceof Error ? error.message : String(error),
+      })
+      this.resetState()
+      this.clearLegacyTranscriptState()
     }
   }
 
@@ -351,7 +400,6 @@ export class EventStore {
   }
 
   private async replayLogs() {
-    if (this.storageReset) return
     const replayEvents = [
       ...await this.loadReplayEvents(this.projectsLogPath, 0),
       ...await this.loadReplayEvents(this.chatsLogPath, 1),
@@ -359,7 +407,6 @@ export class EventStore {
       ...await this.loadReplayEvents(this.queuedMessagesLogPath, 3),
       ...await this.loadReplayEvents(this.turnsLogPath, 4),
     ]
-    if (this.storageReset) return
 
     replayEvents
       .sort((left, right) => (
@@ -395,9 +442,14 @@ export class EventStore {
       try {
         const event = JSON.parse(line) as Partial<StoreEvent>
         if (event.v !== STORE_VERSION) {
-          console.warn(`${LOG_PREFIX} Resetting local history from incompatible event log`)
-          await this.clearStorage()
-          return []
+          console.warn(`${LOG_PREFIX} Ignoring incompatible event in ${path.basename(filePath)} at line ${index + 1}`)
+          await this.recordStartupRecoveryIncident({
+            kind: "log",
+            sourcePath: filePath,
+            line: index + 1,
+            reason: `incompatible event version ${String((event as { v?: unknown }).v)}`,
+          })
+          return parsedEvents
         }
         if ((event as { type?: unknown }).type === "sidebar_project_order_set") {
           continue
@@ -412,9 +464,13 @@ export class EventStore {
           console.warn(`${LOG_PREFIX} Ignoring corrupt trailing line in ${path.basename(filePath)}`)
           return parsedEvents
         }
-        console.warn(`${LOG_PREFIX} Failed to replay ${path.basename(filePath)}, resetting local history:`, error)
-        await this.clearStorage()
-        return []
+        console.warn(`${LOG_PREFIX} Ignoring corrupt line in ${path.basename(filePath)} at line ${index + 1}:`, error)
+        await this.recordStartupRecoveryIncident({
+          kind: "log",
+          sourcePath: filePath,
+          line: index + 1,
+          reason: error instanceof Error ? error.message : String(error),
+        })
       }
     }
 
@@ -1227,7 +1283,7 @@ export class EventStore {
 
   async compact() {
     const snapshot = this.createSnapshot()
-    await Bun.write(this.snapshotPath, JSON.stringify(snapshot, null, 2))
+    await writeFileAtomically(this.snapshotPath, JSON.stringify(snapshot, null, 2))
     await Promise.all([
       Bun.write(this.projectsLogPath, ""),
       Bun.write(this.chatsLogPath, ""),
