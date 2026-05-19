@@ -33,10 +33,18 @@ function renderSection(
     expandedGroups = new Set<string>(),
     collapsedSections = new Set<string>(),
     onNewLocalChat,
+    onOpenProjectSearch,
+    onCopyPath,
+    onOpenExternalPath,
+    onHideProject,
   }: {
     expandedGroups?: Set<string>
     collapsedSections?: Set<string>
     onNewLocalChat?: (localPath: string) => void
+    onOpenProjectSearch?: (projectId: string) => void
+    onCopyPath?: (localPath: string) => void
+    onOpenExternalPath?: (action: "open_finder" | "open_editor", localPath: string) => void
+    onHideProject?: (projectId: string) => void
   } = {}
 ) {
   return renderToStaticMarkup(createElement(
@@ -51,6 +59,10 @@ function renderSection(
       onToggleExpandedGroup: () => undefined,
       renderChatRow: (chat: SidebarChatRow) => createElement("div", { key: chat.chatId }, chat.title),
       onNewLocalChat,
+      onOpenProjectSearch,
+      onCopyPath,
+      onOpenExternalPath,
+      onHideProject,
       isConnected: true,
     })
   ))
@@ -179,7 +191,32 @@ describe("LocalProjectsSection", () => {
       onNewLocalChat: () => undefined,
     })
 
-    expect(html).not.toContain("New Chat")
+    expect(html).not.toContain(">New Chat</span>")
+  })
+
+  test("renders project search between new chat and more actions", () => {
+    const projectGroups: SidebarProjectGroup[] = [{
+      groupKey: "project-a",
+      title: "Project A",
+      realTitle: "Project A",
+      localPath: "/tmp/project-a",
+      chats: [createChat("chat-1", nowMs - hourMs)],
+      previewChats: [createChat("chat-1", nowMs - hourMs)],
+      olderChats: [],
+      defaultCollapsed: false,
+    }]
+
+    const html = renderSection(projectGroups, {
+      onNewLocalChat: () => undefined,
+      onOpenProjectSearch: () => undefined,
+      onCopyPath: () => undefined,
+      onOpenExternalPath: () => undefined,
+      onHideProject: () => undefined,
+    })
+
+    expect(html).toContain("Search Project")
+    expect(html.indexOf("New Chat")).toBeLessThan(html.indexOf("Search Project"))
+    expect(html.indexOf("Search Project")).toBeLessThan(html.indexOf("More"))
   })
 
   test("starts the downward reorder preview when dragged top plus 20px crosses the target center", () => {

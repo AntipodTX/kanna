@@ -182,6 +182,39 @@ function mergeTranscriptEntries(olderHistoryEntries: TranscriptEntry[], recentEn
   return [...deduped.values()]
 }
 
+interface EnsureTranscriptEntryLoadedFromHistoryOptions {
+  hasEntry: () => boolean
+  canLoadMoreHistory: () => boolean
+  getCurrentHistoryLoad: () => Promise<void> | null
+  loadNextHistoryPage: () => Promise<void>
+}
+
+export async function ensureTranscriptEntryLoadedFromHistory({
+  hasEntry,
+  canLoadMoreHistory,
+  getCurrentHistoryLoad,
+  loadNextHistoryPage,
+}: EnsureTranscriptEntryLoadedFromHistoryOptions) {
+  if (hasEntry()) {
+    return true
+  }
+
+  while (canLoadMoreHistory() || getCurrentHistoryLoad()) {
+    const currentHistoryLoad = getCurrentHistoryLoad()
+    if (currentHistoryLoad) {
+      await currentHistoryLoad
+    } else {
+      await loadNextHistoryPage()
+    }
+
+    if (hasEntry()) {
+      return true
+    }
+  }
+
+  return false
+}
+
 export function getPreviousPrompt(messages: ReturnType<typeof processTranscriptMessages>) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]
@@ -690,6 +723,7 @@ export interface KannaState {
   openAddProjectModal: () => void
   closeAddProjectModal: () => void
   loadOlderHistory: () => Promise<void>
+  ensureTranscriptEntryLoaded: (entryId: string) => Promise<boolean>
   handleCreateChat: (projectId: string) => Promise<void>
   handleForkChat: (chat: SidebarChatRow) => Promise<void>
   handleOpenLocalProject: (localPath: string) => Promise<void>
@@ -711,7 +745,7 @@ export interface KannaState {
   handleRenameProject: (projectId: string, sidebarTitle: string | undefined, realTitle: string) => Promise<void>
   handleShareChat: (chatId?: string | null) => Promise<void>
   handleArchiveChat: (chat: SidebarChatRow) => Promise<void>
-  handleOpenArchivedChat: (chatId: string) => Promise<void>
+  handleOpenArchivedChat: (chatId: string, options?: { state?: unknown }) => Promise<void>
   handleDeleteChat: (chat: SidebarChatRow) => Promise<void>
   handleHideProject: (projectId: string) => Promise<void>
   handleReorderProjectGroups: (projectIds: string[]) => Promise<void>
@@ -772,6 +806,10 @@ export function useKannaState(activeChatId: string | null): KannaState {
   const [pendingChatId, setPendingChatId] = useState<string | null>(null)
   const [optimisticUserPrompts, setOptimisticUserPrompts] = useState<OptimisticUserPrompt[]>([])
   const [optimisticProcessing, setOptimisticProcessing] = useState<OptimisticProcessingState | null>(null)
+  const olderHistoryEntriesRef = useRef<TranscriptEntry[]>([])
+  const historyCursorRef = useRef<string | null>(null)
+  const hasOlderHistoryRef = useRef(false)
+  const historyLoadPromiseRef = useRef<Promise<void> | null>(null)
   const [focusEpoch, setFocusEpoch] = useState(0)
   const sendToStartingProfilesRef = useRef<Map<string, SendToStartingTrace>>(new Map())
   const draftChatIds = useChatInputStore(useShallow((state) => Object.keys(state.drafts).sort()))
@@ -1147,10 +1185,26 @@ export function useKannaState(activeChatId: string | null): KannaState {
 
   useEffect(() => {
     setOlderHistoryEntries([])
+    olderHistoryEntriesRef.current = []
     setIsHistoryLoading(false)
     setHistoryCursor(null)
+    historyCursorRef.current = null
     setHasOlderHistory(false)
+    hasOlderHistoryRef.current = false
+    historyLoadPromiseRef.current = null
   }, [activeChatId])
+
+  useEffect(() => {
+    olderHistoryEntriesRef.current = olderHistoryEntries
+  }, [olderHistoryEntries])
+
+  useEffect(() => {
+    historyCursorRef.current = historyCursor
+  }, [historyCursor])
+
+  useEffect(() => {
+    hasOlderHistoryRef.current = hasOlderHistory
+  }, [hasOlderHistory])
 
   const activeChatSnapshot = useMemo(
     () => getActiveChatSnapshot(chatSnapshot, activeChatId),
@@ -1350,30 +1404,103 @@ export function useKannaState(activeChatId: string | null): KannaState {
     })
   }, [optimisticScopeId, serverTranscriptEntries])
 
+  const runExclusiveHistoryLoad = useCallback(async (load: () => Promise<void>) => {
+    if (historyLoadPromiseRef.current) {
+      return await historyLoadPromiseRef.current
+    }
+
+    const promise = (async () => {
+      setIsHistoryLoading(true)
+      try {
+        await load()
+      } finally {
+        setIsHistoryLoading(false)
+        historyLoadPromiseRef.current = null
+      }
+    })()
+    historyLoadPromiseRef.current = promise
+    return await promise
+  }, [])
+
   const loadOlderHistory = useCallback(async () => {
-    if (!activeChatId || !historyCursor || isHistoryLoading || !hasOlderHistory) {
+    if (!activeChatId || !historyCursorRef.current || !hasOlderHistoryRef.current) {
       return
     }
 
-    setIsHistoryLoading(true)
     try {
-      const page = await socket.command<ChatHistoryPage>({
-        type: "chat.loadHistory",
-        chatId: activeChatId,
-        beforeCursor: historyCursor,
-        limit: CHAT_HISTORY_PAGE_SIZE,
+      await runExclusiveHistoryLoad(async () => {
+        const beforeCursor = historyCursorRef.current
+        if (!activeChatId || !beforeCursor || !hasOlderHistoryRef.current) {
+          return
+        }
+        const page = await socket.command<ChatHistoryPage>({
+          type: "chat.loadHistory",
+          chatId: activeChatId,
+          beforeCursor,
+          limit: CHAT_HISTORY_PAGE_SIZE,
+        })
+        setOlderHistoryEntries((current) => {
+          const nextEntries = mergeTranscriptEntries(page.messages, current)
+          olderHistoryEntriesRef.current = nextEntries
+          return nextEntries
+        })
+        historyCursorRef.current = page.olderCursor
+        hasOlderHistoryRef.current = page.hasOlder
+        setHistoryCursor(page.olderCursor)
+        setHasOlderHistory(page.hasOlder)
+        setCommandError(null)
       })
-      setOlderHistoryEntries((current) => mergeTranscriptEntries(page.messages, current))
-      setHistoryCursor(page.olderCursor)
-      setHasOlderHistory(page.hasOlder)
-      setCommandError(null)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       setCommandError(message)
-    } finally {
-      setIsHistoryLoading(false)
     }
-  }, [activeChatId, hasOlderHistory, historyCursor, isHistoryLoading, socket])
+  }, [activeChatId, runExclusiveHistoryLoad, socket])
+
+  const ensureTranscriptEntryLoaded = useCallback(async (entryId: string) => {
+    const recentEntries = activeChatSnapshot?.messages ?? []
+    const hasEntry = () => mergeTranscriptEntries(olderHistoryEntriesRef.current, recentEntries)
+      .some((entry) => entry._id === entryId)
+    if (hasEntry()) {
+      return true
+    }
+    if (!activeChatId) {
+      return false
+    }
+
+    try {
+      return await ensureTranscriptEntryLoadedFromHistory({
+        hasEntry,
+        canLoadMoreHistory: () => Boolean(historyCursorRef.current && hasOlderHistoryRef.current),
+        getCurrentHistoryLoad: () => historyLoadPromiseRef.current,
+        loadNextHistoryPage: async () => {
+          await runExclusiveHistoryLoad(async () => {
+            const beforeCursor = historyCursorRef.current
+            if (!activeChatId || !beforeCursor || !hasOlderHistoryRef.current) {
+              return
+            }
+            const page = await socket.command<ChatHistoryPage>({
+              type: "chat.loadHistory",
+              chatId: activeChatId,
+              beforeCursor,
+              limit: CHAT_HISTORY_PAGE_SIZE,
+            })
+            const nextEntries = mergeTranscriptEntries(page.messages, olderHistoryEntriesRef.current)
+            olderHistoryEntriesRef.current = nextEntries
+            setOlderHistoryEntries(nextEntries)
+            historyCursorRef.current = page.olderCursor
+            hasOlderHistoryRef.current = page.hasOlder
+            setHistoryCursor(page.olderCursor)
+            setHasOlderHistory(page.hasOlder)
+            setCommandError(null)
+          })
+        },
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setCommandError(message)
+      throw error
+    }
+  }, [activeChatId, activeChatSnapshot?.messages, runExclusiveHistoryLoad, socket])
 
   const createChatForProject = useCallback(async (projectId: string) => {
     const chatPreferences = useChatPreferencesStore.getState()
@@ -1765,15 +1892,16 @@ export function useKannaState(activeChatId: string | null): KannaState {
     }
   }, [activeChatId, navigate, sidebarProjectGroups, socket])
 
-  const handleOpenArchivedChat = useCallback(async (chatId: string) => {
+  const handleOpenArchivedChat = useCallback(async (chatId: string, options?: { state?: unknown }) => {
     try {
       setPendingChatId(chatId)
       await socket.command({ type: "chat.unarchive", chatId })
-      navigate(`/chat/${chatId}`)
+      navigate(`/chat/${chatId}`, options)
       setCommandError(null)
     } catch (error) {
       setPendingChatId(null)
       setCommandError(error instanceof Error ? error.message : String(error))
+      throw error
     }
   }, [navigate, socket])
 
@@ -2069,6 +2197,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
     openAddProjectModal,
     closeAddProjectModal,
     loadOlderHistory,
+    ensureTranscriptEntryLoaded,
     handleCreateChat,
     handleForkChat,
     handleOpenLocalProject,

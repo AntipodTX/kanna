@@ -1220,6 +1220,244 @@ describe("ws-router", () => {
     })
   })
 
+  test("searches project chats and optionally includes archived chats", async () => {
+    const state = createEmptyState()
+    state.projectsById.set("project-1", {
+      id: "project-1",
+      localPath: "/tmp/project",
+      title: "Project",
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    state.projectIdsByPath.set("/tmp/project", "project-1")
+    state.chatsById.set("chat-1", {
+      id: "chat-1",
+      projectId: "project-1",
+      title: "First Chat",
+      createdAt: 1,
+      updatedAt: 10,
+      unread: false,
+      provider: null,
+      planMode: false,
+      sessionToken: null,
+      lastTurnOutcome: null,
+    })
+    state.chatsById.set("chat-2", {
+      id: "chat-2",
+      projectId: "project-1",
+      title: "Second Chat",
+      createdAt: 2,
+      updatedAt: 20,
+      unread: false,
+      provider: null,
+      planMode: false,
+      sessionToken: null,
+      lastTurnOutcome: null,
+    })
+    state.chatsById.set("chat-archived", {
+      id: "chat-archived",
+      projectId: "project-1",
+      title: "Archived Chat",
+      createdAt: 3,
+      updatedAt: 30,
+      archivedAt: 31,
+      unread: false,
+      provider: null,
+      planMode: false,
+      sessionToken: null,
+      lastTurnOutcome: null,
+    } as never)
+    state.chatsById.set("chat-deleted", {
+      id: "chat-deleted",
+      projectId: "project-1",
+      title: "Deleted Chat",
+      createdAt: 4,
+      updatedAt: 40,
+      deletedAt: 41,
+      unread: false,
+      provider: null,
+      planMode: false,
+      sessionToken: null,
+      lastTurnOutcome: null,
+    } as never)
+
+    const messagesByChatId = new Map([
+      ["chat-1", [{
+        _id: "chat-1-match",
+        kind: "assistant_text",
+        createdAt: 10,
+        text: "needle appears in the first chat",
+      }]],
+      ["chat-2", [{
+        _id: "chat-2-match",
+        kind: "user_prompt",
+        createdAt: 20,
+        content: "needle appears in the second chat",
+      }]],
+      ["chat-archived", [{
+        _id: "archived-match",
+        kind: "assistant_text",
+        createdAt: 30,
+        text: "needle should stay archived",
+      }]],
+      ["chat-deleted", [{
+        _id: "deleted-match",
+        kind: "assistant_text",
+        createdAt: 40,
+        text: "needle should stay deleted",
+      }]],
+    ])
+
+    const router = createWsRouter({
+      store: {
+        state,
+        getProject: (projectId: string) => state.projectsById.get(projectId) ?? null,
+        getMessages: (chatId: string) => messagesByChatId.get(chatId) ?? [],
+      } as never,
+      agent: { getActiveStatuses: () => new Map(), getDrainingChatIds: () => new Set() } as never,
+      terminals: {
+        getSnapshot: () => null,
+        onEvent: () => () => {},
+      } as never,
+      keybindings: {
+        getSnapshot: () => DEFAULT_KEYBINDINGS_SNAPSHOT,
+        onChange: () => () => {},
+      } as never,
+      refreshDiscovery: async () => [],
+      getDiscoveredProjects: () => [],
+      machineDisplayName: "Local Machine",
+      updateManager: null,
+    })
+    const ws = new FakeWebSocket()
+
+    await router.handleMessage(
+      ws as never,
+      JSON.stringify({
+        v: 1,
+        type: "command",
+        id: "project-search-1",
+        command: {
+          type: "project.search",
+          projectId: "project-1",
+          query: "needle",
+        },
+      })
+    )
+
+    expect(ws.sent[0]).toEqual({
+      v: PROTOCOL_VERSION,
+      type: "ack",
+      id: "project-search-1",
+      result: {
+        query: "needle",
+        projectId: "project-1",
+        hasMore: false,
+        matches: [
+          {
+            chatId: "chat-2",
+            chatTitle: "Second Chat",
+            isArchived: false,
+            entryId: "chat-2-match",
+            targetEntryId: "chat-2-match",
+            messageId: undefined,
+            kind: "user_prompt",
+            createdAt: 20,
+            matchCount: 1,
+            preview: "needle appears in the second chat",
+          },
+          {
+            chatId: "chat-1",
+            chatTitle: "First Chat",
+            isArchived: false,
+            entryId: "chat-1-match",
+            targetEntryId: "chat-1-match",
+            messageId: undefined,
+            kind: "assistant_text",
+            createdAt: 10,
+            matchCount: 1,
+            preview: "needle appears in the first chat",
+          },
+        ],
+      },
+    })
+
+    const archivedWs = new FakeWebSocket()
+
+    await router.handleMessage(
+      archivedWs as never,
+      JSON.stringify({
+        v: 1,
+        type: "command",
+        id: "project-search-archived",
+        command: {
+          type: "project.search",
+          projectId: "project-1",
+          query: "needle",
+          includeArchived: true,
+        },
+      })
+    )
+
+    const archivedResult = archivedWs.sent[0] as {
+      result: { matches: Array<{ chatId: string; isArchived: boolean }> }
+    }
+    expect(archivedResult.result.matches.map((match) => ({
+      chatId: match.chatId,
+      isArchived: match.isArchived,
+    }))).toEqual([
+      { chatId: "chat-archived", isArchived: true },
+      { chatId: "chat-2", isArchived: false },
+      { chatId: "chat-1", isArchived: false },
+    ])
+
+    const firstPageWs = new FakeWebSocket()
+    await router.handleMessage(
+      firstPageWs as never,
+      JSON.stringify({
+        v: 1,
+        type: "command",
+        id: "project-search-page-1",
+        command: {
+          type: "project.search",
+          projectId: "project-1",
+          query: "needle",
+          limit: 1,
+        },
+      })
+    )
+
+    const firstPageResult = firstPageWs.sent[0] as {
+      result: { matches: Array<{ chatId: string }>; nextCursor?: string; hasMore: boolean }
+    }
+    expect(firstPageResult.result.matches.map((match) => match.chatId)).toEqual(["chat-2"])
+    expect(firstPageResult.result.hasMore).toBe(true)
+    expect(firstPageResult.result.nextCursor).toBe("1:0")
+
+    const nextPageWs = new FakeWebSocket()
+    await router.handleMessage(
+      nextPageWs as never,
+      JSON.stringify({
+        v: 1,
+        type: "command",
+        id: "project-search-page-2",
+        command: {
+          type: "project.search",
+          projectId: "project-1",
+          query: "needle",
+          limit: 1,
+          cursor: firstPageResult.result.nextCursor,
+        },
+      })
+    )
+
+    const nextPageResult = nextPageWs.sent[0] as {
+      result: { matches: Array<{ chatId: string }>; nextCursor?: string; hasMore: boolean }
+    }
+    expect(nextPageResult.result.matches.map((match) => match.chatId)).toEqual(["chat-1"])
+    expect(nextPageResult.result.hasMore).toBe(false)
+    expect(nextPageResult.result.nextCursor).toBeUndefined()
+  })
+
   test("marks chats read and rebroadcasts sidebar snapshots", async () => {
     const state = createEmptyState()
     state.projectsById.set("project-1", {

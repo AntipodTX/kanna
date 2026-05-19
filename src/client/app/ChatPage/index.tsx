@@ -1,7 +1,8 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type CSSProperties, type DragEvent, type ReactNode, type RefObject } from "react"
 import { type LegendListRef } from "@legendapp/list/react"
 import type { GroupImperativeHandle } from "react-resizable-panels"
-import { useOutletContext } from "react-router-dom"
+import { useLocation, useOutletContext } from "react-router-dom"
+import type { ChatSearchEntryResult } from "../../../shared/chatSearch"
 import type { ChatInputHandle } from "../../components/chat-ui/ChatInput"
 import { ChatNavbar } from "../../components/chat-ui/ChatNavbar"
 import { BrowserPanel } from "../../components/chat-ui/BrowserPanel"
@@ -25,6 +26,7 @@ import { TERMINAL_TOGGLE_ANIMATION_DURATION_MS } from "../terminalToggleAnimatio
 import { useRightSidebarToggleAnimation } from "../useRightSidebarToggleAnimation"
 import { useStickyChatFocus } from "../useStickyChatFocus"
 import { useTerminalToggleAnimation } from "../useTerminalToggleAnimation"
+import { ProjectChatSearchPopover, type ProjectChatSearchPopoverProps } from "../ProjectChatSearchPopover"
 import type { KannaState } from "../useKannaState"
 import { getNextMeasuredInputHeight, getTranscriptPaddingBottom } from "../useKannaState"
 import { ChatInputDock } from "./ChatInputDock"
@@ -43,6 +45,62 @@ export {
   hasFileDragTypes,
   shouldAutoFollowTranscriptResize,
 } from "./utils"
+
+export function resolveTranscriptEditUserPromptControls(args: {
+  isProcessing: boolean
+  isDraining: boolean
+  handleEditUserPrompt: KannaState["handleEditUserPrompt"]
+  handleForkUserPrompt: KannaState["handleForkUserPrompt"]
+}) {
+  const isDisabled = args.isProcessing || args.isDraining
+  return {
+    onEditUserPrompt: args.handleEditUserPrompt,
+    isEditUserPromptDisabled: isDisabled,
+    onForkUserPrompt: args.handleForkUserPrompt,
+    isForkUserPromptDisabled: isDisabled,
+  }
+}
+
+export async function ensureChatSearchResultTargetLoaded(
+  result: Pick<ChatSearchEntryResult, "entryId" | "targetEntryId">,
+  ensureTranscriptEntryLoaded: (entryId: string) => Promise<boolean>,
+) {
+  const loadedEntry = await ensureTranscriptEntryLoaded(result.entryId)
+  const loadedTarget = result.entryId === result.targetEntryId
+    ? loadedEntry
+    : await ensureTranscriptEntryLoaded(result.targetEntryId)
+  return loadedEntry && loadedTarget
+}
+
+interface ProjectSearchTarget {
+  entryId: string
+  targetEntryId: string
+}
+
+export function getProjectSearchTargetKey(activeChatId: string, target: ProjectSearchTarget) {
+  return `${activeChatId}:${target.entryId}:${target.targetEntryId}`
+}
+
+export function shouldAttemptProjectSearchTargetLoad({
+  activeChatId,
+  target,
+  handledKey,
+  pendingKey,
+}: {
+  activeChatId: string | null
+  target: ProjectSearchTarget | null | undefined
+  handledKey: string | null
+  pendingKey: string | null
+}) {
+  if (!target || !activeChatId) return null
+  const targetKey = getProjectSearchTargetKey(activeChatId, target)
+  if (handledKey === targetKey || pendingKey === targetKey) return null
+  return targetKey
+}
+
+export function getNextHandledProjectSearchTargetKey(currentKey: string | null, targetKey: string, loaded: boolean) {
+  return loaded ? targetKey : currentKey
+}
 
 function useEmptyStateTyping(showEmptyState: boolean, activeChatId: string | null) {
   const [typedEmptyStateText, setTypedEmptyStateText] = useState("")
@@ -467,7 +525,8 @@ function ChatWorkspace({
 }
 
 export function ChatPage() {
-  const state = useOutletContext<KannaState>()
+  const state = useOutletContext<KannaState & { projectSearchPopoverProps?: ProjectChatSearchPopoverProps }>()
+  const location = useLocation()
   const dialog = useAppDialog()
   const layoutRootRef = useRef<HTMLDivElement>(null)
   const transcriptListRef = useRef<LegendListRef | null>(null)
@@ -479,6 +538,9 @@ export function ChatPage() {
   const { inputRef, syncInputHeight, transcriptPaddingBottom } = useTranscriptPaddingBottom()
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [pendingTerminalCommands, setPendingTerminalCommands] = useState<Record<string, string>>({})
+  const [searchTargetEntryId, setSearchTargetEntryId] = useState<string | null>(null)
+  const handledProjectSearchTargetRef = useRef<string | null>(null)
+  const pendingProjectSearchTargetRef = useRef<string | null>(null)
   const showEmptyState = state.messages.length === 0 && state.runtime?.title === "New Chat"
   const projectId = state.activeProjectId
   const projectTerminalLayout = useTerminalLayoutStore((store) => (projectId ? store.projects[projectId] : undefined))
@@ -589,6 +651,43 @@ export function ChatPage() {
   })
 
   const { typedEmptyStateText, isEmptyStateTypingComplete } = useEmptyStateTyping(showEmptyState, state.activeChatId)
+
+  useEffect(() => {
+    setSearchTargetEntryId(null)
+    handledProjectSearchTargetRef.current = null
+    pendingProjectSearchTargetRef.current = null
+  }, [state.activeChatId])
+
+  useEffect(() => {
+    const target = (location.state as { projectSearchTarget?: { entryId: string; targetEntryId: string } } | null)?.projectSearchTarget
+    const targetKey = shouldAttemptProjectSearchTargetLoad({
+      activeChatId: state.activeChatId,
+      target,
+      handledKey: handledProjectSearchTargetRef.current,
+      pendingKey: pendingProjectSearchTargetRef.current,
+    })
+    if (!target || !targetKey) return
+    pendingProjectSearchTargetRef.current = targetKey
+
+    void (async () => {
+      try {
+        const loaded = await ensureChatSearchResultTargetLoaded(target, state.ensureTranscriptEntryLoaded)
+        if (pendingProjectSearchTargetRef.current !== targetKey) return
+        handledProjectSearchTargetRef.current = getNextHandledProjectSearchTargetKey(
+          handledProjectSearchTargetRef.current,
+          targetKey,
+          loaded
+        )
+        if (loaded) {
+          setSearchTargetEntryId(target.targetEntryId)
+        }
+      } finally {
+        if (pendingProjectSearchTargetRef.current === targetKey) {
+          pendingProjectSearchTargetRef.current = null
+        }
+      }
+    })()
+  }, [location.state, state])
 
   useStickyChatFocus({
     rootRef: chatCardRef,
@@ -970,6 +1069,12 @@ export function ChatPage() {
           showScrollButton={showScrollToBottom && state.messages.length > 0}
           onIsAtEndChange={onIsAtEndChange}
           scrollToBottom={() => scrollToTranscriptEnd(true)}
+          scrollTargetEntryId={searchTargetEntryId}
+          onScrollTargetEntrySettled={() => {
+            setSearchTargetEntryId(null)
+            handledProjectSearchTargetRef.current = null
+            pendingProjectSearchTargetRef.current = null
+          }}
           typedEmptyStateText={typedEmptyStateText}
           isEmptyStateTypingComplete={isEmptyStateTypingComplete}
           isPageFileDragActive={isPageFileDragActive}
@@ -1138,7 +1243,10 @@ export function ChatPage() {
             className="min-h-0 min-w-0"
             groupResizeBehavior="preserve-relative-size"
           >
-            {workspace}
+            <div className="relative h-full min-h-0" data-project-search-workspace>
+              {workspace}
+              {state.projectSearchPopoverProps ? <ProjectChatSearchPopover {...state.projectSearchPopoverProps} /> : null}
+            </div>
           </ResizablePanel>
           <ResizableHandle
             withHandle={false}
@@ -1155,7 +1263,10 @@ export function ChatPage() {
           />
         </ResizablePanelGroup>
       ) : (
-        workspace
+        <div className="relative flex min-h-0 flex-1" data-project-search-workspace>
+          {workspace}
+          {state.projectSearchPopoverProps ? <ProjectChatSearchPopover {...state.projectSearchPopoverProps} /> : null}
+        </div>
       )}
       {isMobileRightSidebarOverlay ? (
         <MobileSidebarPane

@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, mock, test } from "bun:test"
 import {
   applySidebarProjectOrder,
   countMatchingUserPrompts,
+  ensureTranscriptEntryLoadedFromHistory,
   getActiveChatSnapshot,
   getNextMeasuredInputHeight,
   getNewestRemainingChatId,
@@ -321,6 +322,69 @@ describe("getActiveChatSnapshot", () => {
     }
 
     expect(getActiveChatSnapshot(snapshot, "chat-new")).toBeNull()
+  })
+})
+
+describe("ensureTranscriptEntryLoadedFromHistory", () => {
+  test("waits for an active history load before reporting the entry as missing", async () => {
+    let hasEntry = false
+    let activeHistoryLoad: Promise<void> | null = null
+    let resolveActiveHistoryLoad!: () => void
+    activeHistoryLoad = new Promise((resolve) => {
+      resolveActiveHistoryLoad = () => {
+        hasEntry = true
+        activeHistoryLoad = null
+        resolve()
+      }
+    })
+    const loadNextHistoryPage = mock(async () => {})
+
+    const result = ensureTranscriptEntryLoadedFromHistory({
+      hasEntry: () => hasEntry,
+      canLoadMoreHistory: () => false,
+      getCurrentHistoryLoad: () => activeHistoryLoad,
+      loadNextHistoryPage,
+    })
+
+    await Promise.resolve()
+    expect(loadNextHistoryPage).toHaveBeenCalledTimes(0)
+
+    resolveActiveHistoryLoad()
+
+    expect(await result).toBe(true)
+    expect(loadNextHistoryPage).toHaveBeenCalledTimes(0)
+  })
+
+  test("continues loading pages when an active history load does not include the entry", async () => {
+    let hasEntry = false
+    let canLoadMoreHistory = true
+    let activeHistoryLoad: Promise<void> | null = null
+    let resolveActiveHistoryLoad!: () => void
+    activeHistoryLoad = new Promise((resolve) => {
+      resolveActiveHistoryLoad = () => {
+        activeHistoryLoad = null
+        resolve()
+      }
+    })
+    const loadNextHistoryPage = mock(async () => {
+      hasEntry = true
+      canLoadMoreHistory = false
+    })
+
+    const result = ensureTranscriptEntryLoadedFromHistory({
+      hasEntry: () => hasEntry,
+      canLoadMoreHistory: () => canLoadMoreHistory,
+      getCurrentHistoryLoad: () => activeHistoryLoad,
+      loadNextHistoryPage,
+    })
+
+    await Promise.resolve()
+    expect(loadNextHistoryPage).toHaveBeenCalledTimes(0)
+
+    resolveActiveHistoryLoad()
+
+    expect(await result).toBe(true)
+    expect(loadNextHistoryPage).toHaveBeenCalledTimes(1)
   })
 })
 

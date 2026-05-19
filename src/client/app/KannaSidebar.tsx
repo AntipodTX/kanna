@@ -63,6 +63,7 @@ interface KannaSidebarProps {
   onOpenArchivedChat: (chatId: string) => void
   onDeleteChat: (chat: SidebarChatRow) => void
   onOpenAddProjectModal: () => void
+  onOpenProjectSearch: (projectId: string) => void
   onCopyPath: (localPath: string) => void
   onOpenExternalPath: (action: "open_finder" | "open_editor", localPath: string) => void
   onRenameProject: (projectId: string, sidebarTitle: string | undefined, realTitle: string) => void
@@ -95,6 +96,7 @@ function KannaSidebarImpl({
   onOpenArchivedChat,
   onDeleteChat,
   onOpenAddProjectModal,
+  onOpenProjectSearch,
   onCopyPath,
   onOpenExternalPath,
   onRenameProject,
@@ -518,6 +520,7 @@ function KannaSidebarImpl({
                   onCreateChat(projectId)
                 }
               }}
+              onOpenProjectSearch={onOpenProjectSearch}
               onCopyPath={onCopyPath}
               onOpenExternalPath={onOpenExternalPath}
               onRenameProject={onRenameProject}
