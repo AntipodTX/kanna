@@ -63,6 +63,53 @@ describe("processTranscriptMessages", () => {
     expect(messages[0].result).toEqual({ answers: { "Provider?": ["Codex"] } })
   })
 
+  test("keeps codex approval and approved command results separate", () => {
+    const messages = processTranscriptMessages([
+      entry({
+        kind: "tool_call",
+        tool: {
+          kind: "tool",
+          toolKind: "codex_approval",
+          toolName: "CodexApproval",
+          toolId: "call-1:approval",
+          input: {
+            approvalKind: "command_execution",
+            command: "echo approved",
+          },
+        },
+      }),
+      entry({
+        kind: "tool_result",
+        toolId: "call-1:approval",
+        content: { decision: "accept" },
+      }),
+      entry({
+        kind: "tool_call",
+        tool: {
+          kind: "tool",
+          toolKind: "bash",
+          toolName: "Bash",
+          toolId: "call-1",
+          input: { command: "echo approved" },
+        },
+      }),
+      entry({
+        kind: "tool_result",
+        toolId: "call-1",
+        content: "approved\n",
+      }),
+    ])
+
+    expect(messages).toHaveLength(2)
+    expect(messages[0]?.kind).toBe("tool")
+    expect(messages[1]?.kind).toBe("tool")
+    if (messages[0]?.kind !== "tool" || messages[1]?.kind !== "tool") throw new Error("unexpected messages")
+    expect(messages[0].toolKind).toBe("codex_approval")
+    expect(messages[0].result).toEqual({ decision: "accept" })
+    expect(messages[1].toolKind).toBe("bash")
+    expect(messages[1].result).toBe("approved\n")
+  })
+
   test("hydrates discarded prompt tool results", () => {
     const messages = processTranscriptMessages([
       entry({
@@ -203,6 +250,7 @@ describe("getLatestToolIds", () => {
     expect(getLatestToolIds(messages)).toEqual({
       AskUserQuestion: messages[0]?.kind === "tool" ? messages[0].id : null,
       ExitPlanMode: null,
+      CodexApproval: null,
       TodoWrite: messages[1]?.kind === "tool" ? messages[1].id : null,
     })
   })
@@ -248,6 +296,7 @@ describe("getLatestToolIds", () => {
     expect(getLatestToolIds(messages)).toEqual({
       AskUserQuestion: null,
       ExitPlanMode: null,
+      CodexApproval: null,
       TodoWrite: null,
     })
   })

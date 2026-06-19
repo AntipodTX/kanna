@@ -92,7 +92,8 @@ export function processTranscriptMessages(entries: TranscriptEntry[]): HydratedT
         if (pendingCall) {
           const rawResult = (
             pendingCall.normalized.toolKind === "ask_user_question" ||
-            pendingCall.normalized.toolKind === "exit_plan_mode"
+            pendingCall.normalized.toolKind === "exit_plan_mode" ||
+            pendingCall.normalized.toolKind === "codex_approval"
           )
             ? getStructuredToolResultFromDebug(entry) ?? entry.content
             : entry.content

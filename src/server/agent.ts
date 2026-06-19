@@ -52,7 +52,7 @@ const CLAUDE_TOOLSET = [
 
 interface PendingToolRequest {
   toolUseId: string
-  tool: NormalizedToolCall & { toolKind: "ask_user_question" | "exit_plan_mode" }
+  tool: NormalizedToolCall & { toolKind: "ask_user_question" | "exit_plan_mode" | "codex_approval" }
   resolve: (result: unknown) => void
 }
 
@@ -242,12 +242,19 @@ export function buildPromptText(content: string, attachments: ChatAttachment[]) 
 }
 
 function discardedToolResult(
-  tool: NormalizedToolCall & { toolKind: "ask_user_question" | "exit_plan_mode" }
+  tool: NormalizedToolCall & { toolKind: "ask_user_question" | "exit_plan_mode" | "codex_approval" }
 ) {
   if (tool.toolKind === "ask_user_question") {
     return {
       discarded: true,
       answers: {},
+    }
+  }
+
+  if (tool.toolKind === "codex_approval") {
+    return {
+      decision: "decline",
+      discarded: true,
     }
   }
 
@@ -1536,7 +1543,10 @@ export class AgentCoordinator {
           content: result,
         })
       )
-      if (active.provider === "codex" && pendingTool.tool.toolKind === "exit_plan_mode") {
+      if (
+        active.provider === "codex"
+        && (pendingTool.tool.toolKind === "exit_plan_mode" || pendingTool.tool.toolKind === "codex_approval")
+      ) {
         pendingTool.resolve(result)
       }
     }

@@ -92,6 +92,7 @@ function StandaloneTranscriptApp() {
     _clearContext?: boolean,
     _message?: string,
   ) => Promise.resolve(), [])
+  const handleCodexApproval = useCallback(() => Promise.resolve(), [])
   const handleOpenLocalLink = useCallback(() => Promise.resolve(), [])
   const scrollToBottom = useCallback(() => {
     void listRef.current?.scrollToEnd?.({ animated: true })
@@ -172,6 +173,7 @@ function StandaloneTranscriptApp() {
             onOpenLocalLink={handleOpenLocalLink}
             onAskUserQuestionSubmit={handleAskUserQuestion}
             onExitPlanModeConfirm={handleExitPlanMode}
+            onCodexApprovalDecision={handleCodexApproval}
             showScrollButton={!isAtEnd && messages.length > 0}
             onIsAtEndChange={setIsAtEnd}
             scrollToBottom={scrollToBottom}

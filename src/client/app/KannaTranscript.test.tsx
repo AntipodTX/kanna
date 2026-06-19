@@ -16,10 +16,11 @@ function renderTranscript(messages: HydratedTranscriptMessage[]) {
     <KannaTranscript
       messages={messages}
       isLoading={false}
-      latestToolIds={{ AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null }}
+      latestToolIds={{ AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null }}
       onOpenLocalLink={() => undefined}
       onAskUserQuestionSubmit={() => undefined}
       onExitPlanModeConfirm={() => undefined}
+      onCodexApprovalDecision={() => undefined}
     />
   )
 }
@@ -151,6 +152,29 @@ Please check the latest error first.`,
     expect(html).not.toContain("The user would like you to know the following.")
     expect(html).toContain("Please check the latest error first.")
     expect(html).toContain('aria-label="Sent mid-turn"')
+  })
+
+  test("renders codex approval prompts outside collapsed tool groups", () => {
+    const html = renderTranscript([
+      {
+        id: "approval-1",
+        kind: "tool",
+        toolKind: "codex_approval",
+        toolName: "CodexApproval",
+        toolId: "approval-tool-1",
+        input: {
+          approvalKind: "command_execution",
+          command: "/home/ap24/.bun/bin/bun test",
+          cwd: "/mnt/kanna",
+          reason: "Command failed in sandbox and can be retried without sandbox restrictions.",
+        },
+        timestamp: new Date().toISOString(),
+      },
+    ])
+
+    expect(html).toContain("Approve command")
+    expect(html).toContain("/home/ap24/.bun/bin/bun test")
+    expect(html).toContain("Approval pending")
   })
 
   test("does not render wrappers for context window updates", () => {
@@ -297,7 +321,7 @@ Please check the latest error first.`,
   })
 
   test("keeps tool-group row ids stable when the grouped run grows", () => {
-    const latestToolIds = { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null }
+    const latestToolIds = { AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null }
     const initialRows = buildResolvedTranscriptRows([
       createToolMessage("tool-1"),
       createToolMessage("tool-2"),
@@ -334,7 +358,7 @@ Please check the latest error first.`,
       createToolMessage("tool-2"),
     ], {
       isLoading: true,
-      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null },
+      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null },
     })
 
     expect(rows).toHaveLength(1)
@@ -361,7 +385,7 @@ Please check the latest error first.`,
       },
     ], {
       isLoading: true,
-      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null },
+      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null },
     })
 
     expect(rows).toHaveLength(2)
@@ -386,7 +410,7 @@ Please check the latest error first.`,
       createToolMessage("tool-2"),
     ], {
       isLoading: true,
-      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null },
+      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null },
     })
 
     expect(rows).toHaveLength(1)
@@ -407,7 +431,7 @@ Please check the latest error first.`,
       createToolMessage("tool-2"),
     ], {
       isLoading: true,
-      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null },
+      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null },
     })
 
     expect(rows).toHaveLength(3)
@@ -450,7 +474,7 @@ Please check the latest error first.`,
   })
 
   test("reuses unchanged single row objects across streaming updates", () => {
-    const latestToolIds = { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null }
+    const latestToolIds = { AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null }
     const previousRows = buildResolvedTranscriptRows([
       {
         id: "user-1",
@@ -497,7 +521,7 @@ Please check the latest error first.`,
   })
 
   test("replaces a user row when attachment content changes", () => {
-    const latestToolIds = { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null }
+    const latestToolIds = { AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null }
     const previousRows = buildResolvedTranscriptRows([
       {
         id: "user-attachment",
@@ -551,7 +575,7 @@ Please check the latest error first.`,
   })
 
   test("reuses unchanged tool-group rows across grouped run growth elsewhere", () => {
-    const latestToolIds = { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null }
+    const latestToolIds = { AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null }
     const previousRows = buildResolvedTranscriptRows([
       createToolMessage("tool-1"),
       createToolMessage("tool-2"),

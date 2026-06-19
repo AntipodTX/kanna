@@ -44,6 +44,7 @@ interface ChatTranscriptViewportProps {
   onOpenLocalLink: KannaState["handleOpenLocalLink"]
   onAskUserQuestionSubmit: KannaState["handleAskUserQuestion"]
   onExitPlanModeConfirm: KannaState["handleExitPlanMode"]
+  onCodexApprovalDecision: KannaState["handleCodexApproval"]
   showScrollButton: boolean
   onIsAtEndChange: (isAtEnd: boolean) => void
   scrollToBottom: () => void
@@ -78,6 +79,7 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
   onOpenLocalLink,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  onCodexApprovalDecision,
   showScrollButton,
   onIsAtEndChange,
   scrollToBottom,
@@ -218,9 +220,10 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
         onToolGroupExpandedChange={handleToolGroupExpandedChange}
         onAskUserQuestionSubmit={onAskUserQuestionSubmit}
         onExitPlanModeConfirm={onExitPlanModeConfirm}
+        onCodexApprovalDecision={onCodexApprovalDecision}
       />
     </div>
-  ), [handleToolGroupExpandedChange, onAskUserQuestionSubmit, onExitPlanModeConfirm, toolGroupExpanded])
+  ), [handleToolGroupExpandedChange, onAskUserQuestionSubmit, onCodexApprovalDecision, onExitPlanModeConfirm, toolGroupExpanded])
 
   const listHeader = (
     <div className="mx-auto w-full max-w-[800px]" style={{ paddingTop: `${headerOffsetPx}px` }}>
