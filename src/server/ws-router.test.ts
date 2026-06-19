@@ -1220,6 +1220,198 @@ describe("ws-router", () => {
     })
   })
 
+  test("searches the full current chat transcript without relying on loaded history pages", async () => {
+    const state = createEmptyState()
+    state.projectsById.set("project-1", {
+      id: "project-1",
+      localPath: "/tmp/project",
+      title: "Project",
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    state.projectIdsByPath.set("/tmp/project", "project-1")
+    state.chatsById.set("chat-1", {
+      id: "chat-1",
+      projectId: "project-1",
+      title: "Chat",
+      createdAt: 1,
+      updatedAt: 1,
+      unread: false,
+      provider: null,
+      planMode: false,
+      sessionToken: null,
+      lastTurnOutcome: null,
+    })
+
+    const router = createWsRouter({
+      store: {
+        state,
+        getChat: () => state.chatsById.get("chat-1") ?? null,
+        getMessages: () => [
+          {
+            _id: "recent-1",
+            kind: "assistant_text",
+            createdAt: 200,
+            text: "recent text",
+          },
+          {
+            _id: "older-1",
+            kind: "assistant_text",
+            createdAt: 1,
+            text: "needle is only in older transcript storage",
+          },
+        ],
+      } as never,
+      agent: { getActiveStatuses: () => new Map(), getDrainingChatIds: () => new Set() } as never,
+      terminals: {
+        getSnapshot: () => null,
+        onEvent: () => () => {},
+      } as never,
+      keybindings: {
+        getSnapshot: () => DEFAULT_KEYBINDINGS_SNAPSHOT,
+        onChange: () => () => {},
+      } as never,
+      refreshDiscovery: async () => [],
+      getDiscoveredProjects: () => [],
+      machineDisplayName: "Local Machine",
+      updateManager: null,
+    })
+    const ws = new FakeWebSocket()
+
+    await router.handleMessage(
+      ws as never,
+      JSON.stringify({
+        v: 1,
+        type: "command",
+        id: "search-1",
+        command: {
+          type: "chat.search",
+          chatId: "chat-1",
+          query: "needle",
+        },
+      })
+    )
+
+    expect(ws.sent[0]).toEqual({
+      v: PROTOCOL_VERSION,
+      type: "ack",
+      id: "search-1",
+      result: {
+        query: "needle",
+        matches: [{
+          chatId: "chat-1",
+          entryId: "older-1",
+          targetEntryId: "older-1",
+          messageId: undefined,
+          kind: "assistant_text",
+          createdAt: 1,
+          matchCount: 1,
+          preview: "needle is only in older transcript storage",
+        }],
+      },
+    })
+  })
+
+  test("includes tool entries in current chat search only when requested", async () => {
+    const state = createEmptyState()
+    state.projectsById.set("project-1", {
+      id: "project-1",
+      localPath: "/tmp/project",
+      title: "Project",
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    state.chatsById.set("chat-1", {
+      id: "chat-1",
+      projectId: "project-1",
+      title: "Chat",
+      createdAt: 1,
+      updatedAt: 1,
+      unread: false,
+      provider: null,
+      planMode: false,
+      sessionToken: null,
+      lastTurnOutcome: null,
+    })
+
+    const router = createWsRouter({
+      store: {
+        state,
+        getChat: () => state.chatsById.get("chat-1") ?? null,
+        getMessages: () => [
+          {
+            _id: "tool-1",
+            kind: "tool_call",
+            createdAt: 1,
+            tool: {
+              kind: "tool",
+              toolKind: "bash",
+              toolName: "Bash",
+              toolId: "tool-1",
+              input: { command: "echo tool-needle" },
+            },
+          },
+          {
+            _id: "tool-result-1",
+            kind: "tool_result",
+            createdAt: 2,
+            toolId: "tool-1",
+            content: "tool-needle in output",
+          },
+        ],
+      } as never,
+      agent: { getActiveStatuses: () => new Map(), getDrainingChatIds: () => new Set() } as never,
+      terminals: {
+        getSnapshot: () => null,
+        onEvent: () => () => {},
+      } as never,
+      keybindings: {
+        getSnapshot: () => DEFAULT_KEYBINDINGS_SNAPSHOT,
+        onChange: () => () => {},
+      } as never,
+      refreshDiscovery: async () => [],
+      getDiscoveredProjects: () => [],
+      machineDisplayName: "Local Machine",
+      updateManager: null,
+    })
+
+    const defaultWs = new FakeWebSocket()
+    await router.handleMessage(
+      defaultWs as never,
+      JSON.stringify({
+        v: 1,
+        type: "command",
+        id: "search-default",
+        command: {
+          type: "chat.search",
+          chatId: "chat-1",
+          query: "tool-needle",
+        },
+      })
+    )
+    expect((defaultWs.sent[0] as { result: { matches: unknown[] } }).result.matches).toEqual([])
+
+    const includeToolsWs = new FakeWebSocket()
+    await router.handleMessage(
+      includeToolsWs as never,
+      JSON.stringify({
+        v: 1,
+        type: "command",
+        id: "search-tools",
+        command: {
+          type: "chat.search",
+          chatId: "chat-1",
+          query: "tool-needle",
+          includeToolEntries: true,
+        },
+      })
+    )
+    expect((includeToolsWs.sent[0] as { result: { matches: Array<{ entryId: string }> } }).result.matches.map((match) => match.entryId)).toEqual([
+      "tool-1",
+      "tool-result-1",
+    ])
+  })
+
   test("marks chats read and rebroadcasts sidebar snapshots", async () => {
     const state = createEmptyState()
     state.projectsById.set("project-1", {

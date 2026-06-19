@@ -1,5 +1,5 @@
 import { type MouseEvent as ReactMouseEvent } from "react"
-import { Check, Flower, GitBranch, Globe, Loader2, Menu, MoreHorizontal, PanelLeft, PanelRight, SquarePen, Terminal, UserRoundPlus } from "lucide-react"
+import { Check, Flower, GitBranch, Globe, Loader2, Menu, MoreHorizontal, PanelLeft, PanelRight, Search, SquarePen, Terminal, UserRoundPlus } from "lucide-react"
 import type { EditorOpenSettings, EditorPreset, OpenExternalAction } from "../../../shared/protocol"
 import { Button } from "../ui/button"
 import { CardHeader } from "../ui/card"
@@ -24,6 +24,7 @@ function openContextMenuFromButton(event: ReactMouseEvent<HTMLButtonElement>) {
 function NavbarOverflowMenu({
   showOnDesktop,
   onToggleEmbeddedTerminal,
+  onOpenChatSearch,
   onExportTranscript,
   canExportTranscript,
   isExportingTranscript,
@@ -31,12 +32,13 @@ function NavbarOverflowMenu({
 }: {
   showOnDesktop: boolean
   onToggleEmbeddedTerminal?: () => void
+  onOpenChatSearch?: () => void
   onExportTranscript?: () => void
   canExportTranscript: boolean
   isExportingTranscript: boolean
   exportTranscriptComplete: boolean
 }) {
-  if (!onToggleEmbeddedTerminal && !onExportTranscript) return null
+  if (!onToggleEmbeddedTerminal && !onOpenChatSearch && !onExportTranscript) return null
 
   return (
     <ContextMenu>
@@ -64,6 +66,17 @@ function NavbarOverflowMenu({
           >
             <Terminal strokeWidth={2} className="h-3.5 w-3.5" />
             <span className="text-xs font-medium">Toggle Terminal</span>
+          </ContextMenuItem>
+        ) : null}
+        {onOpenChatSearch ? (
+          <ContextMenuItem
+            onSelect={(event) => {
+              event.preventDefault()
+              onOpenChatSearch()
+            }}
+          >
+            <Search strokeWidth={2} className="h-3.5 w-3.5" />
+            <span className="text-xs font-medium">Search Chat</span>
           </ContextMenuItem>
         ) : null}
         {onExportTranscript ? (
@@ -98,7 +111,8 @@ interface Props {
   localPath?: string
   embeddedTerminalVisible?: boolean
   onToggleEmbeddedTerminal?: () => void
-  rightPanel?: "hidden" | "git" | "browser"
+  onOpenChatSearch?: () => void
+  rightPanel?: "hidden" | "git" | "browser" | "search"
   onToggleGitPanel?: () => void
   onToggleBrowserPanel?: () => void
   onOpenExternal?: (action: OpenExternalAction, editor?: EditorOpenSettings) => void
@@ -126,6 +140,7 @@ export function ChatNavbar({
   localPath,
   embeddedTerminalVisible = false,
   onToggleEmbeddedTerminal,
+  onOpenChatSearch,
   rightPanel = "hidden",
   onToggleGitPanel,
   onToggleBrowserPanel,
@@ -152,9 +167,15 @@ export function ChatNavbar({
       : (branchName ?? "Detached HEAD")
   const isMac = platform === "darwin"
   const rightPanelVisible = rightPanel !== "hidden"
-  const handleCloseRightPanel = rightPanel === "browser" ? onToggleBrowserPanel : rightPanel === "git" ? onToggleGitPanel : undefined
-  const showBrowserPanelButton = rightPanel === "hidden" || rightPanel === "git"
-  const showGitPanelButton = rightPanel === "hidden" || rightPanel === "browser"
+  const handleCloseRightPanel = rightPanel === "browser"
+    ? onToggleBrowserPanel
+    : rightPanel === "git"
+      ? onToggleGitPanel
+      : rightPanel === "search"
+        ? onOpenChatSearch
+        : undefined
+  const showBrowserPanelButton = rightPanel === "hidden" || rightPanel === "git" || rightPanel === "search"
+  const showGitPanelButton = rightPanel === "hidden" || rightPanel === "browser" || rightPanel === "search"
 
   return (
     <CardHeader
@@ -203,7 +224,7 @@ export function ChatNavbar({
 
         <div className="flex-1 min-w-0" />
 
-        {localPath && (onOpenExternal || onToggleEmbeddedTerminal || onToggleGitPanel || onToggleBrowserPanel || onExportTranscript) ? (
+        {localPath && (onOpenExternal || onToggleEmbeddedTerminal || onOpenChatSearch || onToggleGitPanel || onToggleBrowserPanel || onExportTranscript) ? (
           <div className="flex items-center gap-2 flex-shrink-0">
             {onOpenExternal ? (
               <div className="hidden md:block border border-border/70 rounded-[9px] backdrop-blur-lg">
@@ -217,35 +238,36 @@ export function ChatNavbar({
                 />
               </div>
             ) : null}
-            {(onToggleEmbeddedTerminal || onToggleGitPanel || onToggleBrowserPanel || onExportTranscript) ? (
+            {(onToggleEmbeddedTerminal || onOpenChatSearch || onToggleGitPanel || onToggleBrowserPanel || onExportTranscript) ? (
               <div className="flex items-center  rounded-[9px] h-[30px]">
                 <NavbarOverflowMenu
                   showOnDesktop={rightPanelVisible}
                   onToggleEmbeddedTerminal={onToggleEmbeddedTerminal}
+                  onOpenChatSearch={onOpenChatSearch}
                   onExportTranscript={onExportTranscript}
                   canExportTranscript={canExportTranscript}
                   isExportingTranscript={isExportingTranscript}
                   exportTranscriptComplete={exportTranscriptComplete}
                 />
                 {onToggleEmbeddedTerminal ? (
-                <HotkeyTooltip>
-                  <HotkeyTooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="none"
-                      onClick={onToggleEmbeddedTerminal}
-                      className={cn(
-                        rightPanelVisible ? "hidden" : "hidden md:flex",
-                        "border border-border/0 hover:!border-border/0 px-1.5 h-9 hover:!bg-transparent",
-                        embeddedTerminalVisible && "text-foreground"
-                      )}
-                    >
-                      <Terminal strokeWidth={2} className="h-4" />
-                    </Button>
-                  </HotkeyTooltipTrigger>
-                  <HotkeyTooltipContent side="bottom" shortcut={terminalShortcut} />
-                </HotkeyTooltip>
-              ) : null}
+                  <HotkeyTooltip>
+                    <HotkeyTooltipTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="none"
+                        onClick={onToggleEmbeddedTerminal}
+                        className={cn(
+                          rightPanelVisible ? "hidden" : "hidden md:flex",
+                          "border border-border/0 hover:!border-border/0 px-1.5 h-9 hover:!bg-transparent",
+                          embeddedTerminalVisible && "text-foreground"
+                        )}
+                      >
+                        <Terminal strokeWidth={2} className="h-4" />
+                      </Button>
+                    </HotkeyTooltipTrigger>
+                    <HotkeyTooltipContent side="bottom" shortcut={terminalShortcut} />
+                  </HotkeyTooltip>
+                ) : null}
                 {onExportTranscript ? (
                   <Button
                     variant="ghost"
@@ -280,6 +302,21 @@ export function ChatNavbar({
                     )}
                   >
                     <Globe strokeWidth={2.25} className="h-4" />
+                  </Button>
+                ) : null}
+                {onOpenChatSearch ? (
+                  <Button
+                    variant="ghost"
+                    size="none"
+                    onClick={onOpenChatSearch}
+                    title="Search chat"
+                    aria-label="Search chat"
+                    className={cn(
+                      rightPanelVisible ? "hidden" : "hidden md:flex",
+                      "border border-border/0 hover:!border-border/0 px-1.5 h-9 hover:!bg-transparent"
+                    )}
+                  >
+                    <Search strokeWidth={2.25} className="h-4" />
                   </Button>
                 ) : null}
                 {onToggleGitPanel && showGitPanelButton ? (

@@ -12,6 +12,7 @@ import { cn } from "../../lib/utils"
 import { shouldOpenLocalFileLinkInEditor } from "../../lib/pathUtils"
 import {
   buildResolvedTranscriptRows,
+  findResolvedTranscriptRowIndexForEntry,
   KannaTranscriptRow,
   type ResolvedTranscriptRow,
   useStableResolvedRows,
@@ -22,6 +23,11 @@ import {
   EMPTY_STATE_TEXT,
 } from "./utils"
 import type { EditorPreset } from "../../../shared/protocol"
+
+interface TranscriptViewportExtraData {
+  toolGroupExpanded: Record<string, boolean>
+  revealEntryId: string | null
+}
 
 interface ChatTranscriptViewportProps {
   activeChatId: string | null
@@ -47,6 +53,8 @@ interface ChatTranscriptViewportProps {
   showScrollButton: boolean
   onIsAtEndChange: (isAtEnd: boolean) => void
   scrollToBottom: () => void
+  scrollTargetEntryId?: string | null
+  onScrollTargetEntrySettled?: () => void
   typedEmptyStateText: string
   isEmptyStateTypingComplete: boolean
   isPageFileDragActive: boolean
@@ -81,6 +89,8 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
   showScrollButton,
   onIsAtEndChange,
   scrollToBottom,
+  scrollTargetEntryId,
+  onScrollTargetEntrySettled,
   typedEmptyStateText,
   isEmptyStateTypingComplete,
   isPageFileDragActive,
@@ -187,6 +197,42 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
     void loadOlderHistory()
   }, [hasOlderHistory, isHistoryLoading, loadOlderHistory])
 
+  useEffect(() => {
+    if (!scrollTargetEntryId) return
+    const rowIndex = findResolvedTranscriptRowIndexForEntry(resolvedRows, scrollTargetEntryId)
+    if (rowIndex < 0) return
+    const row = resolvedRows[rowIndex]
+
+    if (row?.kind === "tool-group") {
+      setToolGroupExpanded((current) => (
+        current[row.id]
+          ? current
+          : {
+              ...current,
+              [row.id]: true,
+            }
+      ))
+    }
+
+    let settledFrameId: number | null = null
+    const frameId = window.requestAnimationFrame(() => {
+      void listRef.current?.scrollToIndex?.({
+        index: rowIndex,
+        animated: true,
+        viewPosition: 0.2,
+      })
+      settledFrameId = window.requestAnimationFrame(() => {
+        onScrollTargetEntrySettled?.()
+      })
+    })
+    return () => {
+      window.cancelAnimationFrame(frameId)
+      if (settledFrameId !== null) {
+        window.cancelAnimationFrame(settledFrameId)
+      }
+    }
+  }, [listRef, onScrollTargetEntrySettled, resolvedRows, scrollTargetEntryId])
+
   const handleOpenLocalLinkClick = useCallback((target: OpenLocalLinkTarget) => {
     if (target.trigger !== "contextmenu") {
       const action = shouldOpenLocalFileLinkInEditor(target.path) ? "open_editor" : "open_default"
@@ -210,17 +256,23 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
     })
   }, [onOpenLocalLink])
 
-  const renderItem = useCallback(({ item }: { item: ResolvedTranscriptRow }) => (
+  const transcriptExtraData = useMemo<TranscriptViewportExtraData>(() => ({
+    toolGroupExpanded,
+    revealEntryId: scrollTargetEntryId ?? null,
+  }), [scrollTargetEntryId, toolGroupExpanded])
+
+  const renderItem = useCallback(({ item, extraData }: { item: ResolvedTranscriptRow; extraData: TranscriptViewportExtraData }) => (
     <div className="mx-auto w-full max-w-[800px] pb-5" data-transcript-row-id={item.id}>
       <KannaTranscriptRow
         row={item}
-        toolGroupExpanded={item.kind === "tool-group" ? (toolGroupExpanded[item.id] ?? false) : undefined}
+        toolGroupExpanded={item.kind === "tool-group" ? (extraData.toolGroupExpanded[item.id] ?? false) : undefined}
         onToolGroupExpandedChange={handleToolGroupExpandedChange}
         onAskUserQuestionSubmit={onAskUserQuestionSubmit}
         onExitPlanModeConfirm={onExitPlanModeConfirm}
+        revealEntryId={extraData.revealEntryId}
       />
     </div>
-  ), [handleToolGroupExpandedChange, onAskUserQuestionSubmit, onExitPlanModeConfirm, toolGroupExpanded])
+  ), [handleToolGroupExpandedChange, onAskUserQuestionSubmit, onExitPlanModeConfirm])
 
   const listHeader = (
     <div className="mx-auto w-full max-w-[800px]" style={{ paddingTop: `${headerOffsetPx}px` }}>
@@ -267,7 +319,7 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
         <LegendList<ResolvedTranscriptRow>
           ref={listRef}
           data={resolvedRows}
-          extraData={toolGroupExpanded}
+          extraData={transcriptExtraData}
           keyExtractor={keyExtractor}
           renderItem={renderItem}
           estimatedItemSize={96}

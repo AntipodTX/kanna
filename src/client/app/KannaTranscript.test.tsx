@@ -1,17 +1,23 @@
 import { describe, expect, test } from "bun:test"
 import { renderToStaticMarkup } from "react-dom/server"
 import { CollapsedToolGroup } from "../components/messages/CollapsedToolGroup"
-import type { HydratedTranscriptMessage } from "../../shared/types"
+import type { HydratedBashToolCall, HydratedTranscriptMessage } from "../../shared/types"
 import {
   buildResolvedTranscriptRows,
   computeStableResolvedTranscriptRows,
+  findResolvedTranscriptRowIndexForEntry,
   KannaTranscript,
   type StableResolvedTranscriptRowsState,
 } from "./KannaTranscript"
 
 const ROW_WRAPPER_CLASS = "mx-auto max-w-[800px] pb-5"
 
-function renderTranscript(messages: HydratedTranscriptMessage[]) {
+function renderTranscript(
+  messages: HydratedTranscriptMessage[],
+  options: {
+    revealEntryId?: string | null
+  } = {},
+) {
   return renderToStaticMarkup(
     <KannaTranscript
       messages={messages}
@@ -20,6 +26,7 @@ function renderTranscript(messages: HydratedTranscriptMessage[]) {
       onOpenLocalLink={() => undefined}
       onAskUserQuestionSubmit={() => undefined}
       onExitPlanModeConfirm={() => undefined}
+      revealEntryId={options.revealEntryId}
     />
   )
 }
@@ -28,7 +35,7 @@ function countRowWrappers(html: string) {
   return html.split(ROW_WRAPPER_CLASS).length - 1
 }
 
-function createToolMessage(id: string, toolId = id): HydratedTranscriptMessage {
+function createToolMessage(id: string, toolId = id): HydratedBashToolCall {
   return {
     id,
     kind: "tool",
@@ -40,6 +47,15 @@ function createToolMessage(id: string, toolId = id): HydratedTranscriptMessage {
       description: `Run ${id}`,
     },
     timestamp: new Date().toISOString(),
+  }
+}
+
+function createToolMessageWithResult(id: string, result: string): HydratedTranscriptMessage {
+  return {
+    ...createToolMessage(id),
+    result,
+    rawResult: result,
+    isError: false,
   }
 }
 
@@ -414,6 +430,36 @@ Please check the latest error first.`,
     expect(rows[0]?.kind).toBe("single")
     expect(rows[1]?.kind).toBe("single")
     expect(rows[2]?.kind).toBe("single")
+  })
+
+  test("finds the rendered row index for single and grouped transcript entries", () => {
+    const rows = buildResolvedTranscriptRows([
+      {
+        id: "user-1",
+        kind: "user_prompt",
+        content: "Hello",
+        timestamp: new Date().toISOString(),
+      },
+      createToolMessage("tool-1"),
+      createToolMessage("tool-2"),
+    ], {
+      isLoading: true,
+      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null },
+    })
+
+    expect(findResolvedTranscriptRowIndexForEntry(rows, "user-1")).toBe(0)
+    expect(findResolvedTranscriptRowIndexForEntry(rows, "tool-2")).toBe(1)
+    expect(findResolvedTranscriptRowIndexForEntry(rows, "missing")).toBe(-1)
+  })
+
+  test("reveals expanded tool result content for a targeted tool call", () => {
+    const html = renderTranscript([
+      createToolMessageWithResult("tool-1", "needle appears inside the tool output"),
+    ], {
+      revealEntryId: "tool-1",
+    })
+
+    expect(html).toContain("needle appears inside the tool output")
   })
 
   test("renders grouped tools as expanded across rerenders while streaming when controlled", () => {

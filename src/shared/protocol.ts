@@ -17,6 +17,7 @@ import type {
   UpdateSnapshot,
   EditorPreset,
 } from "./types"
+import type { ChatSearchCommandResult } from "./chatSearch"
 
 export type { EditorPreset }
 
@@ -213,6 +214,7 @@ export type ClientCommand =
       attachmentMode: StandaloneTranscriptAttachmentMode
     }
   | { type: "chat.loadHistory"; chatId: string; beforeCursor: string; limit: number }
+  | { type: "chat.search"; chatId: string; query: string; includeToolEntries?: boolean }
   | { type: "chat.respondTool"; chatId: string; toolUseId: string; result: unknown }
   | {
       type: "message.enqueue"
@@ -260,7 +262,7 @@ export type ServerSnapshot =
 export type ServerEnvelope =
   | { v: 1; type: "snapshot"; id: string; snapshot: ServerSnapshot }
   | { v: 1; type: "event"; id: string; event: TerminalEvent }
-  | { v: 1; type: "ack"; id: string; result?: unknown | ChatHistoryPage | StandaloneTranscriptExportResult }
+  | { v: 1; type: "ack"; id: string; result?: unknown | ChatHistoryPage | ChatSearchCommandResult | StandaloneTranscriptExportResult }
   | { v: 1; type: "error"; id?: string; message: string }
 
 export function isClientEnvelope(value: unknown): value is ClientEnvelope {

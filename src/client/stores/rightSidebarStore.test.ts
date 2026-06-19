@@ -45,7 +45,10 @@ describe("rightSidebarStore", () => {
     useRightSidebarStore.getState().togglePanel(PROJECT_ID, "browser")
     expect(useRightSidebarStore.getState().projects[PROJECT_ID]?.rightPanel).toBe("browser")
 
-    useRightSidebarStore.getState().togglePanel(PROJECT_ID, "browser")
+    useRightSidebarStore.getState().togglePanel(PROJECT_ID, "search")
+    expect(useRightSidebarStore.getState().projects[PROJECT_ID]?.rightPanel).toBe("search")
+
+    useRightSidebarStore.getState().togglePanel(PROJECT_ID, "search")
     expect(useRightSidebarStore.getState().projects[PROJECT_ID]?.rightPanel).toBe("hidden")
   })
 
@@ -106,6 +109,9 @@ describe("rightSidebarStore", () => {
         [PROJECT_ID]: {
           rightPanel: "browser",
         },
+        "project-2": {
+          rightPanel: "search",
+        },
       },
     })
 
@@ -114,6 +120,9 @@ describe("rightSidebarStore", () => {
       projects: {
         [PROJECT_ID]: {
           rightPanel: "browser",
+        },
+        "project-2": {
+          rightPanel: "search",
         },
       },
       projectUi: {},
