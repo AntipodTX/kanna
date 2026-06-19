@@ -5,6 +5,7 @@ import path from "node:path"
 import type { AppSettingsSnapshot, KeybindingsSnapshot, LlmProviderSnapshot, UpdateSnapshot } from "../shared/types"
 import { PROTOCOL_VERSION } from "../shared/types"
 import { createEmptyState } from "./events"
+import { StartupSyncProgress } from "./startup-sync"
 import {
   assertSafeSkillId,
   assertSafeSkillSource,
@@ -261,6 +262,74 @@ describe("ws-router", () => {
         id: "ping-1",
       },
     ])
+  })
+
+  test("publishes startup session sync progress snapshots", async () => {
+    const startupSync = new StartupSyncProgress()
+    const router = createWsRouter({
+      store: { state: createEmptyState() } as never,
+      agent: { getActiveStatuses: () => new Map(), getDrainingChatIds: () => new Set() } as never,
+      terminals: {
+        getSnapshot: () => null,
+        onEvent: () => () => {},
+      } as never,
+      keybindings: {
+        getSnapshot: () => DEFAULT_KEYBINDINGS_SNAPSHOT,
+        onChange: () => () => {},
+      } as never,
+      refreshDiscovery: async () => [],
+      getDiscoveredProjects: () => [],
+      machineDisplayName: "Local Machine",
+      updateManager: null,
+      startupSync,
+    })
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+
+    await router.handleMessage(
+      ws as never,
+      JSON.stringify({
+        v: 1,
+        type: "subscribe",
+        id: "startup-sync-sub",
+        topic: { type: "startup-sync" },
+      })
+    )
+    startupSync.begin()
+    startupSync.append("[kanna] session sync: scanning Claude sessions")
+
+    expect(ws.sent).toContainEqual({
+      v: PROTOCOL_VERSION,
+      type: "snapshot",
+      id: "startup-sync-sub",
+      snapshot: {
+        type: "startup-sync",
+        data: {
+          enabled: false,
+          mode: "session-sync",
+          status: "idle",
+          messages: [],
+          startedAt: null,
+          completedAt: null,
+          error: null,
+        },
+      },
+    })
+    expect(ws.sent.at(-1)).toMatchObject({
+      v: PROTOCOL_VERSION,
+      type: "snapshot",
+      id: "startup-sync-sub",
+      snapshot: {
+        type: "startup-sync",
+        data: {
+          enabled: true,
+          status: "running",
+          messages: ["[kanna] session sync: scanning Claude sessions"],
+        },
+      },
+    })
+
+    router.dispose()
   })
 
   test("reads and writes llm provider settings via commands", async () => {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { deleteProjectUpload, inferAttachmentContentType, persistProjectUpload } from "./uploads"
@@ -26,6 +26,32 @@ async function startIsolatedServer(options: { port: number; strictPort?: boolean
 }
 
 describe("uploads", () => {
+  test("reports storage recovery incidents during startup", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "kanna-server-recovery-"))
+    tempDirs.push(dataDir)
+    const progress: string[] = []
+
+    await writeFile(path.join(dataDir, "snapshot.json"), "{not-json", "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    const server = await startKannaServer({
+      dataDir,
+      port: 0,
+      onMigrationProgress: (message) => progress.push(message),
+    })
+
+    try {
+      expect(progress).toHaveLength(1)
+      expect(progress[0]).toContain("storage recovery")
+      expect(progress[0]).toContain("snapshot snapshot.json was ignored")
+      expect(progress[0]).toContain("backed up to")
+    } finally {
+      console.warn = originalWarn
+      await server.stop()
+    }
+  })
+
   test("stores uploads in .kanna/uploads and keeps duplicate filenames", async () => {
     const projectDir = await mkdtemp(path.join(tmpdir(), "kanna-upload-test-"))
     tempDirs.push(projectDir)

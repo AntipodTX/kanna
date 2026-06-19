@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -343,6 +343,295 @@ describe("EventStore", () => {
     await store.initialize()
 
     expect(store.getChat("chat-1")?.unread).toBe(false)
+  })
+
+  test("recovers from replay logs when snapshot is corrupt", async () => {
+    const dataDir = await createTempDataDir()
+    const snapshotPath = join(dataDir, "snapshot.json")
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+    const chatsLogPath = join(dataDir, "chats.jsonl")
+
+    await writeFile(snapshotPath, "{not-json", "utf8")
+    await writeFile(projectsLogPath, `${JSON.stringify({
+      v: 2,
+      type: "project_opened",
+      timestamp: 10,
+      projectId: "project-1",
+      localPath: "/tmp/project",
+      title: "Project",
+    })}\n`, "utf8")
+    await writeFile(chatsLogPath, `${JSON.stringify({
+      v: 2,
+      type: "chat_created",
+      timestamp: 11,
+      chatId: "chat-1",
+      projectId: "project-1",
+      title: "Recovered Chat",
+    })}\n`, "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      expect(store.getProject("project-1")?.localPath).toBe("/tmp/project")
+      expect(store.getChat("chat-1")?.title).toBe("Recovered Chat")
+      expect(store.getStartupRecoveryIncidents()).toMatchObject([
+        {
+          kind: "snapshot",
+          sourcePath: snapshotPath,
+        },
+      ])
+      expect((await readdir(join(dataDir, "recovery"))).length).toBe(1)
+    } finally {
+      console.warn = originalWarn
+    }
+
+    const recoveredSnapshot = JSON.parse(await readFile(snapshotPath, "utf8")) as SnapshotFile
+    expect(recoveredSnapshot.projects.map((project) => project.id)).toEqual(["project-1"])
+    expect(recoveredSnapshot.chats.map((chat) => chat.id)).toEqual(["chat-1"])
+    expect(await readFile(projectsLogPath, "utf8")).toBe("")
+    expect(await readFile(chatsLogPath, "utf8")).toBe("")
+  })
+
+  test("backs up a corrupt snapshot before replaying logs", async () => {
+    const dataDir = await createTempDataDir()
+    const snapshotPath = join(dataDir, "snapshot.json")
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+
+    await writeFile(snapshotPath, "{not-json", "utf8")
+    await writeFile(projectsLogPath, `${JSON.stringify({
+      v: 2,
+      type: "project_opened",
+      timestamp: 1,
+      projectId: "project-1",
+      localPath: "/tmp/project",
+      title: "Project",
+    })}\n`, "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      const backupFiles = await readdir(join(dataDir, "recovery"))
+      const snapshotBackup = backupFiles.find((file) => file.includes("snapshot") && file.endsWith(".json"))
+      expect(snapshotBackup).toBeString()
+      expect(await readFile(join(dataDir, "recovery", snapshotBackup!), "utf8")).toBe("{not-json")
+      expect(store.getStartupRecoveryIncidents()).toContainEqual(expect.objectContaining({
+        kind: "snapshot",
+        sourcePath: snapshotPath,
+        backupPath: join(dataDir, "recovery", snapshotBackup!),
+      }))
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
+  test("replaces a corrupt snapshot after recovery even when logs are small", async () => {
+    const dataDir = await createTempDataDir()
+    const snapshotPath = join(dataDir, "snapshot.json")
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+
+    await writeFile(snapshotPath, "{not-json", "utf8")
+    await writeFile(projectsLogPath, `${JSON.stringify({
+      v: 2,
+      type: "project_opened",
+      timestamp: 1,
+      projectId: "project-1",
+      localPath: "/tmp/project",
+      title: "Project",
+    })}\n`, "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      const recoveredSnapshot = JSON.parse(await readFile(snapshotPath, "utf8")) as SnapshotFile
+      expect(recoveredSnapshot.projects.map((project) => project.id)).toEqual(["project-1"])
+      expect(await readFile(projectsLogPath, "utf8")).toBe("")
+
+      const reloaded = new EventStore(dataDir)
+      await reloaded.initialize()
+      expect(reloaded.getStartupRecoveryIncidents()).toEqual([])
+      expect(reloaded.getProject("project-1")?.title).toBe("Project")
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
+  test("backs up a log with a corrupt middle line and records a startup incident", async () => {
+    const dataDir = await createTempDataDir()
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+
+    await writeFile(projectsLogPath, [
+      JSON.stringify({
+        v: 2,
+        type: "project_opened",
+        timestamp: 10,
+        projectId: "project-1",
+        localPath: "/tmp/project-a",
+        title: "Project A",
+      }),
+      "{not-json",
+      JSON.stringify({
+        v: 2,
+        type: "project_opened",
+        timestamp: 12,
+        projectId: "project-2",
+        localPath: "/tmp/project-b",
+        title: "Project B",
+      }),
+      "",
+    ].join("\n"), "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      expect(store.getProject("project-1")?.localPath).toBe("/tmp/project-a")
+      expect(store.getProject("project-2")?.localPath).toBe("/tmp/project-b")
+      expect(store.getStartupRecoveryIncidents()).toMatchObject([
+        {
+          kind: "log",
+          sourcePath: projectsLogPath,
+          line: 2,
+        },
+      ])
+      expect((await readdir(join(dataDir, "recovery"))).length).toBe(1)
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
+  test("ignores a corrupt trailing log line without entering recovery mode", async () => {
+    const dataDir = await createTempDataDir()
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+
+    await writeFile(projectsLogPath, [
+      JSON.stringify({
+        v: 2,
+        type: "project_opened",
+        timestamp: 10,
+        projectId: "project-1",
+        localPath: "/tmp/project",
+        title: "Project",
+      }),
+      "{not-json",
+      "",
+    ].join("\n"), "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      expect(store.getProject("project-1")?.localPath).toBe("/tmp/project")
+      expect(store.getStartupRecoveryIncidents()).toEqual([])
+      expect(await Bun.file(join(dataDir, "recovery")).exists()).toBe(false)
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
+  test("continues replay when backing up a corrupt log fails", async () => {
+    const dataDir = await createTempDataDir()
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+
+    await writeFile(projectsLogPath, [
+      JSON.stringify({
+        v: 2,
+        type: "project_opened",
+        timestamp: 1,
+        projectId: "project-1",
+        localPath: "/tmp/project",
+        title: "Project",
+      }),
+      "{not-json",
+      JSON.stringify({
+        v: 2,
+        type: "project_opened",
+        timestamp: 2,
+        projectId: "project-2",
+        localPath: "/tmp/project-2",
+        title: "Project 2",
+      }),
+      "",
+    ].join("\n"), "utf8")
+    await writeFile(join(dataDir, "recovery"), "not-a-directory", "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      const incidents = store.getStartupRecoveryIncidents()
+      expect(store.getProject("project-1")?.title).toBe("Project")
+      expect(store.getProject("project-2")?.title).toBe("Project 2")
+      expect(incidents).toHaveLength(1)
+      expect(incidents[0]).toMatchObject({
+        kind: "log",
+        sourcePath: projectsLogPath,
+        backupPath: null,
+        line: 2,
+      })
+      expect(incidents[0]!.reason).toContain("backup failed:")
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
+  test("records only one startup incident for an incompatible event log", async () => {
+    const dataDir = await createTempDataDir()
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+
+    await writeFile(projectsLogPath, [
+      JSON.stringify({
+        v: 1,
+        type: "project_opened",
+        timestamp: 1,
+        projectId: "project-1",
+        localPath: "/tmp/project",
+        title: "Project",
+      }),
+      JSON.stringify({
+        v: 1,
+        type: "project_opened",
+        timestamp: 2,
+        projectId: "project-2",
+        localPath: "/tmp/project-2",
+        title: "Project 2",
+      }),
+      "",
+    ].join("\n"), "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      const incidents = store.getStartupRecoveryIncidents()
+      expect(incidents).toHaveLength(1)
+      expect(incidents[0]).toMatchObject({
+        kind: "log",
+        sourcePath: projectsLogPath,
+        line: 1,
+        reason: "incompatible event version 1",
+      })
+      expect(incidents[0]!.backupPath).toBeString()
+      expect(await readFile(incidents[0]!.backupPath!, "utf8")).toContain("project-2")
+    } finally {
+      console.warn = originalWarn
+    }
   })
 
   test("persists sidebar project order across restart and compaction", async () => {

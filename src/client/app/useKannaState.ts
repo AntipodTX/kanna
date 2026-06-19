@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router-dom"
 import { useShallow } from "zustand/react/shallow"
-import { PROVIDERS, type AgentProvider, type AppSettingsPatch, type AppSettingsSnapshot, type AskUserQuestionAnswerMap, type ChatAttachment, type ChatDiffSnapshot, type ChatHistoryPage, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type TranscriptEntry, type UpdateInstallResult, type UpdateSnapshot, type UserPromptEntry } from "../../shared/types"
+import { PROVIDERS, type AgentProvider, type AppSettingsPatch, type AppSettingsSnapshot, type AskUserQuestionAnswerMap, type ChatAttachment, type ChatDiffSnapshot, type ChatHistoryPage, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type StartupSyncSnapshot, type TranscriptEntry, type UpdateInstallResult, type UpdateSnapshot, type UserPromptEntry } from "../../shared/types"
 import { NEW_CHAT_COMPOSER_ID, type ComposerState, useChatPreferencesStore } from "../stores/chatPreferencesStore"
 import { useRightSidebarStore } from "../stores/rightSidebarStore"
 import { useTerminalLayoutStore } from "../stores/terminalLayoutStore"
@@ -652,6 +652,7 @@ export interface KannaState {
   sidebarData: SidebarData
   localProjects: LocalProjectsSnapshot | null
   updateSnapshot: UpdateSnapshot | null
+  startupSync: StartupSyncSnapshot | null
   chatSnapshot: ChatSnapshot | null
   chatDiffSnapshot: ChatDiffSnapshot | null
   keybindings: KeybindingsSnapshot | null
@@ -747,6 +748,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
   const [optimisticSidebarProjectOrder, setOptimisticSidebarProjectOrder] = useState<string[] | null>(null)
   const [localProjects, setLocalProjects] = useState<LocalProjectsSnapshot | null>(null)
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null)
+  const [startupSync, setStartupSync] = useState<StartupSyncSnapshot | null>(null)
   const [chatSnapshot, setChatSnapshot] = useState<ChatSnapshot | null>(null)
   const [olderHistoryEntries, setOlderHistoryEntries] = useState<TranscriptEntry[]>([])
   const [isHistoryLoading, setIsHistoryLoading] = useState(false)
@@ -836,6 +838,13 @@ export function useKannaState(activeChatId: string | null): KannaState {
   useEffect(() => {
     return socket.subscribe<UpdateSnapshot>({ type: "update" }, (snapshot) => {
       setUpdateSnapshot(snapshot)
+      setCommandError(null)
+    })
+  }, [socket])
+
+  useEffect(() => {
+    return socket.subscribe<StartupSyncSnapshot>({ type: "startup-sync" }, (snapshot) => {
+      setStartupSync(snapshot)
       setCommandError(null)
     })
   }, [socket])
@@ -2031,6 +2040,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
     sidebarData: resolvedSidebarData,
     localProjects,
     updateSnapshot,
+    startupSync,
     chatSnapshot,
     chatDiffSnapshot,
     keybindings,

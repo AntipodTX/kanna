@@ -514,6 +514,19 @@ export interface UpdateSnapshot {
   reloadRequestedAt: number | null
 }
 
+export type StartupSyncStatus = "idle" | "running" | "completed" | "failed"
+export type StartupSyncMode = "session-sync" | "storage-recovery"
+
+export interface StartupSyncSnapshot {
+  enabled: boolean
+  mode: StartupSyncMode
+  status: StartupSyncStatus
+  messages: string[]
+  startedAt: number | null
+  completedAt: number | null
+  error: string | null
+}
+
 export type UpdateInstallErrorCode =
   | "version_not_live_yet"
   | "install_failed"

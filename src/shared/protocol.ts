@@ -14,6 +14,7 @@ import type {
   SidebarData,
   StandaloneTranscriptAttachmentMode,
   StandaloneTranscriptExportResult,
+  StartupSyncSnapshot,
   UpdateSnapshot,
   EditorPreset,
 } from "./types"
@@ -45,6 +46,7 @@ export type SubscriptionTopic =
   | { type: "sidebar" }
   | { type: "local-projects" }
   | { type: "update" }
+  | { type: "startup-sync" }
   | { type: "keybindings" }
   | { type: "app-settings" }
   | { type: "chat"; chatId: string; recentLimit?: number }
@@ -250,6 +252,7 @@ export type ServerSnapshot =
   | { type: "sidebar"; data: SidebarData }
   | { type: "local-projects"; data: LocalProjectsSnapshot }
   | { type: "update"; data: UpdateSnapshot }
+  | { type: "startup-sync"; data: StartupSyncSnapshot }
   | { type: "keybindings"; data: KeybindingsSnapshot }
   | { type: "app-settings"; data: AppSettingsSnapshot }
   | { type: "llm-provider"; data: LlmProviderSnapshot }
