@@ -1,7 +1,8 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type CSSProperties, type DragEvent, type ReactNode, type RefObject } from "react"
 import { type LegendListRef } from "@legendapp/list/react"
 import type { GroupImperativeHandle } from "react-resizable-panels"
-import { useOutletContext } from "react-router-dom"
+import { useNavigate, useOutletContext } from "react-router-dom"
+import type { ChatSearchCommandResult, ChatSearchEntryResult } from "../../../shared/chatSearch"
 import type { ChatInputHandle } from "../../components/chat-ui/ChatInput"
 import { ChatNavbar } from "../../components/chat-ui/ChatNavbar"
 import { BrowserPanel } from "../../components/chat-ui/BrowserPanel"
@@ -28,6 +29,7 @@ import { useTerminalToggleAnimation } from "../useTerminalToggleAnimation"
 import type { KannaState } from "../useKannaState"
 import { getNextMeasuredInputHeight, getTranscriptPaddingBottom } from "../useKannaState"
 import { ChatInputDock } from "./ChatInputDock"
+import { ChatSearchPanel } from "./ChatSearchPanel"
 import { ChatTranscriptViewport } from "./ChatTranscriptViewport"
 import { TerminalWorkspaceShell } from "./TerminalWorkspaceShell"
 import { useChatPageSidebarActions, EMPTY_DIFF_SNAPSHOT } from "./useChatPageSidebarActions"
@@ -43,6 +45,17 @@ export {
   hasFileDragTypes,
   shouldAutoFollowTranscriptResize,
 } from "./utils"
+
+export async function ensureChatSearchResultTargetLoaded(
+  result: Pick<ChatSearchEntryResult, "entryId" | "targetEntryId">,
+  ensureTranscriptEntryLoaded: (entryId: string) => Promise<boolean>,
+) {
+  const loadedEntry = await ensureTranscriptEntryLoaded(result.entryId)
+  const loadedTarget = result.entryId === result.targetEntryId
+    ? loadedEntry
+    : await ensureTranscriptEntryLoaded(result.targetEntryId)
+  return loadedEntry && loadedTarget
+}
 
 function useEmptyStateTyping(showEmptyState: boolean, activeChatId: string | null) {
   const [typedEmptyStateText, setTypedEmptyStateText] = useState("")
@@ -359,7 +372,7 @@ const MobileSidebarPane = memo(function MobileSidebarPane({
       <button
         type="button"
         className="absolute inset-0 bg-black/45 backdrop-blur-[1px]"
-        aria-label="Close changes sidebar"
+        aria-label="Close right sidebar"
         onClick={onClose}
       />
       <div
@@ -468,6 +481,7 @@ function ChatWorkspace({
 
 export function ChatPage() {
   const state = useOutletContext<KannaState>()
+  const navigate = useNavigate()
   const dialog = useAppDialog()
   const layoutRootRef = useRef<HTMLDivElement>(null)
   const transcriptListRef = useRef<LegendListRef | null>(null)
@@ -479,6 +493,8 @@ export function ChatPage() {
   const { inputRef, syncInputHeight, transcriptPaddingBottom } = useTranscriptPaddingBottom()
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [pendingTerminalCommands, setPendingTerminalCommands] = useState<Record<string, string>>({})
+  const [searchTargetEntryId, setSearchTargetEntryId] = useState<string | null>(null)
+  const [pendingSearchResult, setPendingSearchResult] = useState<ChatSearchEntryResult | null>(null)
   const showEmptyState = state.messages.length === 0 && state.runtime?.title === "New Chat"
   const projectId = state.activeProjectId
   const projectTerminalLayout = useTerminalLayoutStore((store) => (projectId ? store.projects[projectId] : undefined))
@@ -517,6 +533,7 @@ export function ChatPage() {
   const activeRightPanel = projectId ? rightSidebarVisibility.rightPanel : "hidden"
   const showRightSidebar = Boolean(projectId && activeRightPanel !== "hidden")
   const showGitPanel = Boolean(projectId && activeRightPanel === "git")
+  const showSearchPanel = Boolean(projectId && activeRightPanel === "search")
   const shouldRenderRightSidebarLayout = Boolean(projectId)
   const isMobileRightSidebarOverlay = useMobileRightSidebarOverlayEnabled()
   const shouldRenderDesktopRightSidebarLayout = shouldRenderRightSidebarLayout && !isMobileRightSidebarOverlay
@@ -589,6 +606,10 @@ export function ChatPage() {
   })
 
   const { typedEmptyStateText, isEmptyStateTypingComplete } = useEmptyStateTyping(showEmptyState, state.activeChatId)
+
+  useEffect(() => {
+    setSearchTargetEntryId(null)
+  }, [state.activeChatId])
 
   useStickyChatFocus({
     rootRef: chatCardRef,
@@ -685,6 +706,11 @@ export function ChatPage() {
     toggleRightPanel(projectId, "browser")
   }, [projectId, toggleRightPanel])
 
+  const handleToggleSearchPanel = useCallback(() => {
+    if (!projectId || !state.activeChatId) return
+    toggleRightPanel(projectId, "search")
+  }, [projectId, state.activeChatId, toggleRightPanel])
+
   const handleRunQuickAction = useCallback((command: string) => {
     if (!projectId) return
     const terminalId = addTerminal(projectId)
@@ -752,6 +778,38 @@ export function ChatPage() {
     await transcriptListRef.current?.scrollToEnd?.({ animated })
   }, [clearShowScrollTimeout])
 
+  const handleSearchCurrentChat = useCallback(async (query: string, includeToolEntries: boolean): Promise<ChatSearchCommandResult> => {
+    if (!state.activeChatId) {
+      return { query, matches: [] }
+    }
+
+    return await state.socket.command<ChatSearchCommandResult>({
+      type: "chat.search",
+      chatId: state.activeChatId,
+      query,
+      includeToolEntries,
+    })
+  }, [state.activeChatId, state.socket])
+
+  const loadSearchResultTarget = useCallback(async (result: ChatSearchEntryResult) => {
+    const targetEntryId = result.targetEntryId
+    const loaded = await ensureChatSearchResultTargetLoaded(result, state.ensureTranscriptEntryLoaded)
+    if (!loaded) {
+      throw new Error("Unable to load this search result.")
+    }
+    setSearchTargetEntryId(targetEntryId)
+  }, [state.ensureTranscriptEntryLoaded])
+
+  const handleSelectSearchResult = useCallback(async (result: ChatSearchEntryResult) => {
+    if (result.chatId !== state.activeChatId) {
+      setPendingSearchResult(result)
+      navigate(`/chat/${result.chatId}`)
+      return
+    }
+
+    await loadSearchResultTarget(result)
+  }, [loadSearchResultTarget, navigate, state.activeChatId])
+
   const handleChatSubmit = useCallback(async (
     content: string,
     options?: Parameters<typeof state.handleSend>[1],
@@ -769,6 +827,25 @@ export function ChatPage() {
     clearShowScrollTimeout()
     setShowScrollToBottom(false)
   }, [clearShowScrollTimeout, state.activeChatId])
+
+  useEffect(() => {
+    if (!pendingSearchResult || pendingSearchResult.chatId !== state.activeChatId) return
+
+    let cancelled = false
+    void loadSearchResultTarget(pendingSearchResult)
+      .catch((error) => {
+        console.error("Failed to open chat search result", error)
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setPendingSearchResult(null)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [loadSearchResultTarget, pendingSearchResult, state.activeChatId])
 
   useEffect(() => {
     function handleGlobalKeydown(event: KeyboardEvent) {
@@ -924,6 +1001,7 @@ export function ChatPage() {
           localPath={state.navbarLocalPath}
           embeddedTerminalVisible={showTerminalPane}
           onToggleEmbeddedTerminal={projectId ? handleToggleEmbeddedTerminal : undefined}
+          onOpenChatSearch={state.activeChatId ? handleToggleSearchPanel : undefined}
           rightPanel={activeRightPanel}
           onToggleGitPanel={projectId ? handleToggleGitPanel : undefined}
           onToggleBrowserPanel={projectId ? handleToggleBrowserPanel : undefined}
@@ -970,6 +1048,8 @@ export function ChatPage() {
           showScrollButton={showScrollToBottom && state.messages.length > 0}
           onIsAtEndChange={onIsAtEndChange}
           scrollToBottom={() => scrollToTranscriptEnd(true)}
+          scrollTargetEntryId={searchTargetEntryId}
+          onScrollTargetEntrySettled={() => setSearchTargetEntryId(null)}
           typedEmptyStateText={typedEmptyStateText}
           isEmptyStateTypingComplete={isEmptyStateTypingComplete}
           isPageFileDragActive={isPageFileDragActive}
@@ -1093,9 +1173,19 @@ export function ChatPage() {
   ])
   const rightPanelContent = activeRightPanel === "browser" && projectId
     ? <BrowserPanel projectId={projectId} socket={state.socket} onClose={handleCloseRightSidebar} onRunQuickAction={handleRunQuickAction} />
-    : gitPanelContentProps
-      ? <ChatSidebarContent {...gitPanelContentProps} />
-      : null
+    : showSearchPanel
+      ? (
+          <ChatSearchPanel
+            open
+            disabled={!state.activeChatId}
+            onClose={handleCloseRightSidebar}
+            onSearch={handleSearchCurrentChat}
+            onSelectResult={handleSelectSearchResult}
+          />
+        )
+      : gitPanelContentProps
+        ? <ChatSidebarContent {...gitPanelContentProps} />
+        : null
 
   return (
     <div ref={layoutRootRef} className="flex-1 flex flex-col min-w-0 relative">

@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, mock, test } from "bun:test"
 import {
+  ensureChatSearchResultTargetLoaded,
   getTerminalPanelDefaultSizes,
   getRightSidebarSizePercent,
   getRightSidebarSizePx,
@@ -8,6 +9,43 @@ import {
   shouldUseMobileRightSidebarOverlay,
   shouldAutoFollowTranscriptResize,
 } from "./ChatPage"
+
+describe("ensureChatSearchResultTargetLoaded", () => {
+  test("loads the scroll target even when the matching entry is already loaded", async () => {
+    const calls: string[] = []
+    const ensureTranscriptEntryLoaded = mock(async (entryId: string) => {
+      calls.push(entryId)
+      return entryId === "tool-result"
+    })
+
+    await expect(ensureChatSearchResultTargetLoaded({
+      entryId: "tool-result",
+      targetEntryId: "tool-call",
+    }, ensureTranscriptEntryLoaded)).resolves.toBe(false)
+
+    expect(calls).toEqual(["tool-result", "tool-call"])
+  })
+
+  test("returns true only after both the matching entry and scroll target are loaded", async () => {
+    const ensureTranscriptEntryLoaded = mock(async () => true)
+
+    await expect(ensureChatSearchResultTargetLoaded({
+      entryId: "tool-result",
+      targetEntryId: "tool-call",
+    }, ensureTranscriptEntryLoaded)).resolves.toBe(true)
+  })
+
+  test("does not load the same entry twice when the match is its own target", async () => {
+    const ensureTranscriptEntryLoaded = mock(async () => true)
+
+    await expect(ensureChatSearchResultTargetLoaded({
+      entryId: "assistant-message",
+      targetEntryId: "assistant-message",
+    }, ensureTranscriptEntryLoaded)).resolves.toBe(true)
+
+    expect(ensureTranscriptEntryLoaded).toHaveBeenCalledTimes(1)
+  })
+})
 
 describe("hasFileDragTypes", () => {
   test("returns true when file drags are present", () => {

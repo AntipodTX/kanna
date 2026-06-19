@@ -21,6 +21,7 @@ import { writeStandaloneTranscriptExport } from "./standalone-export"
 import { TerminalManager } from "./terminal-manager"
 import type { UpdateManager } from "./update-manager"
 import { deriveChatSnapshot, deriveLocalProjectsSnapshot, deriveSidebarData } from "./read-models"
+import { searchTranscriptEntries } from "../shared/chatSearch"
 import type {
   AppSettingsPatch,
   AppSettingsSnapshot,
@@ -1510,6 +1511,25 @@ export function createWsRouter({
           if (!chat) throw new Error("Chat not found")
           const page = store.getMessagesPageBefore(command.chatId, command.beforeCursor, command.limit)
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result: page })
+          return
+        }
+        case "chat.search": {
+          const chat = store.getChat(command.chatId)
+          if (!chat) throw new Error("Chat not found")
+          const project = store.state.projectsById.get(chat.projectId)
+          send(ws, {
+            v: PROTOCOL_VERSION,
+            type: "ack",
+            id,
+            result: {
+              query: command.query,
+              matches: searchTranscriptEntries(store.getMessages(command.chatId), command.query, {
+                chatId: command.chatId,
+                localPath: project?.localPath,
+                includeToolEntries: Boolean(command.includeToolEntries),
+              }),
+            },
+          })
           return
         }
         case "chat.respondTool": {

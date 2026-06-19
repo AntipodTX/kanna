@@ -11,6 +11,7 @@ interface Props {
   message: ProcessedToolCall
   isLoading?: boolean
   localPath?: string | null
+  forceExpanded?: boolean
 }
 
 type ReadImageBlock = {
@@ -83,7 +84,7 @@ export function ReadResultImages({ images }: { images: ReadonlyArray<ReadImageBl
   )
 }
 
-export function ToolCallMessage({ message, isLoading = false, localPath }: Props) {
+export function ToolCallMessage({ message, isLoading = false, localPath, forceExpanded = false }: Props) {
   const hasResult = message.result !== undefined
   const showLoadingState = !hasResult && isLoading
 
@@ -188,6 +189,7 @@ export function ToolCallMessage({ message, isLoading = false, localPath }: Props
   return (
     <MetaRow className="w-full">
       <ExpandableRow
+        forceExpanded={forceExpanded}
         expandedContent={
           <VerticalLineContainer className="my-4 text-sm">
             <div className="flex flex-col gap-2">
