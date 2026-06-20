@@ -5,6 +5,7 @@ import {
   isValidElement,
   useCallback,
   useContext,
+  useEffect,
   useState,
   type ComponentPropsWithoutRef,
   type ReactNode,
@@ -133,26 +134,34 @@ interface ExpandableRowProps {
   children: ReactNode
   expandedContent: ReactNode
   defaultExpanded?: boolean
+  forceExpanded?: boolean
 }
 
-export function ExpandableRow({ children, expandedContent, defaultExpanded = false }: ExpandableRowProps) {
+export function ExpandableRow({ children, expandedContent, defaultExpanded = false, forceExpanded = false }: ExpandableRowProps) {
   const [expanded, setExpanded] = useState(defaultExpanded)
+  const isExpanded = forceExpanded || expanded
+
+  useEffect(() => {
+    if (forceExpanded) {
+      setExpanded(true)
+    }
+  }, [forceExpanded])
 
   return (
     <div className="flex flex-col w-full">
 
       <button
-        onClick={() => setExpanded(!expanded)}
-        className={`group/expandable-row cursor-pointer grid grid-cols-[auto_1fr] items-center gap-1 text-sm ${!expanded ? "hover:opacity-60 transition-opacity" : ""}`}
+        onClick={() => setExpanded((current) => forceExpanded ? true : !current)}
+        className={`group/expandable-row cursor-pointer grid grid-cols-[auto_1fr] items-center gap-1 text-sm ${!isExpanded ? "hover:opacity-60 transition-opacity" : ""}`}
       >
         <div className="grid grid-cols-[auto_1fr] items-center gap-1.5">
           {children}
         </div>
         <ChevronRight
-          className={`h-4.5 w-4.5 text-muted-icon translate-y-[0.5px] transition-all duration-200 opacity-0 group-hover/expandable-row:opacity-100 ${expanded ? "rotate-90 opacity-100" : ""}`}
+          className={`h-4.5 w-4.5 text-muted-icon translate-y-[0.5px] transition-all duration-200 opacity-0 group-hover/expandable-row:opacity-100 ${isExpanded ? "rotate-90 opacity-100" : ""}`}
         />
       </button>
-      {expanded && expandedContent}
+      {isExpanded && expandedContent}
     </div>
   )
 }

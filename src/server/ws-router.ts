@@ -3,6 +3,7 @@ import os from "node:os"
 import path from "node:path"
 import type { ServerWebSocket } from "bun"
 import { PROTOCOL_VERSION } from "../shared/types"
+import { searchTranscriptEntries, type ProjectChatSearchEntryResult } from "../shared/chatSearch"
 import type { ClientEnvelope, ServerEnvelope, SubscriptionTopic } from "../shared/protocol"
 import { isClientEnvelope } from "../shared/protocol"
 import type { AgentCoordinator } from "./agent"
@@ -33,7 +34,34 @@ import type {
 } from "../shared/types"
 
 const DEFAULT_CHAT_RECENT_LIMIT = 200
+const DEFAULT_PROJECT_SEARCH_RESULT_LIMIT = 100
+const MAX_PROJECT_SEARCH_RESULT_LIMIT = 100
 const SKILL_AGENT_ALIASES = ["universal", "claude-code"] as const
+
+interface ProjectSearchCursor {
+  chatIndex: number
+  matchOffset: number
+}
+
+function encodeProjectSearchCursor(cursor: ProjectSearchCursor) {
+  return `${cursor.chatIndex}:${cursor.matchOffset}`
+}
+
+function decodeProjectSearchCursor(value: string | undefined): ProjectSearchCursor {
+  if (!value) return { chatIndex: 0, matchOffset: 0 }
+  const [chatIndexText, matchOffsetText] = value.split(":")
+  const chatIndex = Number(chatIndexText)
+  const matchOffset = Number(matchOffsetText)
+  return {
+    chatIndex: Number.isInteger(chatIndex) && chatIndex > 0 ? chatIndex : 0,
+    matchOffset: Number.isInteger(matchOffset) && matchOffset > 0 ? matchOffset : 0,
+  }
+}
+
+function getProjectSearchLimit(limit: number | undefined) {
+  if (!limit || !Number.isFinite(limit)) return DEFAULT_PROJECT_SEARCH_RESULT_LIMIT
+  return Math.min(MAX_PROJECT_SEARCH_RESULT_LIMIT, Math.max(1, Math.floor(limit)))
+}
 
 function isSendToStartingProfilingEnabled() {
   return process.env.KANNA_PROFILE_SEND_TO_STARTING === "1"
@@ -1060,6 +1088,77 @@ export function createWsRouter({
           }
           const result = await readProjectQuickActions(project.localPath)
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
+          return
+        }
+        case "project.search": {
+          const project = store.getProject(command.projectId)
+          if (!project) {
+            throw new Error("Project not found")
+          }
+
+          const limit = getProjectSearchLimit(command.limit)
+          const cursor = decodeProjectSearchCursor(command.cursor)
+          const candidateChats = [...store.state.chatsById.values()]
+            .filter((chat) => (
+              chat.projectId === command.projectId
+              && !chat.deletedAt
+              && (command.includeArchived || !chat.archivedAt)
+            ))
+            .sort((a, b) => b.updatedAt - a.updatedAt)
+          const matches: ProjectChatSearchEntryResult[] = []
+          let nextChatIndex = cursor.chatIndex
+          let nextMatchOffset = cursor.matchOffset
+
+          for (
+            let chatIndex = cursor.chatIndex;
+            chatIndex < candidateChats.length && matches.length < limit;
+            chatIndex += 1
+          ) {
+            const chat = candidateChats[chatIndex]!
+            const matchOffset = chatIndex === cursor.chatIndex ? cursor.matchOffset : 0
+            const remaining = limit - matches.length
+            const chatMatches = searchTranscriptEntries(store.getMessages(chat.id), command.query, {
+              chatId: chat.id,
+              localPath: project.localPath,
+              skipMatches: matchOffset,
+              limit: remaining + 1,
+            })
+            const visibleMatches = chatMatches.slice(0, remaining).map((match) => ({
+              ...match,
+              chatId: chat.id,
+              chatTitle: chat.title,
+              isArchived: Boolean(chat.archivedAt),
+            }))
+
+            matches.push(...visibleMatches)
+
+            if (chatMatches.length > remaining) {
+              nextChatIndex = chatIndex
+              nextMatchOffset = matchOffset + remaining
+              break
+            }
+
+            nextChatIndex = chatIndex + 1
+            nextMatchOffset = 0
+          }
+
+          const hasMore = nextChatIndex < candidateChats.length
+          const nextCursor = hasMore
+            ? encodeProjectSearchCursor({ chatIndex: nextChatIndex, matchOffset: nextMatchOffset })
+            : undefined
+
+          send(ws, {
+            v: PROTOCOL_VERSION,
+            type: "ack",
+            id,
+            result: {
+              query: command.query,
+              projectId: command.projectId,
+              matches,
+              nextCursor,
+              hasMore,
+            },
+          })
           return
         }
         case "project.writeQuickActions": {

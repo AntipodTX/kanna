@@ -348,6 +348,7 @@ interface TranscriptSingleRowProps {
     answers: AskUserQuestionAnswerMap
   ) => void
   onExitPlanModeConfirm: (toolUseId: string, confirmed: boolean, clearContext?: boolean, message?: string) => void
+  revealEntryId?: string | null
 }
 
 const TranscriptSingleRow = memo(function TranscriptSingleRow({
@@ -364,6 +365,7 @@ const TranscriptSingleRow = memo(function TranscriptSingleRow({
   isFinalStatus,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  revealEntryId,
 }: TranscriptSingleRowProps) {
   let rendered: React.ReactNode = null
 
@@ -410,7 +412,15 @@ const TranscriptSingleRow = memo(function TranscriptSingleRow({
           rendered = isLatestTodoWrite ? <TodoWriteMessage key={message.id} message={message} /> : null
           break
         }
-        rendered = <ToolCallMessage key={message.id} message={message} isLoading={isLoading} localPath={localPath} />
+        rendered = (
+          <ToolCallMessage
+            key={message.id}
+            message={message}
+            isLoading={isLoading}
+            localPath={localPath}
+            forceExpanded={message.id === revealEntryId}
+          />
+        )
         break
       case "result":
         rendered = hideResult ? null : <ResultMessage key={message.id} message={message} />
@@ -460,6 +470,7 @@ const TranscriptSingleRow = memo(function TranscriptSingleRow({
   && prev.isFinalStatus === next.isFinalStatus
   && prev.onAskUserQuestionSubmit === next.onAskUserQuestionSubmit
   && prev.onExitPlanModeConfirm === next.onExitPlanModeConfirm
+  && prev.revealEntryId === next.revealEntryId
   && sameMessage(prev.message, next.message)
 ))
 
@@ -470,6 +481,7 @@ interface TranscriptToolGroupProps {
   isLoading: boolean
   localPath?: string
   expanded: boolean
+  revealEntryId?: string | null
   onExpandedChange: (groupId: string, next: boolean) => void
 }
 
@@ -480,6 +492,7 @@ const TranscriptToolGroup = memo(function TranscriptToolGroup({
   isLoading,
   localPath,
   expanded,
+  revealEntryId,
   onExpandedChange,
 }: TranscriptToolGroupProps) {
   return (
@@ -492,6 +505,7 @@ const TranscriptToolGroup = memo(function TranscriptToolGroup({
         isLoading={isLoading}
         localPath={localPath}
         expanded={expanded}
+        revealEntryId={revealEntryId}
         onExpandedChange={(next) => onExpandedChange(id, next)}
       />
     </div>
@@ -502,6 +516,7 @@ const TranscriptToolGroup = memo(function TranscriptToolGroup({
   && prev.isLoading === next.isLoading
   && prev.localPath === next.localPath
   && prev.expanded === next.expanded
+  && prev.revealEntryId === next.revealEntryId
   && prev.onExpandedChange === next.onExpandedChange
   && prev.messages.length === next.messages.length
   && prev.messages.every((message, index) => sameMessage(message, next.messages[index]!))
@@ -562,6 +577,16 @@ export function buildResolvedTranscriptRows(
   return rows
 }
 
+export function findResolvedTranscriptRowIndexForEntry(rows: ResolvedTranscriptRow[], entryId: string) {
+  return rows.findIndex((row) => {
+    if (row.kind === "single") {
+      return row.message.id === entryId
+    }
+
+    return row.messages.some((message) => message.id === entryId)
+  })
+}
+
 interface KannaTranscriptProps {
   messages: HydratedTranscriptMessage[]
   isLoading: boolean
@@ -574,6 +599,7 @@ interface KannaTranscriptProps {
     answers: AskUserQuestionAnswerMap
   ) => void
   onExitPlanModeConfirm: (toolUseId: string, confirmed: boolean, clearContext?: boolean, message?: string) => void
+  revealEntryId?: string | null
 }
 
 interface KannaTranscriptRowProps {
@@ -586,6 +612,7 @@ interface KannaTranscriptRowProps {
     answers: AskUserQuestionAnswerMap
   ) => void
   onExitPlanModeConfirm: (toolUseId: string, confirmed: boolean, clearContext?: boolean, message?: string) => void
+  revealEntryId?: string | null
 }
 
 export const KannaTranscriptRow = memo(function KannaTranscriptRow({
@@ -594,6 +621,7 @@ export const KannaTranscriptRow = memo(function KannaTranscriptRow({
   onToolGroupExpandedChange,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  revealEntryId,
 }: KannaTranscriptRowProps) {
   if (row.kind === "tool-group") {
     return (
@@ -604,6 +632,7 @@ export const KannaTranscriptRow = memo(function KannaTranscriptRow({
         isLoading={row.isLoading}
         localPath={row.localPath}
         expanded={toolGroupExpanded ?? false}
+        revealEntryId={revealEntryId}
         onExpandedChange={onToolGroupExpandedChange}
       />
     )
@@ -624,6 +653,7 @@ export const KannaTranscriptRow = memo(function KannaTranscriptRow({
       isFinalStatus={row.isFinalStatus}
       onAskUserQuestionSubmit={onAskUserQuestionSubmit}
       onExitPlanModeConfirm={onExitPlanModeConfirm}
+      revealEntryId={revealEntryId}
     />
   )
 }, (prev, next) => {
@@ -631,6 +661,7 @@ export const KannaTranscriptRow = memo(function KannaTranscriptRow({
   if (prev.onToolGroupExpandedChange !== next.onToolGroupExpandedChange) return false
   if (prev.onAskUserQuestionSubmit !== next.onAskUserQuestionSubmit) return false
   if (prev.onExitPlanModeConfirm !== next.onExitPlanModeConfirm) return false
+  if (prev.revealEntryId !== next.revealEntryId) return false
   if (prev.row.kind !== next.row.kind) return false
   if (prev.row.id !== next.row.id) return false
 
@@ -669,6 +700,7 @@ function KannaTranscriptImpl({
   onOpenLocalLink,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  revealEntryId,
 }: KannaTranscriptProps) {
   const [toolGroupExpanded, setToolGroupExpanded] = useState<Record<string, boolean>>({})
   const rows = useMemo(() => buildResolvedTranscriptRows(messages, {
@@ -700,6 +732,7 @@ function KannaTranscriptImpl({
             onToolGroupExpandedChange={handleToolGroupExpandedChange}
             onAskUserQuestionSubmit={onAskUserQuestionSubmit}
             onExitPlanModeConfirm={onExitPlanModeConfirm}
+            revealEntryId={revealEntryId}
           />
         </div>
       ))}

@@ -17,6 +17,8 @@ import { ChatPage } from "./ChatPage"
 import { LocalProjectsPage } from "./LocalProjectsPage"
 import { SettingsPage } from "./SettingsPage"
 import { useKannaState } from "./useKannaState"
+import { ProjectChatSearchPopover, type ProjectChatSearchPopoverProps } from "./ProjectChatSearchPopover"
+import type { ProjectChatSearchCommandResult, ProjectChatSearchEntryResult } from "../../shared/chatSearch"
 import type { AppSettingsSnapshot } from "../../shared/types"
 
 const VERSION_SEEN_STORAGE_KEY = "kanna:last-seen-version"
@@ -195,6 +197,42 @@ export function shouldPlayChatNotificationSound(
   return Boolean(appSettings) && shouldPlayChatSound(preference, doc)
 }
 
+interface ProjectSearchNavigationState {
+  projectSearchTarget: {
+    entryId: string
+    targetEntryId: string
+  }
+}
+
+export async function selectProjectSearchResult({
+  result,
+  openArchivedChat,
+  navigate,
+  closeSidebar,
+}: {
+  result: ProjectChatSearchEntryResult
+  openArchivedChat: (chatId: string, options?: { state?: ProjectSearchNavigationState }) => Promise<void>
+  navigate: (to: string, options: { state: ProjectSearchNavigationState }) => void
+  closeSidebar: () => void
+}) {
+  const navigationOptions = {
+    state: {
+      projectSearchTarget: {
+        entryId: result.entryId,
+        targetEntryId: result.targetEntryId,
+      },
+    },
+  }
+
+  if (result.isArchived) {
+    await openArchivedChat(result.chatId, navigationOptions)
+  } else {
+    navigate(`/chat/${result.chatId}`, navigationOptions)
+  }
+
+  closeSidebar()
+}
+
 function KannaLayout() {
   const location = useLocation()
   const navigate = useNavigate()
@@ -203,8 +241,14 @@ function KannaLayout() {
   const chatSoundPreference = useChatSoundPreferencesStore((store) => store.chatSoundPreference)
   const chatSoundId = useChatSoundPreferencesStore((store) => store.chatSoundId)
   const showMobileOpenButton = location.pathname === "/"
+  const isChatRoute = location.pathname.startsWith("/chat/")
   const currentVersion = SDK_CLIENT_APP.split("/")[1] ?? "unknown"
   const previousSidebarDataRef = useRef<ReturnType<typeof useKannaState>["sidebarData"] | null>(null)
+  const [projectSearchProjectId, setProjectSearchProjectId] = useState<string | null>(null)
+  const projectSearchProject = useMemo(
+    () => state.sidebarData.projectGroups.find((group) => group.groupKey === projectSearchProjectId) ?? null,
+    [projectSearchProjectId, state.sidebarData.projectGroups]
+  )
   const handleSidebarCreateChat = useCallback((projectId: string) => {
     void state.handleCreateChat(projectId)
   }, [state.handleCreateChat])
@@ -229,6 +273,64 @@ function KannaLayout() {
   const handleOpenAddProjectModal = useCallback(() => {
     state.openAddProjectModal()
   }, [state])
+  const handleOpenProjectSearch = useCallback((projectId: string) => {
+    setProjectSearchProjectId(projectId)
+    state.closeSidebar()
+  }, [state])
+  const handleCloseProjectSearch = useCallback(() => {
+    setProjectSearchProjectId(null)
+  }, [])
+  const handleSearchProjectChats = useCallback(async (
+    query: string,
+    includeArchived: boolean,
+    cursor?: string
+  ): Promise<ProjectChatSearchCommandResult> => {
+    if (!projectSearchProjectId) {
+      return { query, projectId: "", matches: [], hasMore: false }
+    }
+
+    return await state.socket.command<ProjectChatSearchCommandResult>({
+      type: "project.search",
+      projectId: projectSearchProjectId,
+      query,
+      includeArchived,
+      cursor,
+      limit: 100,
+    })
+  }, [projectSearchProjectId, state.socket])
+  const handleSelectProjectSearchResult = useCallback(async (result: ProjectChatSearchEntryResult) => {
+    if (!result.isArchived) {
+      handleCloseProjectSearch()
+    }
+    await selectProjectSearchResult({
+      result,
+      openArchivedChat: state.handleOpenArchivedChat,
+      navigate,
+      closeSidebar: state.closeSidebar,
+    })
+    if (result.isArchived) {
+      handleCloseProjectSearch()
+    }
+  }, [handleCloseProjectSearch, navigate, state])
+  const projectSearchPopoverProps = useMemo<ProjectChatSearchPopoverProps>(() => ({
+    open: Boolean(projectSearchProject),
+    projectTitle: projectSearchProject?.title || "Project",
+    disabled: !projectSearchProjectId || state.connectionStatus !== "connected",
+    onClose: handleCloseProjectSearch,
+    onSearch: handleSearchProjectChats,
+    onSelectResult: handleSelectProjectSearchResult,
+  }), [
+    handleCloseProjectSearch,
+    handleSearchProjectChats,
+    handleSelectProjectSearchResult,
+    projectSearchProject,
+    projectSearchProjectId,
+    state.connectionStatus,
+  ])
+  const outletContext = useMemo(
+    () => ({ ...state, projectSearchPopoverProps }),
+    [projectSearchPopoverProps, state]
+  )
   const handleSidebarDeleteChat = useCallback((chat: Parameters<typeof state.handleDeleteChat>[0]) => {
     void state.handleDeleteChat(chat)
   }, [state.handleDeleteChat])
@@ -270,6 +372,7 @@ function KannaLayout() {
       onOpenArchivedChat={handleOpenArchivedChat}
       onDeleteChat={handleSidebarDeleteChat}
       onOpenAddProjectModal={handleOpenAddProjectModal}
+      onOpenProjectSearch={handleOpenProjectSearch}
       onCopyPath={handleSidebarCopyPath}
       onOpenExternalPath={handleSidebarOpenExternalPath}
       onRenameProject={handleSidebarRenameProject}
@@ -282,6 +385,7 @@ function KannaLayout() {
   ), [
     handleOpenChangelog,
     handleOpenAddProjectModal,
+    handleOpenProjectSearch,
     handleSidebarCopyPath,
     handleSidebarCreateChat,
     handleSidebarArchiveChat,
@@ -358,7 +462,10 @@ function KannaLayout() {
   return (
     <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden">
       {sidebarElement}
-      <Outlet context={state} />
+      <main className="relative flex min-w-0 flex-1">
+        <Outlet context={outletContext} />
+        {!isChatRoute ? <ProjectChatSearchPopover {...projectSearchPopoverProps} /> : null}
+      </main>
       <StandaloneShareDialog
         open={Boolean(state.standaloneShareUrl)}
         shareUrl={state.standaloneShareUrl ?? ""}

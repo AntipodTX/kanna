@@ -17,6 +17,7 @@ import type {
   UpdateSnapshot,
   EditorPreset,
 } from "./types"
+import type { ProjectChatSearchCommandResult } from "./chatSearch"
 
 export type { EditorPreset }
 
@@ -76,6 +77,7 @@ export type ClientCommand =
   | { type: "project.remove"; projectId: string }
   | { type: "sidebar.reorderProjectGroups"; projectIds: string[] }
   | { type: "project.readDiffPatch"; projectId: string; path: string }
+  | { type: "project.search"; projectId: string; query: string; includeArchived?: boolean; cursor?: string; limit?: number }
   | { type: "system.ping" }
   | { type: "browser.listLocalHttpServers"; projectId?: string }
   | { type: "browser.killLocalHttpServer"; port: number }
@@ -260,7 +262,7 @@ export type ServerSnapshot =
 export type ServerEnvelope =
   | { v: 1; type: "snapshot"; id: string; snapshot: ServerSnapshot }
   | { v: 1; type: "event"; id: string; event: TerminalEvent }
-  | { v: 1; type: "ack"; id: string; result?: unknown | ChatHistoryPage | StandaloneTranscriptExportResult }
+  | { v: 1; type: "ack"; id: string; result?: unknown | ChatHistoryPage | ProjectChatSearchCommandResult | StandaloneTranscriptExportResult }
   | { v: 1; type: "error"; id?: string; message: string }
 
 export function isClientEnvelope(value: unknown): value is ClientEnvelope {
