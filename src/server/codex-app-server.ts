@@ -6,10 +6,13 @@ import type {
   AskUserQuestionItem,
   CodexReasoningEffort,
   ContextWindowUsageSnapshot,
+  InstalledSkillsSnapshot,
   ServiceTier,
+  SelectedSkillInput,
   TodoItem,
   TranscriptEntry,
 } from "../shared/types"
+import { CODEX_SLASH_COMMANDS as DEFAULT_CODEX_SLASH_COMMANDS } from "../shared/types"
 import type { HarnessEvent, HarnessToolRequest, HarnessTurn } from "./harness-types"
 import {
   type CollabAgentToolCallItem,
@@ -31,6 +34,10 @@ import {
   type PlanDeltaNotification,
   type ServerNotification,
   type ServerRequest,
+  type SkillsListParams,
+  type SkillsListResponse,
+  type ThreadCompactStartParams,
+  type ThreadCompactStartResponse,
   type ThreadItem,
   type ThreadResumeParams,
   type ThreadResumeResponse,
@@ -129,6 +136,7 @@ export interface StartCodexTurnArgs {
   effort?: CodexReasoningEffort
   serviceTier?: ServiceTier
   content: string
+  selectedSkills?: SelectedSkillInput[]
   planMode: boolean
   onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
   onApprovalRequest?: PendingTurn["onApprovalRequest"]
@@ -160,7 +168,7 @@ function codexSystemInitEntry(model: string): TranscriptEntry {
     model,
     tools: ["Bash", "Write", "Edit", "WebSearch", "TodoWrite", "AskUserQuestion", "ExitPlanMode"],
     agents: ["spawnAgent", "sendInput", "resumeAgent", "wait", "closeAgent"],
-    slashCommands: [],
+    slashCommands: [...DEFAULT_CODEX_SLASH_COMMANDS],
     mcpServers: [],
   })
 }
@@ -746,6 +754,68 @@ export class CodexAppServerManager {
       }) as unknown as CodexAppServerProcess)
   }
 
+  async listSkills(args: { cwd: string; forceReload?: boolean }): Promise<InstalledSkillsSnapshot> {
+    return await this.withUtilityContext(args.cwd, async (context) => {
+      const response = await this.sendRequest<SkillsListResponse>(context, "skills/list", {
+        cwds: [args.cwd],
+        forceReload: args.forceReload,
+      } satisfies SkillsListParams)
+      const entry = response.data.find((item) => item.cwd === args.cwd) ?? response.data[0]
+      const skills = (entry?.skills ?? [])
+        .filter((skill) => skill.enabled)
+        .map((skill) => ({
+          name: skill.name,
+          source: skill.scope,
+          sourceType: "codex-app-server",
+          sourceUrl: "",
+          skillPath: skill.path,
+          installedAt: "",
+          updatedAt: "",
+        }))
+
+      return {
+        lockFilePath: "",
+        skills,
+      }
+    })
+  }
+
+  async compactThread(args: { chatId?: string; cwd: string; threadId: string }): Promise<void> {
+    await this.runSlashCommand({ ...args, command: "/compact" })
+  }
+
+  async runSlashCommand(args: { chatId?: string; cwd: string; threadId: string; command: string }): Promise<void> {
+    const activeContext = args.chatId ? this.sessions.get(args.chatId) : null
+    if (activeContext && !activeContext.closed && activeContext.cwd === args.cwd && activeContext.sessionToken === args.threadId) {
+      if (activeContext.pendingTurn) {
+        throw new Error("Cannot run Codex slash command while a turn is running")
+      }
+      await this.sendCodexSlashCommand(activeContext, args.command, args.threadId)
+      return
+    }
+
+    await this.withUtilityContext(args.cwd, async (context) => {
+      await this.sendRequest<ThreadResumeResponse>(context, "thread/resume", {
+        threadId: args.threadId,
+        cwd: args.cwd,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+        persistExtendedHistory: true,
+      } satisfies ThreadResumeParams)
+      await this.sendCodexSlashCommand(context, args.command, args.threadId)
+    })
+  }
+
+  private async sendCodexSlashCommand(context: SessionContext, command: string, threadId: string): Promise<void> {
+    if (command === "/compact") {
+      await this.sendRequest<ThreadCompactStartResponse>(context, "thread/compact/start", {
+        threadId,
+      } satisfies ThreadCompactStartParams)
+      return
+    }
+    throw new Error(`${command} is not supported by the Codex app-server protocol`)
+  }
+
   async startSession(args: StartCodexSessionArgs) {
     const existing = this.sessions.get(args.chatId)
     if (existing && !existing.closed && existing.cwd === args.cwd && !args.pendingForkSessionToken) {
@@ -863,15 +933,22 @@ export class CodexAppServerManager {
     context.pendingTurn = pendingTurn
 
     try {
+      const input = [
+        {
+          type: "text" as const,
+          text: args.content,
+          text_elements: [] as [],
+        },
+        ...(args.selectedSkills ?? []).map((skill) => ({
+          type: "skill" as const,
+          name: skill.name,
+          path: skill.path,
+        })),
+      ]
+
       const response = await this.sendRequest<TurnStartResponse>(context, "turn/start", {
         threadId: context.sessionToken ?? "",
-        input: [
-          {
-            type: "text",
-            text: args.content,
-            text_elements: [],
-          },
-        ],
+        input,
         approvalPolicy: "never",
         model: args.model,
         effort: args.effort,
@@ -986,6 +1063,45 @@ export class CodexAppServerManager {
       throw new Error("Codex session not started")
     }
     return context
+  }
+
+  private async withUtilityContext<T>(cwd: string, run: (context: SessionContext) => Promise<T>): Promise<T> {
+    const child = this.spawnProcess(cwd)
+    const context: SessionContext = {
+      chatId: `utility-${randomUUID()}`,
+      cwd,
+      child,
+      pendingRequests: new Map(),
+      pendingTurn: null,
+      sessionToken: null,
+      stderrLines: [],
+      closed: false,
+    }
+    this.attachListeners(context)
+
+    try {
+      await this.sendRequest(context, "initialize", {
+        clientInfo: {
+          name: "kanna_desktop",
+          title: "Kanna",
+          version: "0.1.0",
+        },
+        capabilities: {
+          experimentalApi: true,
+        },
+      } satisfies InitializeParams)
+      this.writeMessage(context, {
+        method: "initialized",
+      })
+      return await run(context)
+    } finally {
+      context.closed = true
+      try {
+        context.child.kill("SIGKILL")
+      } catch {
+        // ignore kill failures
+      }
+    }
   }
 
   private attachListeners(context: SessionContext) {

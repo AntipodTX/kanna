@@ -8,6 +8,7 @@ import { EventStore } from "./event-store"
 import { AgentCoordinator } from "./agent"
 import { KannaAnalyticsReporter } from "./analytics"
 import { AppSettingsManager } from "./app-settings"
+import { CodexAppServerManager } from "./codex-app-server"
 import { DiffStore } from "./diff-store"
 import { discoverProjects, type DiscoveredProject } from "./discovery"
 import { KeybindingsManager } from "./keybindings"
@@ -109,6 +110,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const appSettings = new AppSettingsManager(path.join(store.dataDir, "settings.json"))
   await appSettings.initialize()
   await keybindings.initialize()
+  const codexManager = new CodexAppServerManager()
   const analytics = new KannaAnalyticsReporter({
     settings: appSettings,
     currentVersion: options.update?.version ?? "unknown",
@@ -126,6 +128,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const agent = new AgentCoordinator({
     store,
     analytics,
+    codexManager,
     onStateChange: (chatId?: string, options?: { immediate?: boolean }) => {
       if (chatId) {
         if (options?.immediate) {
@@ -146,6 +149,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     keybindings,
     appSettings,
     analytics,
+    codexManager,
     llmProvider: {
       read: readLlmProviderSnapshot,
       write: writeLlmProviderSnapshot,

@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { type LegendListRef } from "@legendapp/list/react"
 import type { GroupImperativeHandle } from "react-resizable-panels"
 import { useOutletContext } from "react-router-dom"
+import type { InstalledSkillsSnapshot, InstalledSkillSummary } from "../../../shared/types"
 import type { ChatInputHandle } from "../../components/chat-ui/ChatInput"
 import { ChatNavbar } from "../../components/chat-ui/ChatNavbar"
 import { BrowserPanel } from "../../components/chat-ui/BrowserPanel"
@@ -501,6 +502,7 @@ export function ChatPage() {
   const editorCommandTemplate = useTerminalPreferencesStore((store) => store.editorCommandTemplate)
   const resolvedKeybindings = useMemo(() => getResolvedKeybindings(state.keybindings), [state.keybindings])
   const baseContextWindowSnapshotRef = useRef<ReturnType<typeof deriveLatestContextWindowSnapshot>>(null)
+  const [installedSkills, setInstalledSkills] = useState<InstalledSkillSummary[]>([])
   const contextWindowSnapshot = useMemo(() => {
     const derivedSnapshot = deriveLatestContextWindowSnapshot(state.chatSnapshot?.messages ?? [])
     const previousSnapshot = baseContextWindowSnapshotRef.current
@@ -510,6 +512,35 @@ export function ChatPage() {
     baseContextWindowSnapshotRef.current = derivedSnapshot
     return derivedSnapshot
   }, [state.chatSnapshot?.messages])
+  const slashCommands = useMemo(() => {
+    for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+      const message = state.messages[index]
+      if (message.kind === "system_init" && message.slashCommands.length > 0) {
+        return message.slashCommands
+      }
+    }
+    return []
+  }, [state.messages])
+
+  useEffect(() => {
+    if (state.connectionStatus !== "connected") {
+      setInstalledSkills([])
+      return
+    }
+
+    let cancelled = false
+    void state.socket.command<InstalledSkillsSnapshot>({ type: "skills.listCodex", projectId })
+      .then((snapshot) => {
+        if (!cancelled) setInstalledSkills(snapshot.skills)
+      })
+      .catch(() => {
+        if (!cancelled) setInstalledSkills([])
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [projectId, state.connectionStatus, state.socket])
 
   const hasTerminals = terminalLayout.terminals.length > 0
   const showTerminalPane = Boolean(projectId && terminalLayout.isVisible && hasTerminals)
@@ -991,6 +1022,8 @@ export function ChatPage() {
         activeProvider={state.runtime?.provider ?? null}
         availableProviders={state.availableProviders}
         contextWindowSnapshot={contextWindowSnapshot}
+        slashCommands={slashCommands}
+        installedSkills={installedSkills}
         onSubmit={handleChatSubmit}
         onCancel={handleCancel}
       />

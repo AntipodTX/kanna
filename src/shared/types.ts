@@ -64,6 +64,15 @@ export interface InstalledSkillsSnapshot {
   skills: InstalledSkillSummary[]
 }
 
+export interface SelectedSkillInput {
+  name: string
+  path: string
+}
+
+export const CODEX_SLASH_COMMANDS = [
+  "/compact",
+] as const
+
 export interface ChatAttachment {
   id: string
   kind: AttachmentKind
