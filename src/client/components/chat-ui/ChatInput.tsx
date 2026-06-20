@@ -6,6 +6,7 @@ import {
   type ClaudeContextWindow,
   type ClaudeReasoningEffort,
   type CodexReasoningEffort,
+  type InstalledSkillSummary,
   type ModelOptions,
   type ProviderCatalogEntry,
   normalizeClaudeContextWindow,
@@ -25,6 +26,13 @@ import { AttachmentFileCard, AttachmentImageCard } from "../messages/AttachmentC
 import { AttachmentPreviewModal } from "../messages/AttachmentPreviewModal"
 import { classifyAttachmentPreview } from "../messages/attachmentPreview"
 import { overrideContextWindowMaxTokens, type ContextWindowSnapshot } from "../../lib/contextWindow"
+import {
+  buildChatCompletionItems,
+  getActiveCompletionTrigger,
+  replaceCompletionToken,
+  type ChatCompletionItem,
+  type CompletionTrigger,
+} from "../../lib/chatInputCompletions"
 
 const MAX_FILES_PER_DROP = 50
 const MAX_CONCURRENT_UPLOADS = 3
@@ -125,6 +133,8 @@ interface Props {
   availableProviders: ProviderCatalogEntry[]
   contextWindowSnapshot?: ContextWindowSnapshot | null
   previousPrompt?: string | null
+  slashCommands?: string[]
+  installedSkills?: InstalledSkillSummary[]
 }
 
 export interface ChatInputHandle {
@@ -183,6 +193,8 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   availableProviders,
   contextWindowSnapshot = null,
   previousPrompt = null,
+  slashCommands = [],
+  installedSkills = [],
 }, forwardedRef) {
   const {
     getDraft,
@@ -209,6 +221,8 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const [attachments, setAttachments] = useState<ComposerAttachment[]>(() => hydrateComposerAttachments(chatId ? getAttachmentDrafts(chatId) : []))
   const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | null>(null)
   const [uploadError, setUploadError] = useState<string | null>(null)
+  const [completionTrigger, setCompletionTrigger] = useState<CompletionTrigger | null>(null)
+  const [activeCompletionIndex, setActiveCompletionIndex] = useState(0)
   const uploadQueueRef = useRef<File[]>([])
   const activeUploadsRef = useRef(0)
   const attachmentsRef = useRef<ComposerAttachment[]>([])
@@ -242,6 +256,45 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     return left.kind === "image" ? -1 : 1
   })
   const selectedAttachment = attachments.find((attachment) => attachment.id === selectedAttachmentId) ?? null
+  const completionItems = useMemo(() => {
+    if (!completionTrigger) return []
+    return buildChatCompletionItems({
+      provider: selectedProvider,
+      triggerKind: completionTrigger.kind,
+      query: completionTrigger.query,
+      slashCommands,
+      installedSkills,
+    })
+  }, [completionTrigger, installedSkills, selectedProvider, slashCommands])
+  const showCompletions = completionItems.length > 0
+
+  function updateCompletionTriggerFromElement(element: HTMLTextAreaElement | null) {
+    if (!element) {
+      setCompletionTrigger(null)
+      return
+    }
+    setCompletionTrigger(getActiveCompletionTrigger(element.value, element.selectionStart))
+    setActiveCompletionIndex(0)
+  }
+
+  function applyCompletion(item: ChatCompletionItem) {
+    if (!completionTrigger) return
+    const next = replaceCompletionToken({
+      value,
+      trigger: completionTrigger,
+      insertText: item.insertText,
+    })
+    setValue(next.value)
+    if (chatId) setDraft(chatId, next.value)
+    setCompletionTrigger(null)
+    requestAnimationFrame(() => {
+      if (!textareaRef.current) return
+      textareaRef.current.focus()
+      textareaRef.current.selectionStart = next.caret
+      textareaRef.current.selectionEnd = next.caret
+      autoResize()
+    })
+  }
 
   const cleanupAttachmentPreview = useCallback((attachment: ComposerAttachment) => {
     if (attachment.previewUrl) {
@@ -553,6 +606,29 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }
 
   function handleKeyDown(event: React.KeyboardEvent) {
+    if (showCompletions) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault()
+        setActiveCompletionIndex((index) => (index + 1) % completionItems.length)
+        return
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault()
+        setActiveCompletionIndex((index) => (index - 1 + completionItems.length) % completionItems.length)
+        return
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault()
+        applyCompletion(completionItems[activeCompletionIndex] ?? completionItems[0])
+        return
+      }
+      if (event.key === "Escape") {
+        event.preventDefault()
+        setCompletionTrigger(null)
+        return
+      }
+    }
+
     if (event.key === "Tab" && !event.shiftKey) {
       event.preventDefault()
       focusNextChatInput(textareaRef.current, document)
@@ -583,6 +659,13 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       event.preventDefault()
       void handleSubmit()
     }
+  }
+
+  function handleKeyUp(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (["ArrowDown", "ArrowUp", "Enter", "Tab", "Escape"].includes(event.key)) {
+      return
+    }
+    updateCompletionTriggerFromElement(event.currentTarget)
   }
 
   function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
@@ -684,6 +767,33 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
             </ScrollArea>
           ) : null}
 
+          {showCompletions ? (
+            <div className="mb-2 overflow-hidden rounded-lg border border-border bg-popover shadow-lg">
+              <div className="max-h-56 overflow-y-auto py-1">
+                {completionItems.map((item, index) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onMouseDown={(event) => {
+                      event.preventDefault()
+                      applyCompletion(item)
+                    }}
+                    className={cn(
+                      "flex h-9 w-full items-center gap-3 px-3 text-left text-sm",
+                      index === activeCompletionIndex ? "bg-accent text-accent-foreground" : "text-popover-foreground hover:bg-accent/70"
+                    )}
+                  >
+                    <span className="w-8 shrink-0 font-mono text-xs text-muted-foreground">
+                      {item.kind === "command" ? "/" : selectedProvider === "claude" ? "/" : "$"}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                    {item.detail ? <span className="min-w-0 max-w-[45%] truncate text-xs text-muted-foreground">{item.detail}</span> : null}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
           <div className="flex items-end max-w-[840px] mx-auto border dark:bg-card/40 backdrop-blur-lg border-border rounded-[29px] pr-1.5">
             <label
               aria-label="Add attachment"
@@ -719,8 +829,11 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
               onChange={(event) => {
                 setValue(event.target.value)
                 if (chatId) setDraft(chatId, event.target.value)
+                updateCompletionTriggerFromElement(event.currentTarget)
                 autoResize()
               }}
+              onClick={(event) => updateCompletionTriggerFromElement(event.currentTarget)}
+              onKeyUp={handleKeyUp}
               onPaste={handlePaste}
               onKeyDown={handleKeyDown}
               disabled={disabled}

@@ -208,6 +208,126 @@ describe("attachment prompt helpers", () => {
 })
 
 describe("AgentCoordinator codex integration", () => {
+  test("routes Codex compact from the chat command list without sending it as prompt text", async () => {
+    const slashCommandCalls: Array<{ chatId?: string; cwd: string; threadId: string; command: string }> = []
+    const startedTurns: string[] = []
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    store.messages.push(timestamped({
+      kind: "system_init",
+      provider: "codex",
+      model: "gpt-5.4",
+      tools: [],
+      agents: [],
+      slashCommands: ["/compact"],
+      mcpServers: [],
+    }))
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async runSlashCommand(args: { chatId?: string; cwd: string; threadId: string; command: string }) {
+          slashCommandCalls.push(args)
+        },
+        async startTurn(args: { content: string }): Promise<HarnessTurn> {
+          startedTurns.push(args.content)
+          async function* stream() {}
+          return {
+            provider: "codex",
+            stream: stream(),
+            interrupt: async () => {},
+            close: () => {},
+          }
+        },
+      } as never,
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "codex",
+      content: "/compact",
+      model: "gpt-5.4",
+    })
+
+    expect(slashCommandCalls).toEqual([{
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+      command: "/compact",
+    }])
+    expect(startedTurns).toEqual([])
+    expect(store.messages.map((entry) => entry.kind)).toEqual(["system_init", "compact_boundary"])
+  })
+
+  test("resolves Codex skill mentions on the server when sending a prompt", async () => {
+    const selectedSkillCalls: unknown[] = []
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.title = "Chat"
+    store.chat.sessionToken = "thread-1"
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async startSession() {},
+        async listSkills() {
+          return {
+            lockFilePath: "",
+            skills: [{
+              name: "skill-creator",
+              source: "system",
+              sourceType: "codex-app-server",
+              sourceUrl: "",
+              skillPath: "/tmp/skill-creator/SKILL.md",
+              installedAt: "",
+              updatedAt: "",
+            }],
+          }
+        },
+        async startTurn(args: { selectedSkills?: unknown[] }): Promise<HarnessTurn> {
+          selectedSkillCalls.push(args.selectedSkills)
+          async function* stream() {
+            yield {
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            }
+          }
+          return {
+            provider: "codex",
+            stream: stream(),
+            interrupt: async () => {},
+            close: () => {},
+          }
+        },
+      } as never,
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "codex",
+      content: "$skill-creator please",
+      model: "gpt-5.4",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(selectedSkillCalls).toEqual([[{
+      name: "skill-creator",
+      path: "/tmp/skill-creator/SKILL.md",
+    }]])
+  })
+
   test("generates a chat title in the background on the first user message", async () => {
     let releaseTitle!: () => void
     const titleGate = new Promise<void>((resolve) => {

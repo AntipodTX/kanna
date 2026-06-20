@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises"
+import { readdir, readFile, stat } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import type { ServerWebSocket } from "bun"
@@ -9,6 +9,7 @@ import type { AgentCoordinator } from "./agent"
 import type { AnalyticsReporter } from "./analytics"
 import { NoopAnalyticsReporter } from "./analytics"
 import type { AppSettingsManager } from "./app-settings"
+import type { CodexAppServerManager } from "./codex-app-server"
 import type { DiscoveredProject } from "./discovery"
 import { DiffStore } from "./diff-store"
 import { EventStore } from "./event-store"
@@ -123,6 +124,7 @@ interface CreateWsRouterArgs {
   keybindings: KeybindingsManager
   appSettings?: Pick<AppSettingsManager, "getSnapshot" | "write"> & Partial<Pick<AppSettingsManager, "writePatch" | "onChange">>
   analytics?: AnalyticsReporter
+  codexManager?: Pick<CodexAppServerManager, "listSkills">
   llmProvider?: {
     read: () => Promise<LlmProviderSnapshot>
     write: (value: Pick<LlmProviderSnapshot, "provider" | "apiKey" | "model" | "baseUrl">) => Promise<LlmProviderSnapshot>
@@ -188,8 +190,20 @@ export function getGlobalSkillLockPath() {
   return path.join(os.homedir(), ".agents", ".skill-lock.json")
 }
 
+function getDefaultSkillSearchDirs() {
+  const cwd = process.cwd()
+  return [
+    path.join(cwd, ".agents", "skills"),
+    path.join(os.homedir(), ".agents", "skills"),
+  ]
+}
+
 function asString(value: unknown) {
   return typeof value === "string" ? value : ""
+}
+
+function skillSnapshotKey(skill: InstalledSkillsSnapshot["skills"][number]) {
+  return `${skill.pluginName ?? ""}:${skill.name}`
 }
 
 export function parseInstalledSkillsLock(parsed: unknown, lockFilePath: string): InstalledSkillsSnapshot {
@@ -225,14 +239,82 @@ export function parseInstalledSkillsLock(parsed: unknown, lockFilePath: string):
   }
 }
 
-export async function listInstalledSkills(lockFilePath = getGlobalSkillLockPath()): Promise<InstalledSkillsSnapshot> {
+async function discoverSkillMarkdownFiles(searchDirs: string[]) {
+  const discovered = new Map<string, InstalledSkillsSnapshot["skills"][number]>()
+
+  function isCodexPath(dir: string) {
+    return path.resolve(dir).split(path.sep).includes(".codex")
+  }
+
+  async function walk(dir: string, depth: number): Promise<void> {
+    if (depth > 5) return
+    if (isCodexPath(dir)) return
+    let entries: string[]
+    try {
+      entries = await readdir(dir)
+    } catch {
+      return
+    }
+
+    if (entries.includes("SKILL.md")) {
+      const skillPath = path.join(dir, "SKILL.md")
+      const name = path.basename(dir)
+      const key = name
+      if (!discovered.has(key)) {
+        discovered.set(key, {
+          name,
+          source: "local",
+          sourceType: "local",
+          sourceUrl: "",
+          skillPath,
+          installedAt: "",
+          updatedAt: "",
+        })
+      }
+      return
+    }
+
+    for (const entry of entries) {
+      const child = path.join(dir, entry)
+      try {
+        if ((await stat(child)).isDirectory()) {
+          await walk(child, depth + 1)
+        }
+      } catch {
+        continue
+      }
+    }
+  }
+
+  for (const dir of searchDirs) {
+    await walk(dir, 0)
+  }
+
+  return [...discovered.values()].sort((a, b) => a.name.localeCompare(b.name))
+}
+
+export async function listInstalledSkills(lockFilePath = getGlobalSkillLockPath(), searchDirs = getDefaultSkillSearchDirs()): Promise<InstalledSkillsSnapshot> {
+  const discovered = await discoverSkillMarkdownFiles(searchDirs)
   try {
-    return parseInstalledSkillsLock(JSON.parse(await readFile(lockFilePath, "utf8")), lockFilePath)
-  } catch {
+    const snapshot = parseInstalledSkillsLock(JSON.parse(await readFile(lockFilePath, "utf8")), lockFilePath)
+    const merged = new Map(discovered.map((skill) => [skillSnapshotKey(skill), skill]))
+    for (const skill of snapshot.skills) {
+      const key = skillSnapshotKey(skill)
+      merged.set(key, {
+        ...skill,
+        skillPath: skill.skillPath || merged.get(key)?.skillPath,
+      })
+    }
     return {
       lockFilePath,
-      skills: [],
+      skills: [...merged.values()].sort((a, b) => a.name.localeCompare(b.name)),
     }
+  } catch {
+    // Fall back to scanning known skill directories below.
+  }
+  return {
+    lockFilePath,
+    skills: discovered,
   }
 }
 
@@ -381,6 +463,7 @@ export function createWsRouter({
   keybindings,
   appSettings,
   analytics,
+  codexManager,
   llmProvider,
   refreshDiscovery,
   getDiscoveredProjects,
@@ -1173,6 +1256,18 @@ export function createWsRouter({
         }
         case "skills.uninstall": {
           const result = await uninstallSkill(command.skillId)
+          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
+          return
+        }
+        case "skills.listCodex": {
+          if (!codexManager) {
+            throw new Error("Codex app-server unavailable")
+          }
+          const project = command.projectId ? store.getProject(command.projectId) : null
+          const result = await codexManager.listSkills({
+            cwd: project?.localPath ?? process.cwd(),
+            forceReload: command.forceReload,
+          })
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
           return
         }

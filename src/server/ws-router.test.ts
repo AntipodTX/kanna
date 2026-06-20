@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type { AppSettingsSnapshot, KeybindingsSnapshot, LlmProviderSnapshot, UpdateSnapshot } from "../shared/types"
@@ -151,18 +151,103 @@ describe("skills helpers", () => {
     const dir = await mkdtemp(path.join(tmpdir(), "kanna-skills-"))
     try {
       const missingPath = path.join(dir, "missing.json")
-      expect(await listInstalledSkills(missingPath)).toEqual({
+      expect(await listInstalledSkills(missingPath, [])).toEqual({
         lockFilePath: missingPath,
         skills: [],
       })
 
       const invalidPath = path.join(dir, ".skill-lock.json")
       await writeFile(invalidPath, "{", "utf8")
-      expect(await listInstalledSkills(invalidPath)).toEqual({
+      expect(await listInstalledSkills(invalidPath, [])).toEqual({
         lockFilePath: invalidPath,
         skills: [],
       })
     } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("discovers local SKILL.md files when no lock entries exist", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "kanna-skills-"))
+    try {
+      const skillDir = path.join(dir, "skills", "debug-helper")
+      const hiddenSkillDir = path.join(dir, "skills", ".system", "system-helper")
+      await mkdir(skillDir, { recursive: true })
+      await mkdir(hiddenSkillDir, { recursive: true })
+      await writeFile(path.join(skillDir, "SKILL.md"), "# Debug Helper\n", "utf8")
+      await writeFile(path.join(hiddenSkillDir, "SKILL.md"), "# System Helper\n", "utf8")
+
+      const snapshot = await listInstalledSkills(path.join(dir, "missing.json"), [path.join(dir, "skills")])
+
+      expect(snapshot.skills).toEqual([
+        expect.objectContaining({
+          name: "debug-helper",
+          source: "local",
+          skillPath: path.join(skillDir, "SKILL.md"),
+        }),
+        expect.objectContaining({
+          name: "system-helper",
+          source: "local",
+          skillPath: path.join(hiddenSkillDir, "SKILL.md"),
+        }),
+      ])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("does not discover Codex CLI skills through direct filesystem scanning", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "kanna-skills-"))
+    try {
+      const lockPath = path.join(dir, ".skill-lock.json")
+      const skillDir = path.join(dir, ".codex", "skills", "skill-creator")
+      const pluginRoot = path.join(dir, ".codex", "plugins", "cache", "github", "1")
+      const pluginSkillDir = path.join(pluginRoot, "skills", "yeet")
+      await mkdir(skillDir, { recursive: true })
+      await mkdir(pluginSkillDir, { recursive: true })
+      await mkdir(path.join(pluginRoot, ".codex-plugin"), { recursive: true })
+      await writeFile(path.join(pluginRoot, ".codex-plugin", "plugin.json"), JSON.stringify({ name: "github" }), "utf8")
+      await writeFile(path.join(skillDir, "SKILL.md"), "# Skill Creator\n", "utf8")
+      await writeFile(path.join(pluginSkillDir, "SKILL.md"), "# Yeet\n", "utf8")
+      await writeFile(lockPath, JSON.stringify({
+        version: 1,
+        skills: {
+          installed: {
+            source: "owner/installed",
+            sourceType: "github",
+          },
+        },
+      }), "utf8")
+
+      const snapshot = await listInstalledSkills(lockPath, [
+        path.join(dir, ".codex", "skills"),
+        path.join(dir, ".codex", "plugins", "cache"),
+      ])
+
+      expect(snapshot.skills.map((skill) => skill.name)).toEqual(["installed"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("discovers project-local skills from the current working directory", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "kanna-project-skills-"))
+    const originalCwd = process.cwd()
+    try {
+      const skillDir = path.join(dir, ".agents", "skills", "project-helper")
+      await mkdir(skillDir, { recursive: true })
+      await writeFile(path.join(skillDir, "SKILL.md"), "# Project Helper\n", "utf8")
+      process.chdir(dir)
+
+      const snapshot = await listInstalledSkills(path.join(dir, "missing.json"))
+
+      expect(snapshot.skills).toContainEqual(expect.objectContaining({
+        name: "project-helper",
+        source: "local",
+        skillPath: path.join(skillDir, "SKILL.md"),
+      }))
+    } finally {
+      process.chdir(originalCwd)
       await rm(dir, { recursive: true, force: true })
     }
   })
@@ -261,6 +346,84 @@ describe("ws-router", () => {
         id: "ping-1",
       },
     ])
+  })
+
+  test("lists Codex skills through the app-server manager for the current project", async () => {
+    const state = createEmptyState()
+    state.projectsById.set("project-1", {
+      id: "project-1",
+      title: "Project",
+      localPath: "/tmp/project",
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const calls: Array<{ cwd: string; forceReload?: boolean }> = []
+    const router = createWsRouter({
+      store: {
+        state,
+        getProject: (projectId: string) => state.projectsById.get(projectId) ?? null,
+      } as never,
+      agent: { getActiveStatuses: () => new Map(), getDrainingChatIds: () => new Set() } as never,
+      terminals: {
+        getSnapshot: () => null,
+        onEvent: () => () => {},
+      } as never,
+      keybindings: {
+        getSnapshot: () => DEFAULT_KEYBINDINGS_SNAPSHOT,
+        onChange: () => () => {},
+      } as never,
+      codexManager: {
+        async listSkills(args: { cwd: string; forceReload?: boolean }) {
+          calls.push(args)
+          return {
+            lockFilePath: "",
+            skills: [{
+              name: "template-bridge:unified-workflow",
+              source: "user",
+              sourceType: "codex-app-server",
+              sourceUrl: "",
+              skillPath: "/tmp/skill/SKILL.md",
+              installedAt: "",
+              updatedAt: "",
+            }],
+          }
+        },
+      } as never,
+      refreshDiscovery: async () => [],
+      getDiscoveredProjects: () => [],
+      machineDisplayName: "Local Machine",
+      updateManager: null,
+    })
+    const ws = new FakeWebSocket()
+
+    await router.handleMessage(
+      ws as never,
+      JSON.stringify({
+        v: 1,
+        type: "command",
+        id: "codex-skills-1",
+        command: { type: "skills.listCodex", projectId: "project-1", forceReload: true },
+      })
+    )
+
+    expect(calls).toEqual([{ cwd: "/tmp/project", forceReload: true }])
+    expect(ws.sent).toEqual([{
+      v: PROTOCOL_VERSION,
+      type: "ack",
+      id: "codex-skills-1",
+      result: {
+        lockFilePath: "",
+        skills: [{
+          name: "template-bridge:unified-workflow",
+          source: "user",
+          sourceType: "codex-app-server",
+          sourceUrl: "",
+          skillPath: "/tmp/skill/SKILL.md",
+          installedAt: "",
+          updatedAt: "",
+        }],
+      },
+    }])
   })
 
   test("reads and writes llm provider settings via commands", async () => {

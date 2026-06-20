@@ -56,13 +56,25 @@ export interface ThreadForkParams {
   persistExtendedHistory: boolean
 }
 
+export interface ThreadCompactStartParams {
+  threadId: string
+}
+
+export type ThreadCompactStartResponse = Record<string, never>
+
 export interface TextUserInput {
   type: "text"
   text: string
   text_elements: []
 }
 
-export type CodexUserInput = TextUserInput
+export interface SkillUserInput {
+  type: "skill"
+  name: string
+  path: string
+}
+
+export type CodexUserInput = TextUserInput | SkillUserInput
 
 export interface CollaborationMode {
   mode: "default" | "plan"
@@ -102,6 +114,30 @@ export interface ThreadStartResponse {
 
 export type ThreadResumeResponse = ThreadStartResponse
 export type ThreadForkResponse = ThreadStartResponse
+
+export interface SkillsListParams {
+  cwds?: string[]
+  forceReload?: boolean
+}
+
+export interface SkillMetadata {
+  name: string
+  description: string
+  shortDescription?: string
+  path: string
+  scope: "user" | "repo" | "system" | "admin"
+  enabled: boolean
+}
+
+export interface SkillsListEntry {
+  cwd: string
+  skills: SkillMetadata[]
+  errors: unknown[]
+}
+
+export interface SkillsListResponse {
+  data: SkillsListEntry[]
+}
 
 export interface TurnSummary {
   id: string

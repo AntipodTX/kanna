@@ -4,11 +4,13 @@ import type {
   AgentProvider,
   ChatAttachment,
   ContextWindowUsageSnapshot,
+  InstalledSkillSummary,
   ModelOptions,
   NormalizedToolCall,
   PendingToolSnapshot,
   KannaStatus,
   QueuedChatMessage,
+  SelectedSkillInput,
   TranscriptEntry,
 } from "../shared/types"
 import { normalizeToolCall } from "../shared/tools"
@@ -49,6 +51,56 @@ const CLAUDE_TOOLSET = [
   "EnterPlanMode",
   "ExitPlanMode",
 ] as const
+
+function parseSlashCommand(content: string): string | null {
+  const trimmed = content.trim()
+  if (!trimmed.startsWith("/") || /\s/u.test(trimmed)) return null
+  return trimmed
+}
+
+function normalizeSlashCommand(command: string) {
+  const trimmed = command.trim()
+  if (!trimmed) return ""
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`
+}
+
+function hasTranscriptSlashCommand(messages: TranscriptEntry[], command: string) {
+  const normalizedCommand = normalizeSlashCommand(command)
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const entry = messages[index]
+    if (entry?.kind !== "system_init") continue
+    return entry.slashCommands.map(normalizeSlashCommand).includes(normalizedCommand)
+  }
+  return false
+}
+
+function getCodexSkillMentionName(skill: Pick<InstalledSkillSummary, "name" | "pluginName">) {
+  return skill.pluginName ? `${skill.pluginName}:${skill.name}` : skill.name
+}
+
+function extractCodexSelectedSkills(
+  value: string,
+  installedSkills: Pick<InstalledSkillSummary, "name" | "skillPath" | "pluginName">[]
+): SelectedSkillInput[] {
+  const installedByName = new Map<string, Pick<InstalledSkillSummary, "name" | "skillPath" | "pluginName">>()
+  for (const skill of installedSkills) {
+    const qualifiedName = getCodexSkillMentionName(skill)
+    installedByName.set(qualifiedName, skill)
+    if (!installedByName.has(skill.name)) {
+      installedByName.set(skill.name, skill)
+    }
+  }
+
+  const selected = new Map<string, SelectedSkillInput>()
+  for (const match of value.matchAll(/(?:^|\s)\$([A-Za-z0-9][A-Za-z0-9_-]{0,127}(?::[A-Za-z0-9][A-Za-z0-9_-]{0,127})?)(?=$|\s)/gu)) {
+    const name = match[1]
+    if (!name || selected.has(name)) continue
+    const skill = installedByName.get(name)
+    if (!skill?.skillPath) continue
+    selected.set(name, { name, path: skill.skillPath })
+  }
+  return [...selected.values()]
+}
 
 interface PendingToolRequest {
   toolUseId: string
@@ -806,6 +858,14 @@ export class AgentCoordinator {
     return queued
   }
 
+  private async resolveCodexSelectedSkills(content: string, cwd: string): Promise<SelectedSkillInput[]> {
+    if (!content.includes("$") || typeof this.codexManager.listSkills !== "function") {
+      return []
+    }
+    const snapshot = await this.codexManager.listSkills({ cwd })
+    return extractCodexSelectedSkills(content, snapshot.skills)
+  }
+
   private async dequeueAndStartQueuedMessage(chatId: string, queuedMessage: QueuedChatMessage, options?: { steered?: boolean }) {
     await this.store.removeQueuedMessage(chatId, queuedMessage.id)
     const chat = this.store.requireChat(chatId)
@@ -979,12 +1039,14 @@ export class AgentCoordinator {
         provider: args.provider,
         model: args.model,
       })
+      const selectedSkills = await this.resolveCodexSelectedSkills(args.content, project.localPath)
       turn = await this.codexManager.startTurn({
         chatId: args.chatId,
         content: buildPromptText(args.content, args.attachments),
         model: args.model,
         effort: args.effort as any,
         serviceTier: args.serviceTier,
+        selectedSkills: selectedSkills.length > 0 ? selectedSkills : undefined,
         planMode: args.planMode,
         onToolRequest,
       })
@@ -1146,6 +1208,10 @@ export class AgentCoordinator {
       projectId: command.projectId ?? null,
     })
 
+    if (!chatId && parseSlashCommand(command.content)) {
+      throw new Error(`${command.content.trim()} requires an existing chat`)
+    }
+
     if (!chatId) {
       if (!command.projectId) {
         throw new Error("Missing projectId for new chat")
@@ -1160,6 +1226,39 @@ export class AgentCoordinator {
     }
 
     const chat = this.store.requireChat(chatId)
+    const slashCommand = parseSlashCommand(command.content)
+    const messages = this.store.getMessages(chatId)
+    if (slashCommand && hasTranscriptSlashCommand(messages, slashCommand)) {
+      if (command.attachments?.length) {
+        throw new Error(`${slashCommand} cannot be used with attachments`)
+      }
+      if (this.activeTurns.has(chatId)) {
+        throw new Error(`${slashCommand} cannot run while a turn is active`)
+      }
+      const provider = this.resolveProvider(command, chat.provider)
+      if (provider !== "codex") {
+        throw new Error(`${slashCommand} is not supported for ${provider}`)
+      }
+      if (!chat.sessionToken) {
+        throw new Error(`${slashCommand} requires an existing Codex thread`)
+      }
+      const project = this.store.getProject(chat.projectId)
+      if (!project) {
+        throw new Error("Project not found")
+      }
+      await this.codexManager.runSlashCommand({
+        chatId,
+        cwd: project.localPath,
+        threadId: chat.sessionToken,
+        command: slashCommand,
+      })
+      if (slashCommand === "/compact") {
+        await this.store.appendMessage(chatId, timestamped({ kind: "compact_boundary" }))
+      }
+      this.emitStateChange(chatId)
+      return { chatId }
+    }
+
     if (this.activeTurns.has(chatId)) {
       this.analytics.track("message_sent")
       const queuedMessage = await this.enqueueMessage(chatId, command.content, command.attachments ?? [], {

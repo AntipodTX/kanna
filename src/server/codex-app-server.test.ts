@@ -152,6 +152,57 @@ describe("CodexAppServerManager", () => {
     ])
   })
 
+  test("lists skills through the app-server skills/list method", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "skills/list") {
+        child.writeServerMessage({
+          id: message.id,
+          result: {
+            data: [{
+              cwd: "/tmp/project",
+              skills: [{
+                name: "template-bridge:unified-workflow",
+                description: "Unified workflow",
+                path: "/home/user/.codex/plugins/template-bridge/skills/unified-workflow/SKILL.md",
+                scope: "user",
+                enabled: true,
+              }],
+              errors: [],
+            }],
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    const snapshot = await manager.listSkills({
+      cwd: "/tmp/project",
+      forceReload: true,
+    })
+
+    expect(snapshot).toEqual({
+      lockFilePath: "",
+      skills: [{
+        name: "template-bridge:unified-workflow",
+        source: "user",
+        sourceType: "codex-app-server",
+        sourceUrl: "",
+        skillPath: "/home/user/.codex/plugins/template-bridge/skills/unified-workflow/SKILL.md",
+        installedAt: "",
+        updatedAt: "",
+      }],
+    })
+    const skillsList = process.messages.find((message: any) => message.method === "skills/list") as
+      | { method: "skills/list"; params: { cwds?: string[]; forceReload?: boolean } }
+      | undefined
+    expect(skillsList?.params).toEqual({ cwds: ["/tmp/project"], forceReload: true })
+  })
+
   test("maps fast mode and reasoning into app-server params", async () => {
     const process = new FakeCodexProcess((message, child) => {
       if (message.method === "initialize") {
@@ -211,6 +262,188 @@ describe("CodexAppServerManager", () => {
     expect(turnStart?.params.effort).toBe("xhigh")
     expect(turnStart?.params.serviceTier).toBe("fast")
     expect(turnStart?.params.collaborationMode?.settings?.reasoning_effort).toBeNull()
+  })
+
+  test("sends selected skills as structured turn input items", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-1", status: "completed", error: null } },
+        })
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: "turn-1", status: "completed", error: null },
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    const turn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "$skill-creator Add a skill",
+      planMode: false,
+      selectedSkills: [{ name: "skill-creator", path: "/tmp/skill-creator/SKILL.md" }],
+      onToolRequest: async () => ({}),
+    })
+
+    await collectStream(turn.stream)
+
+    const turnStart = process.messages.find((message: any) => message.method === "turn/start") as
+      | { method: "turn/start"; params: { input?: unknown[] } }
+      | undefined
+
+    expect(turnStart?.params.input).toEqual([
+      {
+        type: "text",
+        text: "$skill-creator Add a skill",
+        text_elements: [],
+      },
+      {
+        type: "skill",
+        name: "skill-creator",
+        path: "/tmp/skill-creator/SKILL.md",
+      },
+    ])
+  })
+
+  test("emits executable Codex slash commands in the synthetic system init entry", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-1", status: "completed", error: null } },
+        })
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: "turn-1", status: "completed", error: null },
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    const turn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "Hello",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    })
+
+    const events = await collectStream(turn.stream)
+    const systemInit = events.find((event) => event.type === "transcript" && event.entry.kind === "system_init")
+    expect(systemInit?.entry.slashCommands).toEqual([
+      "/compact",
+    ])
+  })
+
+  test("rejects Codex slash commands that the app-server protocol cannot execute", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    await expect(manager.runSlashCommand({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+      command: "/status",
+    })).rejects.toThrow("/status is not supported by the Codex app-server protocol")
+  })
+
+  test("starts Codex thread compaction through the app-server", async () => {
+    const methods: string[] = []
+    const process = new FakeCodexProcess((message, child) => {
+      methods.push(message.method)
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "thread/compact/start") {
+        expect(message.params).toEqual({ threadId: "thread-1" })
+        child.writeServerMessage({ id: message.id, result: {} })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    await manager.compactThread({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+    })
+
+    expect(methods).toContain("thread/compact/start")
   })
 
   test("maps thread token usage updates into context window transcript entries", async () => {
