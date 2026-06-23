@@ -1518,6 +1518,150 @@ describe("AgentCoordinator claude integration", () => {
     events.close()
   })
 
+  test("Claude steer suppresses a late result from the interrupted prompt", async () => {
+    const events = new AsyncEventQueue<any>()
+
+    const store = createFakeStore()
+    await store.enqueueMessage("chat-1", {
+      id: "queued-1",
+      content: "queued follow up",
+      attachments: [],
+      provider: "claude",
+      model: "claude-opus-4-1",
+      planMode: false,
+    })
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => ({
+        provider: "claude",
+        stream: events,
+        getAccountInfo: async () => null,
+        interrupt: async () => {},
+        close: () => {},
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        sendPrompt: async () => {},
+      }),
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first prompt",
+      model: "claude-opus-4-1",
+    })
+
+    await coordinator.steer({
+      type: "message.steer",
+      chatId: "chat-1",
+      queuedMessageId: "queued-1",
+    })
+
+    events.push({
+      type: "transcript" as const,
+      entry: timestamped({
+        kind: "result",
+        subtype: "error",
+        isError: true,
+        durationMs: 0,
+        result: "",
+      }),
+    })
+    events.push({
+      type: "transcript" as const,
+      entry: timestamped({
+        kind: "result",
+        subtype: "success",
+        isError: false,
+        durationMs: 1,
+        result: "done",
+      }),
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+    const resultMessages = store.messages.filter((entry) => entry.kind === "result")
+    expect(resultMessages).toHaveLength(1)
+    expect(resultMessages[0]).toMatchObject({
+      kind: "result",
+      subtype: "success",
+      result: "done",
+    })
+
+    events.close()
+  })
+
+  test("Claude cancel clears the active turn when a late result arrives before cancel finishes", async () => {
+    const events = new AsyncEventQueue<any>()
+
+    const store = createFakeStore()
+    const appendMessage = store.appendMessage.bind(store)
+    let resolveInterruptedAppendStarted: (() => void) | null = null
+    const interruptedAppendStarted = new Promise<void>((resolve) => {
+      resolveInterruptedAppendStarted = resolve
+    })
+    let releaseInterruptedAppend!: () => void
+    const interruptedAppendRelease = new Promise<void>((resolve) => {
+      releaseInterruptedAppend = resolve
+    })
+
+    store.appendMessage = async (chatId: string, entry: TranscriptEntry) => {
+      await appendMessage(chatId, entry)
+      if (entry.kind !== "interrupted") return
+
+      events.push({
+        type: "transcript" as const,
+        entry: timestamped({
+          kind: "result",
+          subtype: "error",
+          isError: true,
+          durationMs: 0,
+          result: "",
+        }),
+      })
+      resolveInterruptedAppendStarted?.()
+      await interruptedAppendRelease
+    }
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => ({
+        provider: "claude",
+        stream: events,
+        getAccountInfo: async () => null,
+        interrupt: async () => {},
+        close: () => {},
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        sendPrompt: async () => {},
+      }),
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first prompt",
+      model: "claude-opus-4-1",
+    })
+
+    const cancelPromise = coordinator.cancel("chat-1")
+    try {
+      await interruptedAppendStarted
+      await waitFor(() => !coordinator.getActiveStatuses().has("chat-1"))
+    } finally {
+      releaseInterruptedAppend()
+      await cancelPromise
+      events.close()
+    }
+
+    const resultMessages = store.messages.filter((entry) => entry.kind === "result")
+    expect(resultMessages).toHaveLength(0)
+  })
+
   test("uses Claude forkSession when starting a forked chat", async () => {
     const startSessionCalls: Array<{ sessionToken: string | null; forkSession: boolean }> = []
     const events = new AsyncEventQueue<any>()
