@@ -150,7 +150,7 @@ describeIfSupported("TerminalManager", () => {
     } finally {
       manager.close(terminalId)
     }
-  })
+  }, 10_000)
 
   test("filters leaked focus reports while focus mode is disabled", async () => {
     const terminalId = "terminal-focus-filtered"

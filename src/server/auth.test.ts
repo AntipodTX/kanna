@@ -14,10 +14,13 @@ afterEach(async () => {
 async function startPasswordServer(options: { trustProxy?: boolean; port?: number } = {}) {
   const projectDir = await mkdtemp(path.join(tmpdir(), "kanna-auth-test-"))
   const dataDir = await mkdtemp(path.join(tmpdir(), "kanna-auth-data-"))
+  const homeDir = await mkdtemp(path.join(tmpdir(), "kanna-auth-home-"))
   tempDirs.push(projectDir)
   tempDirs.push(dataDir)
+  tempDirs.push(homeDir)
   const server = await startKannaServer({
     dataDir,
+    homeDir,
     port: options.port ?? 4320,
     strictPort: true,
     password: "secret",

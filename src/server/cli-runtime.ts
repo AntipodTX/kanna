@@ -16,6 +16,7 @@ export interface CliOptions {
   share: ShareMode
   password: string | null
   strictPort: boolean
+  syncSessions: boolean
 }
 
 export interface CliUpdateOptions {
@@ -92,6 +93,7 @@ Options:
   --cloudflared <token>
                        Run a named Cloudflare tunnel from a token
   --password <secret>  Require a password before loading the app
+  --sync-sessions      Import and reconcile native Claude/Codex sessions on startup
   --strict-port        Fail instead of trying another port
   --no-open            Don't open browser automatically
   --version            Print version and exit
@@ -107,6 +109,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   let sawHost = false
   let sawRemote = false
   let strictPort = false
+  let syncSessions = false
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
@@ -170,6 +173,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
       strictPort = true
       continue
     }
+    if (arg === "--sync-sessions") {
+      syncSessions = true
+      continue
+    }
     if (!arg.startsWith("-")) throw new Error(`Unexpected positional argument: ${arg}`)
   }
 
@@ -182,6 +189,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
       share,
       password,
       strictPort,
+      syncSessions,
     },
   }
 }

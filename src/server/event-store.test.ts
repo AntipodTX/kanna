@@ -582,6 +582,28 @@ describe("EventStore", () => {
     expect(store.listChatsByProject(reopened.id).map((entry) => entry.id)).toEqual([chat.id])
   })
 
+  test("reopening a removed project preserves its sidebar title", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project", "Original Name")
+    await store.renameProjectSidebarTitle(project.id, "Sidebar Name")
+    await store.removeProject(project.id)
+
+    const reopened = await store.openProject("/tmp/project", "Synced Name")
+
+    expect(reopened.id).toBe(project.id)
+    expect(reopened.title).toBe("Synced Name")
+    expect(reopened.sidebarTitle).toBe("Sidebar Name")
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+
+    expect(reloaded.getProject(project.id)?.title).toBe("Synced Name")
+    expect(reloaded.getProject(project.id)?.sidebarTitle).toBe("Sidebar Name")
+  })
+
   test("archives chats without deleting their transcript", async () => {
     const dataDir = await createTempDataDir()
     const store = new EventStore(dataDir)
@@ -601,5 +623,62 @@ describe("EventStore", () => {
 
     expect(store.getChat(chat.id)?.archivedAt).toBeUndefined()
     expect(store.listChatsByProject(project.id).map((entry) => entry.id)).toEqual([chat.id])
+  })
+
+  test("hides deleted provider chats in the compacted snapshot so they stay hidden after restart", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.setChatProvider(chat.id, "claude")
+    await store.setSessionToken(chat.id, "session-1")
+    await store.deleteChat(chat.id)
+    expect(store.isProviderSessionHidden("claude", "session-1")).toBe(true)
+    await store.compact()
+
+    const snapshot = JSON.parse(await readFile(join(dataDir, "snapshot.json"), "utf8")) as SnapshotFile
+    expect(snapshot.chats).toHaveLength(0)
+    expect(snapshot.hiddenProviderSessions).toContainEqual({
+      provider: "claude",
+      sessionToken: "session-1",
+      hiddenAt: expect.any(Number),
+    })
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+
+    expect(reloaded.getChat(chat.id)).toBeNull()
+    expect(reloaded.state.chatsById.get(chat.id)).toBeUndefined()
+    expect(reloaded.isProviderSessionHidden("claude", "session-1")).toBe(true)
+  })
+
+  test("preserves hidden provider sessions through replay and compaction", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    await store.hideProviderSession("claude", "session-1")
+
+    expect(store.isProviderSessionHidden("claude", "session-1")).toBe(true)
+    expect(store.isProviderSessionHidden("codex", "session-1")).toBe(false)
+
+    const replayed = new EventStore(dataDir)
+    await replayed.initialize()
+    expect(replayed.isProviderSessionHidden("claude", "session-1")).toBe(true)
+
+    await replayed.compact()
+
+    const snapshot = JSON.parse(await readFile(join(dataDir, "snapshot.json"), "utf8")) as SnapshotFile
+    expect(snapshot.hiddenProviderSessions).toContainEqual({
+      provider: "claude",
+      sessionToken: "session-1",
+      hiddenAt: expect.any(Number),
+    })
+
+    const compacted = new EventStore(dataDir)
+    await compacted.initialize()
+    expect(compacted.isProviderSessionHidden("claude", "session-1")).toBe(true)
   })
 })

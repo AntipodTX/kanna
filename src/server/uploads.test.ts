@@ -15,11 +15,19 @@ afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
 
+async function createServerTestHomeDir(prefix: string) {
+  const homeDir = await mkdtemp(path.join(tmpdir(), prefix))
+  tempDirs.push(homeDir)
+  return homeDir
+}
+
 async function startIsolatedServer(options: { port: number; strictPort?: boolean }) {
   const dataDir = await mkdtemp(path.join(tmpdir(), "kanna-server-data-"))
-  tempDirs.push(dataDir)
+  const homeDir = await mkdtemp(path.join(tmpdir(), "kanna-server-home-"))
+  tempDirs.push(dataDir, homeDir)
   return startKannaServer({
     dataDir,
+    homeDir,
     port: options.port,
     strictPort: options.strictPort ?? true,
   })
@@ -279,6 +287,82 @@ describe("uploads", () => {
       expect(await response.json()).toEqual({ ok: true })
       expect(await Bun.file(attachment.absolutePath).exists()).toBe(false)
     } finally {
+      await server.stop()
+    }
+  })
+
+  test("skips initial session sync unless requested", async () => {
+    const homeDir = await createServerTestHomeDir("kanna-home-sync-logs-")
+    const logs: string[] = []
+    const server = await startKannaServer({
+      port: 4315,
+      strictPort: true,
+      homeDir,
+      onMigrationProgress: (message) => {
+        logs.push(message)
+      },
+    })
+
+    try {
+      expect(logs).toContain("[kanna] session sync: skipped (enable with --sync-sessions)")
+    } finally {
+      await server.stop()
+    }
+  })
+
+  test("runs initial session sync when requested", async () => {
+    const homeDir = await createServerTestHomeDir("kanna-home-sync-enabled-")
+    const logs: string[] = []
+    const server = await startKannaServer({
+      port: 4316,
+      strictPort: true,
+      homeDir,
+      syncSessions: true,
+      onMigrationProgress: (message) => {
+        logs.push(message)
+      },
+    })
+
+    try {
+      expect(logs).toContain("[kanna] session sync: skipped (no projects to scan)")
+    } finally {
+      await server.stop()
+    }
+  })
+
+  test("serves the browser while requested session sync is still running", async () => {
+    const homeDir = await createServerTestHomeDir("kanna-home-sync-background-")
+    const logs: string[] = []
+    let syncStarted = false
+    let releaseSync!: () => void
+    const syncGate = new Promise<void>((resolve) => {
+      releaseSync = resolve
+    })
+
+    const server = await startKannaServer({
+      port: 4317,
+      strictPort: true,
+      homeDir,
+      syncSessions: true,
+      onMigrationProgress: (message) => {
+        logs.push(message)
+      },
+      sessionSync: async (args) => {
+        syncStarted = true
+        args.onProgress?.("[kanna] session sync: fake slow sync")
+        await syncGate
+      },
+    })
+
+    try {
+      expect(syncStarted).toBe(true)
+      expect(logs).toContain("[kanna] session sync: fake slow sync")
+      const response = await fetch(`http://localhost:${server.port}/health`)
+      expect(response.status).toBe(200)
+      expect(await response.json()).toMatchObject({ ok: true, port: server.port })
+    } finally {
+      releaseSync()
+      await server.startupSyncDone
       await server.stop()
     }
   })

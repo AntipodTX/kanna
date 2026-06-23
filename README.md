@@ -50,6 +50,7 @@ That's it. Kanna opens in your browser at [`localhost:3210`](http://localhost:32
 - **Project-first sidebar** — chats grouped under projects, with live status indicators (idle, running, waiting, failed)
 - **Drag-and-drop project ordering** — reorder project groups in the sidebar with persistent ordering
 - **Local project discovery** — auto-discovers projects from both Claude and Codex local history
+- **Session import (beta)** — import native Claude and Codex CLI sessions into Kanna on startup
 - **Rich transcript rendering** — hydrated tool calls, collapsible tool groups, plan mode dialogs, and interactive prompts with full result display
 - **Quick responses** — lightweight structured queries (e.g. title generation) via Haiku with automatic Codex fallback
 - **Plan mode** — review and approve agent plans before execution
@@ -68,6 +69,7 @@ Bun Server (HTTP + WS)
     ├── AgentCoordinator ─── multi-provider turn management
     ├── ProviderCatalog ─── provider/model/effort normalization
     ├── QuickResponseAdapter ─── structured queries with provider fallback
+    ├── SessionImport ─── opt-in native Claude/Codex session import
     ├── EventStore ─── JSONL persistence + snapshot compaction
     └── ReadModels ─── derived views (sidebar, chat, projects)
     ↕  stdio
@@ -116,11 +118,22 @@ kanna                  # start with defaults (localhost only)
 kanna --port 4000      # custom port
 kanna --no-open        # don't open browser
 kanna --password <secret>      # require a password before loading the app
+kanna --sync-sessions          # import native Claude and Codex sessions on startup (beta)
 kanna --share                # create a public quick tunnel + terminal QR
 kanna --cloudflared <token>  # run a named Cloudflare tunnel from a token
 ```
 
 Default URL: `http://localhost:3210`
+
+### Session import (beta)
+
+Native Claude/Codex session import is opt-in because it can be slow:
+
+```bash
+kanna --sync-sessions
+```
+
+At startup, Kanna imports non-empty native Claude and Codex CLI sessions for known projects into the local Kanna store. The native provider history remains the source of truth: Kanna reads from `~/.claude` and Codex thread data, but does not write to `~/.claude` or `~/.codex`. While import is running, the browser shows a blocking progress dialog with import progress logs.
 
 ### Network access (Tailscale / LAN)
 
@@ -230,6 +243,8 @@ src/
 │   ├── codex-app-server.ts  Codex App Server JSON-RPC client
 │   ├── provider-catalog.ts  Provider/model/effort normalization
 │   ├── quick-response.ts    Structured queries with provider fallback
+│   ├── session-sync.ts      Native Claude/Codex session import
+│   ├── startup-sync.ts      Startup sync progress snapshots for the UI
 │   ├── ws-router.ts WebSocket message routing & subscriptions
 │   ├── event-store.ts  JSONL persistence, replay & compaction
 │   ├── discovery.ts Auto-discover projects from Claude and Codex local state

@@ -106,7 +106,7 @@ interface AgentCoordinatorArgs {
   onStateChange: (chatId?: string, options?: { immediate?: boolean }) => void
   analytics?: AnalyticsReporter
   codexManager?: CodexAppServerManager
-  generateTitle?: (messageContent: string, cwd: string) => Promise<GenerateChatTitleResult>
+  generateTitle?: (messageContent: string, cwd: string, preferredProvider?: AgentProvider) => Promise<GenerateChatTitleResult>
   startClaudeSession?: (args: {
     localPath: string
     model: string
@@ -680,7 +680,8 @@ export class AgentCoordinator {
   private readonly onStateChange: (chatId?: string, options?: { immediate?: boolean }) => void
   private readonly analytics: AnalyticsReporter
   private readonly codexManager: CodexAppServerManager
-  private readonly generateTitle: (messageContent: string, cwd: string) => Promise<GenerateChatTitleResult>
+  private readonly generateTitle:
+    (messageContent: string, cwd: string, preferredProvider?: AgentProvider) => Promise<GenerateChatTitleResult>
   private readonly startClaudeSessionFn: NonNullable<AgentCoordinatorArgs["startClaudeSession"]>
   private reportBackgroundError: ((message: string) => void) | null = null
   readonly activeTurns = new Map<string, ActiveTurn>()
@@ -692,7 +693,11 @@ export class AgentCoordinator {
     this.onStateChange = args.onStateChange
     this.analytics = args.analytics ?? NoopAnalyticsReporter
     this.codexManager = args.codexManager ?? new CodexAppServerManager()
-    this.generateTitle = args.generateTitle ?? generateTitleForChatDetailed
+    this.generateTitle = args.generateTitle ?? ((messageContent, cwd, preferredProvider) =>
+      generateTitleForChatDetailed(messageContent, cwd, undefined, {
+        preferredProvider,
+        useConfiguredProvider: false,
+      }))
     this.startClaudeSessionFn = args.startClaudeSession ?? startClaudeSession
   }
 
@@ -885,7 +890,7 @@ export class AgentCoordinator {
     const optimisticTitle = shouldGenerateTitle ? fallbackTitleFromMessage(args.content) : null
 
     if (optimisticTitle) {
-      await this.store.renameChat(args.chatId, optimisticTitle)
+      await this.store.renameChat(args.chatId, optimisticTitle, { markTitleOverride: false })
       logSendToStartingProfile(args.profile, "start_turn.optimistic_title_set", {
         chatId: args.chatId,
         title: optimisticTitle,
@@ -914,7 +919,13 @@ export class AgentCoordinator {
     })
 
     if (shouldGenerateTitle) {
-      void this.generateTitleInBackground(args.chatId, args.content, project.localPath, optimisticTitle ?? "New Chat")
+      void this.generateTitleInBackground(
+        args.chatId,
+        args.content,
+        project.localPath,
+        optimisticTitle ?? "New Chat",
+        args.provider
+      )
     }
 
     const onToolRequest = async (request: HarnessToolRequest): Promise<unknown> => {
@@ -1353,9 +1364,15 @@ export class AgentCoordinator {
     }
   }
 
-  private async generateTitleInBackground(chatId: string, messageContent: string, cwd: string, expectedCurrentTitle: string) {
+  private async generateTitleInBackground(
+    chatId: string,
+    messageContent: string,
+    cwd: string,
+    expectedCurrentTitle: string,
+    preferredProvider: AgentProvider
+  ) {
     try {
-      const result = await this.generateTitle(messageContent, cwd)
+      const result = await this.generateTitle(messageContent, cwd, preferredProvider)
       if (result.failureMessage) {
         this.reportBackgroundError?.(
           `[title-generation] chat ${chatId} failed provider title generation: ${result.failureMessage}`
@@ -1366,7 +1383,7 @@ export class AgentCoordinator {
       const chat = this.store.requireChat(chatId)
       if (chat.title !== expectedCurrentTitle) return
 
-      await this.store.renameChat(chatId, result.title)
+      await this.store.renameChat(chatId, result.title, { markTitleOverride: false })
       this.emitStateChange(chatId)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)

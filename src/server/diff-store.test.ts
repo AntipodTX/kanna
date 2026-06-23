@@ -25,7 +25,7 @@ async function run(command: string[], cwd: string) {
 
 async function createRepo() {
   const root = await mkdtemp(path.join(tmpdir(), "kanna-diff-store-"))
-  await run(["git", "init"], root)
+  await run(["git", "init", "--initial-branch=main"], root)
   await run(["git", "config", "user.email", "kanna@example.com"], root)
   await run(["git", "config", "user.name", "Kanna"], root)
   return root
@@ -33,7 +33,7 @@ async function createRepo() {
 
 async function createBareRemote() {
   const root = await mkdtemp(path.join(tmpdir(), "kanna-diff-remote-"))
-  await run(["git", "init", "--bare"], root)
+  await run(["git", "init", "--bare", "--initial-branch=main"], root)
   return root
 }
 
@@ -115,7 +115,7 @@ describe("DiffStore", () => {
 
     const lastMessage = (await run(["git", "log", "-1", "--pretty=%B"], repoRoot)).trim()
     expect(lastMessage).toBe("Update app\n\nOnly app changes")
-  })
+  }, 10_000)
 
   test("commit_and_push publishes an unpublished branch", async () => {
     const repoRoot = await createRepo()

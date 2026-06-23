@@ -216,37 +216,37 @@ function buildPresetEditorCommand(
 }
 
 function resolveEditorExecutable(preset: Exclude<EditorPreset, "custom">, platform: NodeJS.Platform) {
+  if (platform !== "darwin") {
+    return { command: preset === "vscode" ? "code" : preset === "xcode" ? "xed" : preset, args: [] }
+  }
+
   if (preset === "cursor") {
     if (hasCommand("cursor")) return { command: "cursor", args: [] }
-    if (platform === "darwin" && canOpenMacApp("Cursor")) return { command: "open", args: ["-a", "Cursor"] }
+    if (canOpenMacApp("Cursor")) return { command: "open", args: ["-a", "Cursor"] }
   }
   if (preset === "vscode") {
     if (hasCommand("code")) return { command: "code", args: [] }
-    if (platform === "darwin" && canOpenMacApp("Visual Studio Code")) return { command: "open", args: ["-a", "Visual Studio Code"] }
+    if (canOpenMacApp("Visual Studio Code")) return { command: "open", args: ["-a", "Visual Studio Code"] }
   }
   if (preset === "windsurf") {
     if (hasCommand("windsurf")) return { command: "windsurf", args: [] }
-    if (platform === "darwin" && canOpenMacApp("Windsurf")) return { command: "open", args: ["-a", "Windsurf"] }
+    if (canOpenMacApp("Windsurf")) return { command: "open", args: ["-a", "Windsurf"] }
   }
   if (preset === "xcode") {
     if (hasCommand("xed")) return { command: "xed", args: [] }
-    if (platform === "darwin" && canOpenMacApp("Xcode")) return { command: "open", args: ["-a", "Xcode"] }
+    if (canOpenMacApp("Xcode")) return { command: "open", args: ["-a", "Xcode"] }
   }
 
-  if (platform === "darwin") {
-    switch (preset) {
-      case "cursor":
-        throw new Error("Cursor is not installed")
-      case "vscode":
-        throw new Error("Visual Studio Code is not installed")
-      case "windsurf":
-        throw new Error("Windsurf is not installed")
-      case "xcode":
-        throw new Error("Xcode is not installed")
-    }
+  switch (preset) {
+    case "cursor":
+      throw new Error("Cursor is not installed")
+    case "vscode":
+      throw new Error("Visual Studio Code is not installed")
+    case "windsurf":
+      throw new Error("Windsurf is not installed")
+    case "xcode":
+      throw new Error("Xcode is not installed")
   }
-
-  return { command: preset === "vscode" ? "code" : preset === "xcode" ? "xed" : preset, args: [] }
 }
 
 function buildCustomEditorCommand(args: {

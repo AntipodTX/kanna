@@ -21,6 +21,17 @@ import { resolveLocalPath } from "./paths"
 const COMPACTION_THRESHOLD_BYTES = 2 * 1024 * 1024
 const STALE_EMPTY_CHAT_MAX_AGE_MS = 30 * 60 * 1000
 const SIDEBAR_PROJECT_ORDER_FILE = "sidebar-order.json"
+const LAST_ASSISTANT_RESPONSE_PREVIEW_MAX_LENGTH = 220
+
+function providerSessionKey(provider: AgentProvider, sessionToken: string) {
+  return `${provider}:${sessionToken}`
+}
+
+function createAssistantResponsePreview(text: string) {
+  const normalized = text.replace(/\s+/g, " ").trim()
+  if (normalized.length <= LAST_ASSISTANT_RESPONSE_PREVIEW_MAX_LENGTH) return normalized
+  return `${normalized.slice(0, LAST_ASSISTANT_RESPONSE_PREVIEW_MAX_LENGTH - 3)}...`
+}
 
 function normalizeSidebarProjectOrder(value: unknown) {
   if (!Array.isArray(value)) {
@@ -102,6 +113,9 @@ function getReplayEventPriority(event: StoreEvent) {
     case "turn_finished":
     case "turn_failed":
       return 8
+    case "chat_transcript_metadata_set":
+    case "chat_synced":
+    case "provider_session_hidden":
     case "chat_read_state_set":
       return 9
     case "chat_deleted":
@@ -141,6 +155,21 @@ function getForkedChatTitle(title: string) {
   return trimmed.startsWith("Fork: ") ? trimmed : `Fork: ${trimmed}`
 }
 
+export interface TranscriptSyncProviderRecord {
+  providerKey: string
+  providerHash: string
+  matchKey: string
+}
+
+export interface TranscriptSyncState {
+  v: 1
+  provider: AgentProvider
+  sessionToken: string
+  transcriptHash: string
+  canonicalHash: string
+  providerSequence: TranscriptSyncProviderRecord[]
+}
+
 export class EventStore {
   readonly dataDir: string
   readonly state: StoreState = createEmptyState()
@@ -154,6 +183,7 @@ export class EventStore {
   private readonly turnsLogPath: string
   private readonly transcriptsDir: string
   private readonly sidebarProjectOrderPath: string
+  private readonly transcriptSyncDir: string
   private legacyMessagesByChatId = new Map<string, TranscriptEntry[]>()
   private legacySidebarProjectOrder: string[] = []
   private sidebarProjectOrder: string[] = []
@@ -170,11 +200,13 @@ export class EventStore {
     this.turnsLogPath = path.join(this.dataDir, "turns.jsonl")
     this.transcriptsDir = path.join(this.dataDir, "transcripts")
     this.sidebarProjectOrderPath = path.join(this.dataDir, SIDEBAR_PROJECT_ORDER_FILE)
+    this.transcriptSyncDir = path.join(this.dataDir, "transcript-sync")
   }
 
   async initialize() {
     await mkdir(this.dataDir, { recursive: true })
     await mkdir(this.transcriptsDir, { recursive: true })
+    await mkdir(this.transcriptSyncDir, { recursive: true })
     await this.ensureFile(this.projectsLogPath)
     await this.ensureFile(this.chatsLogPath)
     await this.ensureFile(this.messagesLogPath)
@@ -232,6 +264,7 @@ export class EventStore {
           ...chat,
           unread: chat.unread ?? false,
           pendingForkSessionToken: chat.pendingForkSessionToken ?? null,
+          hasLocalTitleOverride: chat.hasLocalTitleOverride ?? false,
         })
       }
       this.legacySidebarProjectOrder = normalizeSidebarProjectOrder(parsed.sidebarProjectOrder)
@@ -249,6 +282,14 @@ export class EventStore {
           this.legacyMessagesByChatId.set(messageSet.chatId, cloneTranscriptEntries(messageSet.entries))
         }
       }
+      if (parsed.hiddenProviderSessions?.length) {
+        for (const hiddenSession of parsed.hiddenProviderSessions) {
+          this.state.hiddenProviderSessionsByKey.set(
+            providerSessionKey(hiddenSession.provider, hiddenSession.sessionToken),
+            { ...hiddenSession }
+          )
+        }
+      }
     } catch (error) {
       console.warn(`${LOG_PREFIX} Failed to load snapshot, resetting local history:`, error)
       await this.clearStorage()
@@ -260,6 +301,7 @@ export class EventStore {
     this.state.projectIdsByPath.clear()
     this.state.chatsById.clear()
     this.state.queuedMessagesByChatId.clear()
+    this.state.hiddenProviderSessionsByKey.clear()
     this.sidebarProjectOrder = []
     this.legacySidebarProjectOrder = []
     this.cachedTranscript = null
@@ -425,12 +467,14 @@ export class EventStore {
     switch (event.type) {
       case "project_opened": {
         const localPath = resolveLocalPath(event.localPath)
+        const existingProject = this.state.projectsById.get(event.projectId)
         const project = {
           id: event.projectId,
           localPath,
           title: event.title,
           createdAt: event.timestamp,
           updatedAt: event.timestamp,
+          ...(existingProject?.sidebarTitle ? { sidebarTitle: existingProject.sidebarTitle } : {}),
         }
         this.state.projectsById.set(project.id, project)
         this.state.projectIdsByPath.set(localPath, project.id)
@@ -469,6 +513,7 @@ export class EventStore {
           pendingForkSessionToken: null,
           hasMessages: false,
           lastTurnOutcome: null,
+          hasLocalTitleOverride: false,
         }
         this.state.chatsById.set(chat.id, chat)
         break
@@ -478,6 +523,9 @@ export class EventStore {
         if (!chat) break
         chat.title = event.title
         chat.updatedAt = event.timestamp
+        if (event.markTitleOverride ?? true) {
+          chat.hasLocalTitleOverride = true
+        }
         break
       }
       case "chat_deleted": {
@@ -521,6 +569,38 @@ export class EventStore {
         if (!chat) break
         chat.unread = event.unread
         chat.updatedAt = event.timestamp
+        break
+      }
+      case "chat_transcript_metadata_set": {
+        this.applyTranscriptMetadata(event.chatId, {
+          hasMessages: event.hasMessages,
+          lastMessageAt: event.lastMessageAt,
+          lastAssistantResponsePreview: event.lastAssistantResponsePreview,
+        }, event.timestamp)
+        break
+      }
+      case "chat_synced": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (!chat) break
+        chat.provider = event.provider
+        chat.sessionToken = event.sessionToken
+        chat.externalUpdatedAt = event.externalUpdatedAt
+        if (!chat.hasLocalTitleOverride && event.title?.trim()) {
+          chat.title = event.title.trim()
+        }
+        chat.updatedAt = Math.max(chat.updatedAt, event.timestamp)
+        break
+      }
+      case "provider_session_hidden": {
+        if (!event.sessionToken.trim()) break
+        this.state.hiddenProviderSessionsByKey.set(
+          providerSessionKey(event.provider, event.sessionToken),
+          {
+            provider: event.provider,
+            sessionToken: event.sessionToken,
+            hiddenAt: event.timestamp,
+          }
+        )
         break
       }
       case "message_appended": {
@@ -609,8 +689,34 @@ export class EventStore {
     chat.hasMessages = true
     if (entry.kind === "user_prompt") {
       chat.lastMessageAt = entry.createdAt
+    } else if (entry.kind === "assistant_text") {
+      const preview = createAssistantResponsePreview(entry.text)
+      if (preview) {
+        chat.lastAssistantResponsePreview = preview
+      }
     }
     chat.updatedAt = Math.max(chat.updatedAt, entry.createdAt)
+  }
+
+  private applyTranscriptMetadata(
+    chatId: string,
+    metadata: { hasMessages: boolean; lastMessageAt: number | null; lastAssistantResponsePreview: string | null },
+    timestamp: number
+  ) {
+    const chat = this.state.chatsById.get(chatId)
+    if (!chat) return
+    chat.hasMessages = metadata.hasMessages
+    if (metadata.lastMessageAt === null) {
+      delete chat.lastMessageAt
+    } else {
+      chat.lastMessageAt = metadata.lastMessageAt
+    }
+    if (metadata.lastAssistantResponsePreview === null) {
+      delete chat.lastAssistantResponsePreview
+    } else {
+      chat.lastAssistantResponsePreview = metadata.lastAssistantResponsePreview
+    }
+    chat.updatedAt = Math.max(chat.updatedAt, timestamp)
   }
 
   private append<TEvent extends StoreEvent>(filePath: string, event: TEvent) {
@@ -624,6 +730,10 @@ export class EventStore {
 
   private transcriptPath(chatId: string) {
     return path.join(this.transcriptsDir, `${chatId}.jsonl`)
+  }
+
+  private transcriptSyncPath(chatId: string) {
+    return path.join(this.transcriptSyncDir, `${chatId}.json`)
   }
 
   private loadTranscriptFromDisk(chatId: string) {
@@ -725,7 +835,7 @@ export class EventStore {
     return this.writeChain
   }
 
-  async createChat(projectId: string) {
+  async createChat(projectId: string, options: { title?: string } = {}) {
     const project = this.state.projectsById.get(projectId)
     if (!project || project.deletedAt) {
       throw new Error("Project not found")
@@ -737,7 +847,7 @@ export class EventStore {
       timestamp: Date.now(),
       chatId,
       projectId,
-      title: "New Chat",
+      title: options.title?.trim() || "New Chat",
     }
     await this.append(this.chatsLogPath, event)
     return this.state.chatsById.get(chatId)!
@@ -787,7 +897,7 @@ export class EventStore {
     return this.state.chatsById.get(chatId)!
   }
 
-  async renameChat(chatId: string, title: string) {
+  async renameChat(chatId: string, title: string, options: { markTitleOverride?: boolean } = {}) {
     const trimmed = title.trim()
     if (!trimmed) return
     const chat = this.requireChat(chatId)
@@ -798,12 +908,16 @@ export class EventStore {
       timestamp: Date.now(),
       chatId,
       title: trimmed,
+      markTitleOverride: options.markTitleOverride,
     }
     await this.append(this.chatsLogPath, event)
   }
 
   async deleteChat(chatId: string) {
-    this.requireChat(chatId)
+    const chat = this.requireChat(chatId)
+    if (chat.provider && chat.sessionToken?.trim()) {
+      await this.hideProviderSession(chat.provider, chat.sessionToken)
+    }
     const event: ChatEvent = {
       v: STORE_VERSION,
       type: "chat_deleted",
@@ -946,6 +1060,26 @@ export class EventStore {
     return this.writeChain
   }
 
+  async replaceTranscript(chatId: string, entries: TranscriptEntry[]) {
+    this.requireChat(chatId)
+    const transcriptPath = this.transcriptPath(chatId)
+    const tempPath = `${transcriptPath}.${crypto.randomUUID()}.tmp`
+    const payload = entries.map((entry) => JSON.stringify(entry)).join("\n")
+    const metadataEvent = this.createTranscriptMetadataEvent(chatId, entries)
+    this.writeChain = this.writeChain.then(async () => {
+      await mkdir(this.transcriptsDir, { recursive: true })
+      await writeFile(tempPath, payload ? `${payload}\n` : "", "utf8")
+      await rename(tempPath, transcriptPath)
+      await appendFile(this.chatsLogPath, `${JSON.stringify(metadataEvent)}\n`, "utf8")
+      this.applyEvent(metadataEvent)
+      this.cachedTranscript = {
+        chatId,
+        entries: cloneTranscriptEntries(entries),
+      }
+    })
+    return this.writeChain
+  }
+
   async enqueueMessage(chatId: string, message: Omit<QueuedChatMessage, "id" | "createdAt"> & Partial<Pick<QueuedChatMessage, "id" | "createdAt">>) {
     this.requireChat(chatId)
     const queuedMessage: QueuedChatMessage = {
@@ -1043,6 +1177,20 @@ export class EventStore {
     await this.append(this.turnsLogPath, event)
   }
 
+  async hideProviderSession(provider: AgentProvider, sessionToken: string) {
+    if (!sessionToken.trim()) return
+    const key = providerSessionKey(provider, sessionToken)
+    if (this.state.hiddenProviderSessionsByKey.has(key)) return
+    const event: ChatEvent = {
+      v: STORE_VERSION,
+      type: "provider_session_hidden",
+      timestamp: Date.now(),
+      provider,
+      sessionToken,
+    }
+    await this.append(this.chatsLogPath, event)
+  }
+
   async setPendingForkSessionToken(chatId: string, pendingForkSessionToken: string | null) {
     const chat = this.requireChat(chatId)
     if ((chat.pendingForkSessionToken ?? null) === pendingForkSessionToken) return
@@ -1054,6 +1202,42 @@ export class EventStore {
       pendingForkSessionToken,
     }
     await this.append(this.turnsLogPath, event)
+  }
+
+  async syncChat(args: {
+    chatId: string
+    provider: AgentProvider
+    sessionToken: string
+    externalUpdatedAt: number
+    title?: string | null
+  }) {
+    const chat = this.state.chatsById.get(args.chatId)
+    if (!chat) {
+      throw new Error("Chat not found")
+    }
+
+    const normalizedTitle = args.title?.trim() || null
+    const shouldUpdateTitle = normalizedTitle && !chat.hasLocalTitleOverride && chat.title !== normalizedTitle
+    if (
+      chat.provider === args.provider
+      && chat.sessionToken === args.sessionToken
+      && chat.externalUpdatedAt === args.externalUpdatedAt
+      && !shouldUpdateTitle
+    ) {
+      return
+    }
+
+    const event: ChatEvent = {
+      v: STORE_VERSION,
+      type: "chat_synced",
+      timestamp: Date.now(),
+      chatId: args.chatId,
+      provider: args.provider,
+      sessionToken: args.sessionToken,
+      externalUpdatedAt: args.externalUpdatedAt,
+      title: normalizedTitle,
+    }
+    await this.append(this.chatsLogPath, event)
   }
 
   getProject(projectId: string) {
@@ -1169,6 +1353,55 @@ export class EventStore {
     return [...this.state.projectsById.values()].filter((project) => !project.deletedAt)
   }
 
+  getTranscriptSyncState(chatId: string) {
+    const statePath = this.transcriptSyncPath(chatId)
+    if (!existsSync(statePath)) {
+      return null
+    }
+
+    try {
+      const text = readFileSyncImmediate(statePath, "utf8")
+      if (!text.trim()) return null
+      return JSON.parse(text) as TranscriptSyncState
+    } catch {
+      return null
+    }
+  }
+
+  async setTranscriptSyncState(chatId: string, state: TranscriptSyncState) {
+    this.requireChat(chatId)
+    const syncPath = this.transcriptSyncPath(chatId)
+    const tempPath = `${syncPath}.${crypto.randomUUID()}.tmp`
+    const payload = JSON.stringify(state, null, 2)
+    this.writeChain = this.writeChain.then(async () => {
+      await mkdir(this.transcriptSyncDir, { recursive: true })
+      await writeFile(tempPath, payload, "utf8")
+      await rename(tempPath, syncPath)
+    })
+    return this.writeChain
+  }
+
+  findChatByProviderSession(
+    provider: AgentProvider,
+    sessionToken: string,
+    options: { includeDeleted?: boolean } = {}
+  ) {
+    for (const chat of this.state.chatsById.values()) {
+      if (chat.provider !== provider || chat.sessionToken !== sessionToken) {
+        continue
+      }
+      if (chat.deletedAt && !options.includeDeleted) {
+        continue
+      }
+      return chat
+    }
+    return null
+  }
+
+  isProviderSessionHidden(provider: AgentProvider, sessionToken: string) {
+    return this.state.hiddenProviderSessionsByKey.has(providerSessionKey(provider, sessionToken))
+  }
+
   listChatsByProject(projectId: string) {
     return [...this.state.chatsById.values()]
       .filter((chat) => chat.projectId === projectId && !chat.deletedAt && !chat.archivedAt)
@@ -1222,6 +1455,33 @@ export class EventStore {
             attachments: [...entry.attachments],
           })),
         })),
+      hiddenProviderSessions: [...this.state.hiddenProviderSessionsByKey.values()]
+        .map((entry) => ({ ...entry })),
+    }
+  }
+
+  private createTranscriptMetadataEvent(chatId: string, entries: TranscriptEntry[]): ChatEvent {
+    let lastMessageAt: number | undefined
+    let lastAssistantResponsePreview: string | undefined
+    for (const entry of entries) {
+      if (entry.kind === "user_prompt") {
+        lastMessageAt = Math.max(lastMessageAt ?? 0, entry.createdAt)
+      } else if (entry.kind === "assistant_text") {
+        const preview = createAssistantResponsePreview(entry.text)
+        if (preview) {
+          lastAssistantResponsePreview = preview
+        }
+      }
+    }
+
+    return {
+      v: STORE_VERSION,
+      type: "chat_transcript_metadata_set",
+      timestamp: Date.now(),
+      chatId,
+      hasMessages: entries.length > 0,
+      lastMessageAt: lastMessageAt ?? null,
+      lastAssistantResponsePreview: lastAssistantResponsePreview ?? null,
     }
   }
 
