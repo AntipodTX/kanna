@@ -12,6 +12,25 @@ afterEach(() => {
 })
 
 describe("migrateChatPreferencesState", () => {
+  test("preserves max effort for Fable Claude models", () => {
+    const migrated = migrateChatPreferencesState({
+      defaultProvider: "last_used",
+      providerDefaults: {
+        claude: {
+          model: "fable",
+          modelOptions: { reasoningEffort: "max", contextWindow: "1m" },
+          planMode: false,
+        },
+      },
+    })
+
+    expect(migrated.providerDefaults.claude).toEqual({
+      model: "fable",
+      modelOptions: { reasoningEffort: "max", contextWindow: "200k" },
+      planMode: false,
+    })
+  })
+
   test("preserves max effort for versioned Opus Claude models", () => {
     const migrated = migrateChatPreferencesState({
       defaultProvider: "last_used",
@@ -27,6 +46,25 @@ describe("migrateChatPreferencesState", () => {
     expect(migrated.providerDefaults.claude).toEqual({
       model: "claude-opus-4-8",
       modelOptions: { reasoningEffort: "max", contextWindow: "1m" },
+      planMode: false,
+    })
+  })
+
+  test("downgrades unsupported max effort for Haiku Claude models", () => {
+    const migrated = migrateChatPreferencesState({
+      defaultProvider: "last_used",
+      providerDefaults: {
+        claude: {
+          model: "claude-haiku-4-5-20251001",
+          modelOptions: { reasoningEffort: "max", contextWindow: "200k" },
+          planMode: false,
+        },
+      },
+    })
+
+    expect(migrated.providerDefaults.claude).toEqual({
+      model: "claude-haiku-4-5-20251001",
+      modelOptions: { reasoningEffort: "high", contextWindow: "200k" },
       planMode: false,
     })
   })
@@ -72,7 +110,7 @@ describe("migrateChatPreferencesState", () => {
       legacyComposerState: {
         provider: "claude",
         model: "claude-sonnet-4-6",
-        modelOptions: { reasoningEffort: "high", contextWindow: "1m" },
+        modelOptions: { reasoningEffort: "max", contextWindow: "1m" },
         planMode: false,
       },
     })

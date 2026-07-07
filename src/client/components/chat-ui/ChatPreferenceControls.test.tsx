@@ -48,13 +48,13 @@ describe("ChatPreferenceControls", () => {
     expect(html).toContain("Plan Mode")
   })
 
-  test("renders Fable as a Claude model option", () => {
-    const html = renderToStaticMarkup(
+  test("renders Fable Claude XHigh and Ultracode efforts", () => {
+    const xhighHtml = renderToStaticMarkup(
       <ChatPreferenceControls
         availableProviders={PROVIDERS}
         selectedProvider="claude"
         model="fable"
-        modelOptions={{ reasoningEffort: "high", contextWindow: "1m" }}
+        modelOptions={{ reasoningEffort: "xhigh", contextWindow: "1m" }}
         onProviderChange={() => {}}
         onModelChange={() => {}}
         onModelOptionChange={() => {}}
@@ -62,7 +62,23 @@ describe("ChatPreferenceControls", () => {
       />
     )
 
-    expect(html).toContain("Fable")
-    expect(html).toContain("High")
+    const ultracodeHtml = renderToStaticMarkup(
+      <ChatPreferenceControls
+        availableProviders={PROVIDERS}
+        selectedProvider="claude"
+        model="fable"
+        modelOptions={{ reasoningEffort: "ultracode", contextWindow: "1m" }}
+        onProviderChange={() => {}}
+        onModelChange={() => {}}
+        onModelOptionChange={() => {}}
+        includePlanMode={false}
+      />
+    )
+
+    expect(xhighHtml).toContain("Fable")
+    expect(xhighHtml).toContain("XHigh")
+    expect(ultracodeHtml).toContain("Fable")
+    expect(ultracodeHtml).toContain("Ultracode")
+    expect(ultracodeHtml.indexOf("Max")).toBeLessThan(ultracodeHtml.indexOf("Ultracode"))
   })
 })

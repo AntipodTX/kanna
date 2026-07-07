@@ -22,6 +22,24 @@ describe("provider catalog normalization", () => {
     })
   })
 
+  test("maps legacy Claude Ultracode effort into shared model options", () => {
+    expect(normalizeClaudeModelOptions("fable", undefined, "ultracode")).toEqual({
+      reasoningEffort: "ultracode",
+      contextWindow: "200k",
+    })
+  })
+
+  test("normalizes unsupported Claude efforts to the default", () => {
+    expect(normalizeClaudeModelOptions("claude-haiku-4-5-20251001", {
+      claude: {
+        reasoningEffort: "max",
+      },
+    })).toEqual({
+      reasoningEffort: "high",
+      contextWindow: "200k",
+    })
+  })
+
   test("normalizes Claude context window only for supported models", () => {
     expect(normalizeClaudeModelOptions("claude-sonnet-4-6", {
       claude: {
@@ -78,13 +96,50 @@ describe("provider catalog normalization", () => {
 
   test("overlays Claude model labels from the Agent SDK model catalog", () => {
     expect(applyClaudeSdkModels([
-      { value: "claude-fable-5[1m]", displayName: "Fable from SDK", supportsEffort: true },
+      { value: "claude-fable-5[1m]", displayName: "Fable from SDK", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "max"] },
       { value: "claude-opus-4-7", displayName: "Opus 4.7", supportsEffort: true },
       { value: "claude-opus-4-8", displayName: "Opus from SDK", supportsEffort: true },
     ])).toBe(true)
 
     const claude = SERVER_PROVIDERS.find((provider) => provider.id === "claude")
-    expect(claude?.models.find((model) => model.id === "fable")?.label).toBe("Fable from SDK")
+    const fable = claude?.models.find((model) => model.id === "fable") as { label?: string; supportedEffortLevels?: readonly string[] } | undefined
+    expect(fable?.label).toBe("Fable from SDK")
+    expect(fable?.supportedEffortLevels).toEqual(["low", "medium", "high", "max"])
     expect(claude?.models.find((model) => model.id === "claude-opus-4-8")?.label).toBe("Opus from SDK")
+  })
+
+  test("maps SDK xhigh effort support to XHigh and Ultracode UI options", () => {
+    expect(applyClaudeSdkModels([
+      { value: "fable", displayName: "Fable", supportsEffort: true, supportedEffortLevels: ["low", "xhigh"] },
+    ])).toBe(true)
+
+    const claude = SERVER_PROVIDERS.find((provider) => provider.id === "claude")
+    const fable = claude?.models.find((model) => model.id === "fable") as { supportedEffortLevels?: readonly string[] } | undefined
+    expect(fable?.supportedEffortLevels).toEqual(["low", "xhigh", "ultracode"])
+  })
+
+  test("sorts SDK effort metadata by the shared Claude UI order", () => {
+    expect(applyClaudeSdkModels([
+      { value: "fable", displayName: "Fable", supportsEffort: true, supportedEffortLevels: ["low", "xhigh", "max"] },
+    ])).toBe(true)
+
+    const claude = SERVER_PROVIDERS.find((provider) => provider.id === "claude")
+    const fable = claude?.models.find((model) => model.id === "fable") as { supportedEffortLevels?: readonly string[] } | undefined
+    expect(fable?.supportedEffortLevels).toEqual(["low", "xhigh", "max", "ultracode"])
+  })
+
+  test("normalizes Claude model options against SDK-updated effort metadata", () => {
+    expect(applyClaudeSdkModels([
+      { value: "claude-sonnet-4-6", displayName: "Sonnet", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "xhigh"] },
+    ])).toBe(true)
+
+    expect(normalizeClaudeModelOptions("claude-sonnet-4-6", {
+      claude: {
+        reasoningEffort: "xhigh",
+      },
+    })).toEqual({
+      reasoningEffort: "xhigh",
+      contextWindow: "200k",
+    })
   })
 })
