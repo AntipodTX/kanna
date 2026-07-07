@@ -1,9 +1,10 @@
-import { query, type CanUseTool, type PermissionResult, type Query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
+import { query, type CanUseTool, type EffortLevel, type PermissionResult, type Query, type SDKUserMessage, type Settings } from "@anthropic-ai/claude-agent-sdk"
 import { homedir } from "node:os"
 import type {
   AgentProvider,
   ChatAttachment,
   ContextWindowUsageSnapshot,
+  ClaudeReasoningEffort,
   ModelOptions,
   NormalizedToolCall,
   PendingToolSnapshot,
@@ -28,7 +29,7 @@ import {
   normalizeCodexModelOptions,
   normalizeServerModel,
 } from "./provider-catalog"
-import { resolveClaudeApiModelId } from "../shared/types"
+import { CLAUDE_REASONING_OPTIONS, resolveClaudeApiModelId } from "../shared/types"
 import { fallbackTitleFromMessage } from "./generate-title"
 
 const CLAUDE_TOOLSET = [
@@ -49,6 +50,44 @@ const CLAUDE_TOOLSET = [
   "EnterPlanMode",
   "ExitPlanMode",
 ] as const
+
+export function resolveClaudeRuntimeOptions(effort?: string): {
+  effort?: EffortLevel
+  settings?: Settings
+} {
+  if (effort === "ultracode") {
+    return {
+      effort: "xhigh",
+      settings: { ultracode: true },
+    }
+  }
+
+  const sdkEffort = resolveClaudeSdkEffort(effort)
+  if (sdkEffort) {
+    return {
+      effort: sdkEffort,
+      settings: undefined,
+    }
+  }
+
+  return {
+    effort: undefined,
+    settings: undefined,
+  }
+}
+
+function isClaudeSdkRuntimeEffort(effort: ClaudeReasoningEffort): effort is EffortLevel {
+  return effort !== "ultracode"
+}
+
+function resolveClaudeSdkEffort(effort?: string): EffortLevel | undefined {
+  for (const option of CLAUDE_REASONING_OPTIONS) {
+    if (option.id === effort && isClaudeSdkRuntimeEffort(option.id)) {
+      return option.id
+    }
+  }
+  return undefined
+}
 
 interface PendingToolRequest {
   toolUseId: string
@@ -619,13 +658,15 @@ async function startClaudeSession(args: {
   }
 
   const promptQueue = new AsyncMessageQueue<SDKUserMessage>()
+  const runtimeOptions = resolveClaudeRuntimeOptions(args.effort)
 
   const q = query({
     prompt: promptQueue,
     options: {
       cwd: args.localPath,
       model: args.model,
-      effort: args.effort as "low" | "medium" | "high" | "max" | undefined,
+      effort: runtimeOptions.effort,
+      settings: runtimeOptions.settings,
       resume: args.sessionToken ?? undefined,
       forkSession: args.forkSession,
       permissionMode: args.planMode ? "plan" : "acceptEdits",

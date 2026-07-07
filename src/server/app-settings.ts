@@ -12,7 +12,6 @@ import {
   normalizeClaudeContextWindow,
   normalizeClaudeModelId,
   normalizeCodexModelId,
-  supportsClaudeMaxReasoningEffort,
   type AppSettingsPatch,
   type AppSettingsSnapshot,
   type AppThemePreference,
@@ -25,6 +24,7 @@ import {
   type EditorPreset,
   type ProviderPreference,
 } from "../shared/types"
+import { normalizeServerClaudeReasoningEffort } from "./provider-catalog"
 
 interface AppSettingsFile {
   analyticsEnabled?: unknown
@@ -174,7 +174,7 @@ function normalizeClaudePreference(value?: {
   return {
     model,
     modelOptions: {
-      reasoningEffort: !supportsClaudeMaxReasoningEffort(model) && normalizedEffort === "max" ? "high" : normalizedEffort,
+      reasoningEffort: normalizeServerClaudeReasoningEffort(model, normalizedEffort),
       contextWindow: normalizeClaudeContextWindow(model, value?.modelOptions?.contextWindow),
     },
     planMode: value?.planMode === true,

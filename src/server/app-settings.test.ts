@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { AppSettingsManager, readAppSettingsSnapshot } from "./app-settings"
+import { applyClaudeSdkModels, resetServerProvidersForTests } from "./provider-catalog"
 import type { AppSettingsSnapshot } from "../shared/types"
 
 let tempDirs: string[] = []
@@ -10,6 +11,7 @@ let tempDirs: string[] = []
 afterEach(async () => {
   await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true })))
   tempDirs = []
+  resetServerProvidersForTests()
 })
 
 async function createTempFilePath() {
@@ -73,6 +75,73 @@ describe("readAppSettingsSnapshot", () => {
     const snapshot = await readAppSettingsSnapshot(filePath)
     expect(snapshot.analyticsEnabled).toBe(true)
     expect(snapshot.warning).toContain("invalid JSON")
+  })
+
+  test("preserves Fable max effort from settings", async () => {
+    const filePath = await createTempFilePath()
+    await writeFile(filePath, JSON.stringify({
+      providerDefaults: {
+        claude: {
+          model: "fable",
+          modelOptions: { reasoningEffort: "max", contextWindow: "1m" },
+        },
+      },
+    }), "utf8")
+
+    await expect(readAppSettingsSnapshot(filePath)).resolves.toMatchObject({
+      providerDefaults: {
+        claude: {
+          model: "fable",
+          modelOptions: { reasoningEffort: "max", contextWindow: "200k" },
+        },
+      },
+    })
+  })
+
+  test("downgrades unsupported Haiku max effort from settings", async () => {
+    const filePath = await createTempFilePath()
+    await writeFile(filePath, JSON.stringify({
+      providerDefaults: {
+        claude: {
+          model: "claude-haiku-4-5-20251001",
+          modelOptions: { reasoningEffort: "max", contextWindow: "200k" },
+        },
+      },
+    }), "utf8")
+
+    await expect(readAppSettingsSnapshot(filePath)).resolves.toMatchObject({
+      providerDefaults: {
+        claude: {
+          model: "claude-haiku-4-5-20251001",
+          modelOptions: { reasoningEffort: "high", contextWindow: "200k" },
+        },
+      },
+    })
+  })
+
+  test("preserves SDK-enabled Claude efforts from settings", async () => {
+    expect(applyClaudeSdkModels([
+      { value: "claude-sonnet-4-6", displayName: "Sonnet", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "xhigh"] },
+    ])).toBe(true)
+
+    const filePath = await createTempFilePath()
+    await writeFile(filePath, JSON.stringify({
+      providerDefaults: {
+        claude: {
+          model: "claude-sonnet-4-6",
+          modelOptions: { reasoningEffort: "xhigh", contextWindow: "200k" },
+        },
+      },
+    }), "utf8")
+
+    await expect(readAppSettingsSnapshot(filePath)).resolves.toMatchObject({
+      providerDefaults: {
+        claude: {
+          model: "claude-sonnet-4-6",
+          modelOptions: { reasoningEffort: "xhigh", contextWindow: "200k" },
+        },
+      },
+    })
   })
 })
 

@@ -6,8 +6,10 @@ import {
   maxClaudeContextWindowFromModelUsage,
   normalizeClaudeStreamMessage,
   normalizeClaudeUsageSnapshot,
+  resolveClaudeRuntimeOptions,
 } from "./agent"
 import type { HarnessTurn } from "./harness-types"
+import { CLAUDE_REASONING_OPTIONS } from "../shared/types"
 import type { ChatAttachment, TranscriptEntry } from "../shared/types"
 
 function timestamped<T extends Omit<TranscriptEntry, "_id" | "createdAt">>(entry: T): TranscriptEntry {
@@ -142,6 +144,39 @@ describe("normalizeClaudeStreamMessage", () => {
         contextWindow: 1_000_000,
       },
     })).toBe(1_000_000)
+  })
+})
+
+describe("resolveClaudeRuntimeOptions", () => {
+  test("forwards every non-Ultracode shared Claude effort to the SDK", () => {
+    for (const option of CLAUDE_REASONING_OPTIONS) {
+      if (option.id === "ultracode") continue
+      expect(resolveClaudeRuntimeOptions(option.id)).toEqual({
+        effort: option.id,
+        settings: undefined,
+      })
+    }
+  })
+
+  test("keeps Claude XHigh as an effort-only option", () => {
+    expect(resolveClaudeRuntimeOptions("xhigh")).toEqual({
+      effort: "xhigh",
+      settings: undefined,
+    })
+  })
+
+  test("enables Claude Ultracode as xhigh effort plus workflow settings", () => {
+    expect(resolveClaudeRuntimeOptions("ultracode")).toEqual({
+      effort: "xhigh",
+      settings: { ultracode: true },
+    })
+  })
+
+  test("keeps Claude Max as an effort-only option", () => {
+    expect(resolveClaudeRuntimeOptions("max")).toEqual({
+      effort: "max",
+      settings: undefined,
+    })
   })
 })
 

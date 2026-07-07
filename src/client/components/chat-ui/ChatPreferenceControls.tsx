@@ -11,7 +11,7 @@ import {
   type CodexModelOptions,
   type CodexReasoningEffort,
   type ProviderCatalogEntry,
-  supportsClaudeMaxReasoningEffort,
+  isClaudeReasoningEffortSupported,
 } from "../../../shared/types"
 import { cn } from "../../lib/utils"
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover"
@@ -177,7 +177,8 @@ export function ChatPreferenceControls({
   const showPlanMode = includePlanMode && providerConfig?.supportsPlanMode && onPlanModeChange
   const claudeModelOptions = selectedProvider === "claude" ? modelOptions as ClaudeModelOptions : null
   const codexModelOptions = selectedProvider === "codex" ? modelOptions as CodexModelOptions : null
-  const contextWindowOptions = providerConfig.models.find((candidate) => candidate.id === model)?.contextWindowOptions ?? []
+  const selectedModelOption = providerConfig.models.find((candidate) => candidate.id === model)
+  const contextWindowOptions = selectedModelOption?.contextWindowOptions ?? []
   const selectedContextWindow = claudeModelOptions?.contextWindow ?? CLAUDE_CONTEXT_WINDOW_OPTIONS[0].id
   const ContextWindowIcon = selectedContextWindow === "1m" ? SquareMenu : SquareMinus
 
@@ -271,7 +272,7 @@ export function ChatPreferenceControls({
                 selected={modelOptions.reasoningEffort === effort.id}
                 icon={<Brain className="h-4 w-4 text-muted-foreground" />}
                 label={effort.label}
-                disabled={effort.id === "max" && !supportsClaudeMaxReasoningEffort(model)}
+                disabled={!isClaudeReasoningEffortSupported(selectedModelOption, effort.id)}
               />
             ))
             : CODEX_REASONING_OPTIONS.map((effort) => (

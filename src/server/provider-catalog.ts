@@ -1,5 +1,6 @@
 import type {
   AgentProvider,
+  ClaudeReasoningEffort,
   ClaudeModelOptions,
   CodexModelOptions,
   ClaudeContextWindow,
@@ -9,12 +10,14 @@ import type {
   ServiceTier,
 } from "../shared/types"
 import {
+  CLAUDE_REASONING_OPTIONS,
   DEFAULT_CLAUDE_MODEL_OPTIONS,
   DEFAULT_CODEX_MODEL_OPTIONS,
   PROVIDERS,
   normalizeClaudeContextWindow,
   normalizeProviderModelId,
   isClaudeReasoningEffort,
+  isClaudeReasoningEffortSupported,
   isCodexReasoningEffort,
 } from "../shared/types"
 
@@ -78,6 +81,20 @@ function findSdkModelForOption(models: readonly ClaudeSdkModelInfo[], option: Pr
   return bestModel
 }
 
+function normalizeClaudeSdkEffortLevel(level: string): readonly ClaudeReasoningEffort[] {
+  if (level === "xhigh") return ["xhigh", "ultracode"]
+  return isClaudeReasoningEffort(level) ? [level] : []
+}
+
+function normalizeClaudeSdkEffortLevels(levels?: readonly string[]): readonly ClaudeReasoningEffort[] | undefined {
+  if (!levels) return undefined
+
+  const normalized = new Set(levels.flatMap(normalizeClaudeSdkEffortLevel))
+  return normalized.size > 0
+    ? CLAUDE_REASONING_OPTIONS.map((option) => option.id).filter((effort) => normalized.has(effort))
+    : undefined
+}
+
 export function applyClaudeSdkModels(models: readonly ClaudeSdkModelInfo[]) {
   const claudeIndex = SERVER_PROVIDERS.findIndex((provider) => provider.id === "claude")
   const claudeProvider = SERVER_PROVIDERS[claudeIndex]
@@ -90,6 +107,7 @@ export function applyClaudeSdkModels(models: readonly ClaudeSdkModelInfo[]) {
       ...option,
       label: sdkModel.displayName?.trim() || option.label,
       supportsEffort: sdkModel.supportsEffort ?? option.supportsEffort,
+      supportedEffortLevels: normalizeClaudeSdkEffortLevels(sdkModel.supportedEffortLevels) ?? option.supportedEffortLevels,
     }
   })
 
@@ -121,18 +139,33 @@ export function normalizeServerModel(provider: AgentProvider, model?: string): s
   return catalog.defaultModel
 }
 
+export function getServerProviderModelOption(provider: AgentProvider, modelId: string): ProviderModelOption | undefined {
+  const normalizedModelId = normalizeServerModel(provider, modelId)
+  return getServerProviderCatalog(provider).models.find((candidate) => candidate.id === normalizedModelId)
+}
+
+export function normalizeServerClaudeReasoningEffort(modelId: string, effort?: unknown): ClaudeReasoningEffort {
+  const normalizedEffort = isClaudeReasoningEffort(effort)
+    ? effort
+    : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
+  return isClaudeReasoningEffortSupported(getServerProviderModelOption("claude", modelId), normalizedEffort)
+    ? normalizedEffort
+    : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
+}
+
 export function normalizeClaudeModelOptions(
   model: string,
   modelOptions?: ModelOptions,
   legacyEffort?: string
 ): ClaudeModelOptions {
   const reasoningEffort = modelOptions?.claude?.reasoningEffort
+  const normalizedEffort = isClaudeReasoningEffort(reasoningEffort)
+    ? reasoningEffort
+    : isClaudeReasoningEffort(legacyEffort)
+      ? legacyEffort
+      : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
   return {
-    reasoningEffort: isClaudeReasoningEffort(reasoningEffort)
-      ? reasoningEffort
-      : isClaudeReasoningEffort(legacyEffort)
-        ? legacyEffort
-        : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort,
+    reasoningEffort: normalizeServerClaudeReasoningEffort(model, normalizedEffort),
     contextWindow: normalizeClaudeContextWindow(model, modelOptions?.claude?.contextWindow as ClaudeContextWindow | undefined),
   }
 }

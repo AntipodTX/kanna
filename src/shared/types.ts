@@ -138,7 +138,7 @@ export interface ProviderModelOption {
   supportsEffort: boolean
   aliases?: readonly string[]
   contextWindowOptions?: readonly ProviderContextWindowOption[]
-  supportsMaxReasoningEffort?: boolean
+  supportedEffortLevels?: readonly ClaudeReasoningEffort[]
 }
 
 export interface ProviderEffortOption {
@@ -155,7 +155,9 @@ export const CLAUDE_REASONING_OPTIONS = [
   { id: "low", label: "Low" },
   { id: "medium", label: "Medium" },
   { id: "high", label: "High" },
+  { id: "xhigh", label: "XHigh" },
   { id: "max", label: "Max" },
+  { id: "ultracode", label: "Ultracode" },
 ] as const satisfies readonly ProviderEffortOption[]
 
 export const CODEX_REASONING_OPTIONS = [
@@ -170,6 +172,24 @@ export type ClaudeReasoningEffort = (typeof CLAUDE_REASONING_OPTIONS)[number]["i
 export type CodexReasoningEffort = (typeof CODEX_REASONING_OPTIONS)[number]["id"]
 export type ClaudeContextWindow = "200k" | "1m"
 export type ServiceTier = "fast"
+
+export const CLAUDE_STANDARD_REASONING_EFFORT_LEVELS: readonly ClaudeReasoningEffort[] = [
+  "low",
+  "medium",
+  "high",
+] as const
+
+export const CLAUDE_MAX_REASONING_EFFORT_LEVELS: readonly ClaudeReasoningEffort[] = [
+  ...CLAUDE_STANDARD_REASONING_EFFORT_LEVELS,
+  "max",
+] as const
+
+export const CLAUDE_XHIGH_REASONING_EFFORT_LEVELS: readonly ClaudeReasoningEffort[] = [
+  ...CLAUDE_STANDARD_REASONING_EFFORT_LEVELS,
+  "xhigh",
+  "max",
+  "ultracode",
+] as const
 
 export interface ClaudeModelOptions {
   reasoningEffort: ClaudeReasoningEffort
@@ -260,6 +280,7 @@ export const PROVIDERS: ProviderCatalogEntry[] = [
         id: "fable",
         label: deriveClaudeModelLabel("fable"),
         supportsEffort: true,
+        supportedEffortLevels: [...CLAUDE_XHIGH_REASONING_EFFORT_LEVELS],
       },
       {
         id: "claude-opus-4-8",
@@ -267,7 +288,7 @@ export const PROVIDERS: ProviderCatalogEntry[] = [
         supportsEffort: true,
         aliases: ["opus"],
         contextWindowOptions: [...CLAUDE_CONTEXT_WINDOW_OPTIONS],
-        supportsMaxReasoningEffort: true,
+        supportedEffortLevels: [...CLAUDE_XHIGH_REASONING_EFFORT_LEVELS],
       },
       {
         id: "claude-sonnet-4-6",
@@ -275,12 +296,14 @@ export const PROVIDERS: ProviderCatalogEntry[] = [
         supportsEffort: true,
         aliases: ["sonnet"],
         contextWindowOptions: [...CLAUDE_CONTEXT_WINDOW_OPTIONS],
+        supportedEffortLevels: [...CLAUDE_MAX_REASONING_EFFORT_LEVELS],
       },
       {
         id: "claude-haiku-4-5-20251001",
         label: deriveClaudeModelLabel("claude-haiku-4-5-20251001"),
         supportsEffort: true,
         aliases: ["haiku"],
+        supportedEffortLevels: [...CLAUDE_STANDARD_REASONING_EFFORT_LEVELS],
       },
     ],
     efforts: [...CLAUDE_REASONING_OPTIONS],
@@ -343,8 +366,25 @@ export function getClaudeModelOption(modelId: string): ProviderModelOption | und
   return getProviderModelOption("claude", modelId)
 }
 
+export function isClaudeReasoningEffortSupported(
+  model: ProviderModelOption | undefined,
+  effort: ClaudeReasoningEffort
+): boolean {
+  if (!model?.supportsEffort) return false
+  return (model.supportedEffortLevels ?? CLAUDE_STANDARD_REASONING_EFFORT_LEVELS).includes(effort)
+}
+
+export function normalizeClaudeReasoningEffort(modelId: string, effort?: unknown): ClaudeReasoningEffort {
+  const normalizedEffort = isClaudeReasoningEffort(effort)
+    ? effort
+    : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
+  return isClaudeReasoningEffortSupported(getClaudeModelOption(modelId), normalizedEffort)
+    ? normalizedEffort
+    : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
+}
+
 export function supportsClaudeMaxReasoningEffort(modelId: string): boolean {
-  return Boolean(getClaudeModelOption(modelId)?.supportsMaxReasoningEffort)
+  return isClaudeReasoningEffortSupported(getClaudeModelOption(modelId), "max")
 }
 
 export function getClaudeContextWindowOptions(modelId: string): readonly ProviderContextWindowOption[] {
