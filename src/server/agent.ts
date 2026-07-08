@@ -1273,9 +1273,34 @@ export class AgentCoordinator {
           continue
         }
 
-        if (!event.entry) continue
-        await this.store.appendMessage(session.chatId, event.entry)
         const active = this.activeTurns.get(session.chatId)
+        if (!event.entry) continue
+
+        const isTerminalEntry = event.entry.kind === "result" || event.entry.kind === "interrupted"
+        const completedClaudePromptSeq = isTerminalEntry
+          ? (session.pendingPromptSeqs.shift() ?? null)
+          : null
+        const shouldAppendEntry = !isTerminalEntry
+          || (
+            active !== undefined
+            && completedClaudePromptSeq === (active.claudePromptSeq ?? null)
+            && !active.cancelRequested
+          )
+
+        if (shouldAppendEntry) {
+          await this.store.appendMessage(session.chatId, event.entry)
+        } else {
+          logClaudeSteer("claude_stale_terminal_event_suppressed", {
+            chatId: session.chatId,
+            sessionId: session.id,
+            entryKind: event.entry.kind,
+            activePromptSeq: active?.claudePromptSeq ?? null,
+            activeCancelRequested: active?.cancelRequested ?? null,
+            completedPromptSeq: completedClaudePromptSeq,
+            pendingPromptSeqs: [...session.pendingPromptSeqs],
+          })
+        }
+
         if (event.entry.kind === "system_init" && active) {
           active.status = "running"
           const chat = this.store.getChat(session.chatId)
@@ -1294,10 +1319,6 @@ export class AgentCoordinator {
           })
         }
 
-        const completedClaudePromptSeq = event.entry.kind === "result" || event.entry.kind === "interrupted"
-          ? (session.pendingPromptSeqs.shift() ?? null)
-          : null
-
         logClaudeSteer("claude_event", {
           chatId: session.chatId,
           sessionId: session.id,
@@ -1310,14 +1331,16 @@ export class AgentCoordinator {
 
         if (event.entry.kind === "result" && active && completedClaudePromptSeq === (active.claudePromptSeq ?? null)) {
           active.hasFinalResult = true
-          if (event.entry.isError) {
-            await this.store.recordTurnFailed(session.chatId, event.entry.result || "Turn failed")
-          } else if (!active.cancelRequested) {
-            await this.store.recordTurnFinished(session.chatId)
-          }
-          this.activeTurns.delete(session.chatId)
           if (!active.cancelRequested) {
+            if (event.entry.isError) {
+              await this.store.recordTurnFailed(session.chatId, event.entry.result || "Turn failed")
+            } else {
+              await this.store.recordTurnFinished(session.chatId)
+            }
+            this.activeTurns.delete(session.chatId)
             await this.maybeStartNextQueuedMessage(session.chatId)
+          } else if (this.activeTurns.get(session.chatId) === active) {
+            this.activeTurns.delete(session.chatId)
           }
         }
 
