@@ -1,6 +1,7 @@
 import path from "node:path"
 import { stat } from "node:fs/promises"
-import { APP_NAME, getRuntimeProfile } from "../shared/branding"
+import { homedir } from "node:os"
+import { APP_NAME, getDataDir, getKeybindingsFilePath, getRuntimeProfile, LOG_PREFIX } from "../shared/branding"
 import type { ChatAttachment } from "../shared/types"
 import type { ShareMode } from "../shared/share"
 import { createAuthManager } from "./auth"
@@ -10,6 +11,7 @@ import { KannaAnalyticsReporter } from "./analytics"
 import { AppSettingsManager } from "./app-settings"
 import { DiffStore } from "./diff-store"
 import { discoverProjects, type DiscoveredProject } from "./discovery"
+import { CodexAppServerManager } from "./codex-app-server"
 import { KeybindingsManager } from "./keybindings"
 import { readLlmProviderSnapshot, validateLlmProviderCredentials, writeLlmProviderSnapshot } from "./llm-provider"
 import { getMachineDisplayName } from "./machine-name"
@@ -19,6 +21,8 @@ import type { UpdateInstallAttemptResult } from "./cli-runtime"
 import { createWsRouter, type ClientState } from "./ws-router"
 import { deleteProjectUpload, inferAttachmentContentType, inferProjectFileContentType, persistProjectUpload } from "./uploads"
 import { getProjectUploadDir } from "./paths"
+import { syncExternalSessions } from "./session-sync"
+import { StartupSyncProgress } from "./startup-sync"
 
 const MAX_UPLOAD_FILES = 50
 const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024
@@ -65,7 +69,9 @@ export interface StartKannaServerOptions {
   share?: ShareMode
   dataDir?: string
   password?: string | null
+  homeDir?: string
   strictPort?: boolean
+  syncSessions?: boolean
   /**
    * When true, the auth layer trusts X-Forwarded-Proto for CSRF origin
    * checks, redirect URLs, and the Secure cookie flag. The hostname still
@@ -74,6 +80,7 @@ export interface StartKannaServerOptions {
    */
   trustProxy?: boolean
   onMigrationProgress?: (message: string) => void
+  sessionSync?: typeof syncExternalSessions
   update?: {
     version: string
     fetchLatestVersion: (packageName: string) => Promise<string>
@@ -84,10 +91,11 @@ export interface StartKannaServerOptions {
 export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const port = options.port ?? 3210
   const hostname = options.host ?? "127.0.0.1"
+  const homeDir = options.homeDir ?? homedir()
   const strictPort = options.strictPort ?? false
   const runtimeProfile = getRuntimeProfile()
   const auth = options.password ? createAuthManager(options.password, { trustProxy: options.trustProxy ?? false }) : null
-  const store = new EventStore(options.dataDir)
+  const store = new EventStore(options.dataDir ?? getDataDir(homeDir))
   const diffStore = new DiffStore(store.dataDir)
   const machineDisplayName = getMachineDisplayName()
   await store.initialize()
@@ -96,16 +104,19 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   let discoveredProjects: DiscoveredProject[] = []
 
   async function refreshDiscovery() {
-    discoveredProjects = discoverProjects()
+    discoveredProjects = discoverProjects(homeDir)
     return discoveredProjects
   }
 
   await refreshDiscovery()
+  const codexManager = new CodexAppServerManager()
+  const startupSync = new StartupSyncProgress()
+  let startupSyncDone: Promise<void> = Promise.resolve()
 
   let server: ReturnType<typeof Bun.serve<ClientState>>
   let router: ReturnType<typeof createWsRouter>
   const terminals = new TerminalManager()
-  const keybindings = new KeybindingsManager()
+  const keybindings = new KeybindingsManager(getKeybindingsFilePath(homeDir))
   const appSettings = new AppSettingsManager(path.join(store.dataDir, "settings.json"))
   await appSettings.initialize()
   await keybindings.initialize()
@@ -137,6 +148,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
       }
       router.scheduleBroadcast()
     },
+    codexManager,
   })
   router = createWsRouter({
     store,
@@ -155,6 +167,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     getDiscoveredProjects: () => discoveredProjects,
     machineDisplayName,
     updateManager,
+    startupSync,
   })
   const staleEmptyChatPruneInterval = setInterval(() => {
     void router.pruneStaleEmptyChats()
@@ -282,8 +295,34 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     strictPort,
   })
 
+  if (options.syncSessions) {
+    startupSync.begin()
+    startupSyncDone = (options.sessionSync ?? syncExternalSessions)({
+      store,
+      discoveredProjects,
+      homeDir,
+      codexClient: codexManager,
+      onProgress: (message) => {
+        options.onMigrationProgress?.(message)
+        startupSync.append(message)
+      },
+    }).then(() => {
+      startupSync.complete()
+      void router.broadcastSnapshots()
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error)
+      const logMessage = `${LOG_PREFIX} session sync: failed: ${message}`
+      options.onMigrationProgress?.(logMessage)
+      startupSync.append(logMessage)
+      startupSync.fail(error)
+    })
+  } else {
+    options.onMigrationProgress?.(`${LOG_PREFIX} session sync: skipped (enable with --sync-sessions)`)
+  }
+
   const shutdown = async () => {
     clearInterval(staleEmptyChatPruneInterval)
+    await startupSyncDone
     for (const chatId of [...agent.activeTurns.keys()]) {
       await agent.cancel(chatId)
     }
@@ -300,6 +339,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     store,
     diffStore,
     updateManager,
+    startupSyncDone,
     stop: shutdown,
   }
 }

@@ -20,7 +20,16 @@ export interface ChatRecord {
   pendingForkSessionToken?: string | null
   hasMessages?: boolean
   lastMessageAt?: number
+  lastAssistantResponsePreview?: string
   lastTurnOutcome: "success" | "failed" | "cancelled" | null
+  hasLocalTitleOverride?: boolean
+  externalUpdatedAt?: number
+}
+
+export interface HiddenProviderSessionRecord {
+  provider: AgentProvider
+  sessionToken: string
+  hiddenAt: number
 }
 
 export interface StoreState {
@@ -28,6 +37,7 @@ export interface StoreState {
   projectIdsByPath: Map<string, string>
   chatsById: Map<string, ChatRecord>
   queuedMessagesByChatId: Map<string, QueuedChatMessage[]>
+  hiddenProviderSessionsByKey: Map<string, HiddenProviderSessionRecord>
 }
 
 export interface SnapshotFile {
@@ -38,6 +48,7 @@ export interface SnapshotFile {
   sidebarProjectOrder?: string[]
   queuedMessages?: Array<{ chatId: string; entries: QueuedChatMessage[] }>
   messages?: Array<{ chatId: string; entries: TranscriptEntry[] }>
+  hiddenProviderSessions?: HiddenProviderSessionRecord[]
 }
 
 export type ProjectEvent = {
@@ -75,6 +86,7 @@ export type ChatEvent =
       timestamp: number
       chatId: string
       title: string
+      markTitleOverride?: boolean
     }
   | {
       v: 2
@@ -114,6 +126,32 @@ export type ChatEvent =
       timestamp: number
       chatId: string
       unread: boolean
+    }
+  | {
+      v: 2
+      type: "chat_transcript_metadata_set"
+      timestamp: number
+      chatId: string
+      hasMessages: boolean
+      lastMessageAt: number | null
+      lastAssistantResponsePreview: string | null
+    }
+  | {
+      v: 2
+      type: "chat_synced"
+      timestamp: number
+      chatId: string
+      provider: AgentProvider
+      sessionToken: string
+      externalUpdatedAt: number
+      title?: string | null
+    }
+  | {
+      v: 2
+      type: "provider_session_hidden"
+      timestamp: number
+      provider: AgentProvider
+      sessionToken: string
     }
 
 export type MessageEvent = {
@@ -189,6 +227,7 @@ export function createEmptyState(): StoreState {
     projectIdsByPath: new Map(),
     chatsById: new Map(),
     queuedMessagesByChatId: new Map(),
+    hiddenProviderSessionsByKey: new Map(),
   }
 }
 

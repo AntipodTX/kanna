@@ -1,4 +1,8 @@
-import { QuickResponseAdapter } from "./quick-response"
+import {
+  QuickResponseAdapter,
+  type StructuredQuickResponseAttempt,
+  type StructuredQuickResponseFailure,
+} from "./quick-response"
 
 const TITLE_SCHEMA = {
   type: "object",
@@ -27,9 +31,11 @@ export interface GenerateChatTitleResult {
   title: string | null
   usedFallback: boolean
   failureMessage: string | null
+  provider?: StructuredQuickResponseAttempt["provider"] | null
+  attempts?: StructuredQuickResponseAttempt[]
 }
 
-function summarizeFailures(failures: Array<{ provider: "openai" | "claude" | "codex"; reason: string }>) {
+function summarizeFailures(failures: StructuredQuickResponseFailure[]) {
   if (failures.length === 0) return null
   return failures.map((failure) => failure.reason).join("; ")
 }
@@ -37,16 +43,18 @@ function summarizeFailures(failures: Array<{ provider: "openai" | "claude" | "co
 export async function generateTitleForChat(
   messageContent: string,
   cwd: string,
-  adapter = new QuickResponseAdapter()
+  adapter = new QuickResponseAdapter(),
+  options: { preferredProvider?: "claude" | "codex"; useConfiguredProvider?: boolean } = {}
 ): Promise<string | null> {
-  const result = await generateTitleForChatDetailed(messageContent, cwd, adapter)
+  const result = await generateTitleForChatDetailed(messageContent, cwd, adapter, options)
   return result.title
 }
 
 export async function generateTitleForChatDetailed(
   messageContent: string,
   cwd: string,
-  adapter = new QuickResponseAdapter()
+  adapter = new QuickResponseAdapter(),
+  options: { preferredProvider?: "claude" | "codex"; useConfiguredProvider?: boolean } = {}
 ): Promise<GenerateChatTitleResult> {
   const result = await adapter.generateStructuredWithDiagnostics<string>({
     cwd,
@@ -57,6 +65,9 @@ export async function generateTitleForChatDetailed(
       const output = value && typeof value === "object" ? value as { title?: unknown } : {}
       return normalizeGeneratedTitle(output.title)
     },
+    preferredProvider: options.preferredProvider,
+    useConfiguredProvider: options.useConfiguredProvider,
+    preferSmallestCodexModel: true,
   })
 
   if (result.value) {
@@ -64,6 +75,8 @@ export async function generateTitleForChatDetailed(
       title: result.value,
       usedFallback: false,
       failureMessage: null,
+      provider: result.provider,
+      attempts: result.attempts,
     }
   }
 
@@ -72,5 +85,7 @@ export async function generateTitleForChatDetailed(
     title: fallbackTitle,
     usedFallback: true,
     failureMessage: summarizeFailures(result.failures),
+    provider: result.provider,
+    attempts: result.attempts,
   }
 }

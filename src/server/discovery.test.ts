@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import { getDataRootDir } from "../shared/branding"
 import {
   ClaudeProjectDiscoveryAdapter,
   CodexProjectDiscoveryAdapter,
@@ -48,6 +49,22 @@ describe("project discovery", () => {
         modifiedAt: new Date("2026-03-16T10:00:00.000Z").getTime(),
       },
     ])
+  })
+
+  test("Claude adapter excludes Kanna data-root projects", () => {
+    const homeDir = makeTempDir()
+    const dataRootDir = getDataRootDir(homeDir)
+    const realProjectDir = path.join(homeDir, "workspace", "alpha-project")
+    const claudeProjectsDir = path.join(homeDir, ".claude", "projects")
+
+    mkdirSync(realProjectDir, { recursive: true })
+    mkdirSync(dataRootDir, { recursive: true })
+    mkdirSync(path.join(claudeProjectsDir, encodeClaudeProjectPath(realProjectDir)), { recursive: true })
+    mkdirSync(path.join(claudeProjectsDir, encodeClaudeProjectPath(dataRootDir)), { recursive: true })
+
+    const projects = new ClaudeProjectDiscoveryAdapter().scan(homeDir)
+
+    expect(projects.map((project) => project.localPath)).toEqual([realProjectDir])
   })
 
   test("Codex adapter reads cwd from session metadata and ignores stale or invalid entries", () => {
@@ -157,6 +174,60 @@ describe("project discovery", () => {
     expect(projects.find((project) => project.localPath === cliProjectDir)?.modifiedAt).toBe(
       Date.parse("2026-03-17T03:42:25.751Z")
     )
+  })
+
+  test("Codex adapter excludes Kanna data-root projects from sessions and config", () => {
+    const homeDir = makeTempDir()
+    const sessionsDir = path.join(homeDir, ".codex", "sessions", "2026", "03", "16")
+    const dataRootDir = getDataRootDir(homeDir)
+    const realProjectDir = path.join(homeDir, "workspace", "codex-real")
+    mkdirSync(dataRootDir, { recursive: true })
+    mkdirSync(realProjectDir, { recursive: true })
+    mkdirSync(sessionsDir, { recursive: true })
+
+    writeFileSync(path.join(homeDir, ".codex", "session_index.jsonl"), [
+      JSON.stringify({
+        id: "session-internal",
+        updated_at: "2026-03-16T23:05:58.940134Z",
+      }),
+      JSON.stringify({
+        id: "session-real",
+        updated_at: "2026-03-16T23:15:58.940134Z",
+      }),
+    ].join("\n"))
+
+    writeFileSync(path.join(homeDir, ".codex", "config.toml"), [
+      `[projects."${dataRootDir}"]`,
+      `trust_level = "trusted"`,
+      `[projects."${realProjectDir}"]`,
+      `trust_level = "trusted"`,
+    ].join("\n"))
+
+    writeFileSync(path.join(sessionsDir, "rollout-2026-03-16T23-05-52-session-internal.jsonl"), [
+      JSON.stringify({
+        timestamp: "2026-03-16T23:05:52.000Z",
+        type: "session_meta",
+        payload: {
+          id: "session-internal",
+          cwd: dataRootDir,
+        },
+      }),
+    ].join("\n"))
+
+    writeFileSync(path.join(sessionsDir, "rollout-2026-03-16T23-15-52-session-real.jsonl"), [
+      JSON.stringify({
+        timestamp: "2026-03-16T23:15:52.000Z",
+        type: "session_meta",
+        payload: {
+          id: "session-real",
+          cwd: realProjectDir,
+        },
+      }),
+    ].join("\n"))
+
+    const projects = new CodexProjectDiscoveryAdapter().scan(homeDir)
+
+    expect(projects.map((project) => project.localPath)).toEqual([realProjectDir])
   })
 
   test("discoverProjects de-dupes provider results by normalized path and keeps the newest timestamp", () => {

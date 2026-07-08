@@ -2,11 +2,12 @@ import { query } from "@anthropic-ai/claude-agent-sdk"
 import { homedir } from "node:os"
 import OpenAI from "openai"
 import { getDataRootDir } from "../shared/branding"
-import type { LlmProviderSnapshot } from "../shared/types"
+import type { CodexReasoningEffort, LlmProviderSnapshot } from "../shared/types"
 import { CodexAppServerManager } from "./codex-app-server"
+import type { CodexModel } from "./codex-app-server-protocol"
 import { readLlmProviderSnapshot } from "./llm-provider"
 
-const CLAUDE_STRUCTURED_TIMEOUT_MS = 5_000
+const CLAUDE_STRUCTURED_TIMEOUT_MS = 15_000
 
 type JsonSchema = {
   type: "object"
@@ -15,12 +16,34 @@ type JsonSchema = {
   additionalProperties?: boolean
 }
 
+export function buildClaudeStructuredOptions(args: Omit<StructuredQuickResponseArgs<unknown>, "parse">) {
+  return {
+    cwd: args.cwd,
+    model: "haiku" as const,
+    tools: [] as string[],
+    systemPrompt: "",
+    effort: "low" as const,
+    maxTurns: 1,
+    permissionMode: "plan" as const,
+    outputFormat: {
+      type: "json_schema" as const,
+      schema: args.schema,
+    },
+    env: { ...process.env },
+  }
+}
+
 export interface StructuredQuickResponseArgs<T> {
   cwd: string
   task: string
   prompt: string
   schema: JsonSchema
   parse: (value: unknown) => T | null
+  preferredProvider?: "claude" | "codex"
+  useConfiguredProvider?: boolean
+  codexModel?: string
+  codexEffort?: CodexReasoningEffort
+  preferSmallestCodexModel?: boolean
 }
 
 interface QuickResponseAdapterArgs {
@@ -39,9 +62,67 @@ export interface StructuredQuickResponseFailure {
   reason: string
 }
 
+export interface StructuredQuickResponseAttempt {
+  provider: "openai" | "claude" | "codex"
+  outcome: "success" | "no_result" | "invalid" | "error"
+  durationMs: number
+  reason?: string
+}
+
 export interface StructuredQuickResponseResult<T> {
   value: T | null
+  provider: "openai" | "claude" | "codex" | null
+  attempts: StructuredQuickResponseAttempt[]
   failures: StructuredQuickResponseFailure[]
+}
+
+function getProviderOrder(preferredProvider?: "claude" | "codex") {
+  if (preferredProvider === "codex") {
+    return ["codex", "claude"] as const
+  }
+  return ["claude", "codex"] as const
+}
+
+const CODEX_SMALL_MODEL_PATTERNS = [
+  { pattern: /(^|[^a-z0-9])(nano|micro|tiny)([^a-z0-9]|$)/i, score: 0 },
+  { pattern: /(^|[^a-z0-9])mini([^a-z0-9]|$)/i, score: 1 },
+  { pattern: /(^|[^a-z0-9])(small|lite|spark)([^a-z0-9]|$)/i, score: 2 },
+] as const
+
+const CODEX_EFFORT_ORDER: CodexReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"]
+
+function codexModelSearchText(model: CodexModel) {
+  return [
+    model.id,
+    model.model,
+    model.displayName,
+    model.description,
+  ].filter(Boolean).join(" ")
+}
+
+function getSmallCodexModelScore(model: CodexModel): number | null {
+  if (model.hidden) return null
+  if (model.inputModalities.length > 0 && !model.inputModalities.includes("text")) return null
+
+  const text = codexModelSearchText(model)
+  for (const candidate of CODEX_SMALL_MODEL_PATTERNS) {
+    if (candidate.pattern.test(text)) {
+      return candidate.score
+    }
+  }
+  return null
+}
+
+function selectSmallestCodexTextModel(models: CodexModel[]): CodexModel | null {
+  return models
+    .map((model, index) => ({ model, index, score: getSmallCodexModelScore(model) }))
+    .filter((candidate): candidate is { model: CodexModel; index: number; score: number } => candidate.score !== null)
+    .sort((left, right) => left.score - right.score || left.index - right.index)[0]?.model ?? null
+}
+
+function selectLowestCodexEffort(model: CodexModel): CodexReasoningEffort | undefined {
+  const supported = new Set(model.supportedReasoningEfforts.map((effort) => effort.reasoningEffort))
+  return CODEX_EFFORT_ORDER.find((effort) => supported.has(effort))
 }
 
 export function getQuickResponseWorkspace(env: Record<string, string | undefined> = process.env) {
@@ -69,11 +150,19 @@ function parseJsonText(value: string): unknown | null {
   return null
 }
 
-function structuredOutputFromSdkMessage(message: unknown): unknown | null {
+function formatClaudeResultPreview(value: unknown): string {
+  const raw = typeof value === "string" ? value : JSON.stringify(value)
+  if (!raw) return "<empty>"
+  const normalized = raw.replace(/\s+/g, " ").trim()
+  if (normalized.length <= 300) return normalized
+  return `${normalized.slice(0, 300)}...`
+}
+
+export function extractClaudeStructuredResult(message: unknown): unknown | null {
   if (!message || typeof message !== "object") return null
 
   const record = message as Record<string, unknown>
-  if (record.type === "result") {
+  if ("structured_output" in record) {
     return record.structured_output ?? null
   }
 
@@ -96,28 +185,23 @@ function structuredOutputFromSdkMessage(message: unknown): unknown | null {
 export async function runClaudeStructured(args: Omit<StructuredQuickResponseArgs<unknown>, "parse">): Promise<unknown | null> {
   const q = query({
     prompt: args.prompt,
-    options: {
-      cwd: args.cwd,
-      model: "claude-haiku-4-5-20251001",
-      tools: [],
-      systemPrompt: "",
-      effort: "low",
-      permissionMode: "bypassPermissions",
-      outputFormat: {
-        type: "json_schema",
-        schema: args.schema,
-      },
-      env: { ...process.env },
-    },
+    options: buildClaudeStructuredOptions(args),
   })
 
   try {
     const result = await Promise.race<unknown | null>([
       (async () => {
         for await (const message of q) {
-          const structuredOutput = structuredOutputFromSdkMessage(message)
-          if (structuredOutput !== null) {
-            return structuredOutput
+          const structuredResult = extractClaudeStructuredResult(message)
+          if (structuredResult !== null) {
+            return structuredResult
+          }
+
+          if (message && typeof message === "object" && "result" in message) {
+            const resultMessage = message as Record<string, unknown>
+            throw new Error(
+              `Claude returned result without structured_output for conversation title generation: ${formatClaudeResultPreview(resultMessage.result)}`
+            )
           }
         }
         return null
@@ -130,8 +214,6 @@ export async function runClaudeStructured(args: Omit<StructuredQuickResponseArgs
     ])
 
     return result
-  } catch (error) {
-    return null
   } finally {
     try {
       q.close()
@@ -172,8 +254,10 @@ export async function runCodexStructured(
 ): Promise<unknown | null> {
   const response = await codexManager.generateStructured({
     cwd: args.cwd,
-    model: "gpt-5.4-mini",
     prompt: `${args.prompt}\n\nReturn JSON only that matches this schema:\n${JSON.stringify(args.schema, null, 2)}`,
+    model: args.codexModel,
+    effort: args.codexEffort,
+    outputSchema: args.schema,
   })
   if (typeof response !== "string") return null
   return parseJsonText(response)
@@ -203,20 +287,26 @@ export class QuickResponseAdapter {
   }
 
   async generateStructuredWithDiagnostics<T>(args: StructuredQuickResponseArgs<T>): Promise<StructuredQuickResponseResult<T>> {
-    const request = {
+    const request: Omit<StructuredQuickResponseArgs<unknown>, "parse"> = {
       cwd: getQuickResponseWorkspace(),
       task: args.task,
       prompt: args.prompt,
       schema: args.schema,
+      codexModel: args.codexModel,
+      codexEffort: args.codexEffort,
     }
 
     const failures: StructuredQuickResponseFailure[] = []
-    const llmProvider = await this.readLlmProvider()
-    if (llmProvider.enabled) {
+    const attempts: StructuredQuickResponseAttempt[] = []
+    const llmProvider = args.useConfiguredProvider === false ? null : await this.readLlmProvider()
+    if (llmProvider?.enabled) {
       const openAIResult = await this.tryProvider("openai", args.task, args.parse, () => this.runOpenAIStructured(llmProvider, request))
+      attempts.push(openAIResult.attempt)
       if (openAIResult.value !== null) {
         return {
           value: openAIResult.value,
+          provider: "openai",
+          attempts,
           failures,
         }
       }
@@ -225,31 +315,57 @@ export class QuickResponseAdapter {
       }
     }
 
-    const claudeResult = await this.tryProvider("claude", args.task, args.parse, () => this.runClaudeStructured(request))
-    if (claudeResult.value !== null) {
-      return {
-        value: claudeResult.value,
-        failures,
+    for (const provider of getProviderOrder(args.preferredProvider)) {
+      const providerResult = await this.tryProvider(
+        provider,
+        args.task,
+        args.parse,
+        async () => provider === "claude"
+          ? this.runClaudeStructured(request)
+          : this.runCodexStructured(await this.resolveCodexRequest(args, request))
+      )
+      attempts.push(providerResult.attempt)
+      if (providerResult.value !== null) {
+        return {
+          value: providerResult.value,
+          provider,
+          attempts,
+          failures,
+        }
       }
-    }
-    if (claudeResult.failure) {
-      failures.push(claudeResult.failure)
-    }
-
-    const codexResult = await this.tryProvider("codex", args.task, args.parse, () => this.runCodexStructured(request))
-    if (codexResult.value !== null) {
-      return {
-        value: codexResult.value,
-        failures,
+      if (providerResult.failure) {
+        failures.push(providerResult.failure)
       }
-    }
-    if (codexResult.failure) {
-      failures.push(codexResult.failure)
     }
 
     return {
       value: null,
+      provider: null,
+      attempts,
       failures,
+    }
+  }
+
+  private async resolveCodexRequest<T>(
+    args: StructuredQuickResponseArgs<T>,
+    request: Omit<StructuredQuickResponseArgs<unknown>, "parse">
+  ): Promise<Omit<StructuredQuickResponseArgs<unknown>, "parse">> {
+    if (!args.preferSmallestCodexModel || request.codexModel) {
+      return request
+    }
+
+    try {
+      const model = selectSmallestCodexTextModel(await this.codexManager.listModels({ cwd: request.cwd }))
+      if (!model) {
+        return request
+      }
+      return {
+        ...request,
+        codexModel: model.model || model.id,
+        codexEffort: selectLowestCodexEffort(model),
+      }
+    } catch {
+      return request
     }
   }
 
@@ -258,26 +374,45 @@ export class QuickResponseAdapter {
     task: string,
     parse: (value: unknown) => T | null,
     run: () => Promise<unknown | null>
-  ): Promise<{ value: T | null; failure: StructuredQuickResponseFailure | null }> {
+  ): Promise<{
+    value: T | null
+    failure: StructuredQuickResponseFailure | null
+    attempt: StructuredQuickResponseAttempt
+  }> {
+    const startedAt = Date.now()
     try {
       const result = await run()
       if (result === null) {
+        const reason = `${provider} returned no result for ${task}`
         return {
           value: null,
           failure: {
             provider,
-            reason: `${provider} returned no result for ${task}`,
+            reason,
+          },
+          attempt: {
+            provider,
+            outcome: "no_result",
+            durationMs: Date.now() - startedAt,
+            reason,
           },
         }
       }
 
       const parsed = parse(result)
       if (parsed === null) {
+        const reason = `${provider} returned invalid structured output for ${task}`
         return {
           value: null,
           failure: {
             provider,
-            reason: `${provider} returned invalid structured output for ${task}`,
+            reason,
+          },
+          attempt: {
+            provider,
+            outcome: "invalid",
+            durationMs: Date.now() - startedAt,
+            reason,
           },
         }
       }
@@ -285,14 +420,26 @@ export class QuickResponseAdapter {
       return {
         value: parsed,
         failure: null,
+        attempt: {
+          provider,
+          outcome: "success",
+          durationMs: Date.now() - startedAt,
+        },
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      const reason = `${provider} failed ${task}: ${message}`
       return {
         value: null,
         failure: {
           provider,
-          reason: `${provider} failed ${task}: ${message}`,
+          reason,
+        },
+        attempt: {
+          provider,
+          outcome: "error",
+          durationMs: Date.now() - startedAt,
+          reason,
         },
       }
     }

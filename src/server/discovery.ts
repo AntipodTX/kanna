@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
+import { getDataRootDir } from "../shared/branding"
 import type { AgentProvider } from "../shared/types"
 import { resolveLocalPath } from "./paths"
 
@@ -19,7 +20,7 @@ export interface ProjectDiscoveryAdapter {
   scan(homeDir?: string): ProviderDiscoveredProject[]
 }
 
-function resolveEncodedClaudePath(folderName: string) {
+export function resolveEncodedClaudePath(folderName: string) {
   const segments = folderName.replace(/^-/, "").split("-").filter(Boolean)
   let currentPath = ""
   let remainingSegments = [...segments]
@@ -59,6 +60,10 @@ function normalizeExistingDirectory(localPath: string) {
   } catch {
     return null
   }
+}
+
+function isInternalKannaProjectPath(localPath: string, homeDir: string) {
+  return resolveLocalPath(localPath) === resolveLocalPath(getDataRootDir(homeDir))
 }
 
 function mergeDiscoveredProjects(projects: Iterable<DiscoveredProject>): DiscoveredProject[] {
@@ -101,6 +106,9 @@ export class ClaudeProjectDiscoveryAdapter implements ProjectDiscoveryAdapter {
       const resolvedPath = resolveEncodedClaudePath(entry.name)
       const normalizedPath = normalizeExistingDirectory(resolvedPath)
       if (!normalizedPath) {
+        continue
+      }
+      if (isInternalKannaProjectPath(normalizedPath, homeDir)) {
         continue
       }
 
@@ -248,6 +256,9 @@ export class CodexProjectDiscoveryAdapter implements ProjectDiscoveryAdapter {
       if (!normalizedPath) {
         continue
       }
+      if (isInternalKannaProjectPath(normalizedPath, homeDir)) {
+        continue
+      }
 
       projects.push({
         provider: this.provider,
@@ -264,6 +275,9 @@ export class CodexProjectDiscoveryAdapter implements ProjectDiscoveryAdapter {
 
       const normalizedPath = normalizeExistingDirectory(configuredPath)
       if (!normalizedPath) {
+        continue
+      }
+      if (isInternalKannaProjectPath(normalizedPath, homeDir)) {
         continue
       }
 
@@ -295,7 +309,7 @@ export function discoverProjects(
 ): DiscoveredProject[] {
   const mergedProjects = mergeDiscoveredProjects(
     adapters.flatMap((adapter) => adapter.scan(homeDir).map(({ provider: _provider, ...project }) => project))
-  )
+  ).filter((project) => !isInternalKannaProjectPath(project.localPath, homeDir))
 
   return mergedProjects
 }

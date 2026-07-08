@@ -16,6 +16,7 @@ import { KannaSidebar } from "./KannaSidebar"
 import { ChatPage } from "./ChatPage"
 import { LocalProjectsPage } from "./LocalProjectsPage"
 import { SettingsPage } from "./SettingsPage"
+import { StartupSyncProgressDialog } from "./StartupSyncProgressDialog"
 import { useKannaState } from "./useKannaState"
 import type { AppSettingsSnapshot } from "../../shared/types"
 
@@ -205,6 +206,7 @@ function KannaLayout() {
   const showMobileOpenButton = location.pathname === "/"
   const currentVersion = SDK_CLIENT_APP.split("/")[1] ?? "unknown"
   const previousSidebarDataRef = useRef<ReturnType<typeof useKannaState>["sidebarData"] | null>(null)
+  const [dismissedStartupSyncStartedAt, setDismissedStartupSyncStartedAt] = useState<number | null>(null)
   const handleSidebarCreateChat = useCallback((projectId: string) => {
     void state.handleCreateChat(projectId)
   }, [state.handleCreateChat])
@@ -359,6 +361,14 @@ function KannaLayout() {
     <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden">
       {sidebarElement}
       <Outlet context={state} />
+      <StartupSyncProgressDialog
+        snapshot={
+          state.startupSync?.enabled && state.startupSync.startedAt !== dismissedStartupSyncStartedAt
+            ? state.startupSync
+            : null
+        }
+        onDismiss={() => setDismissedStartupSyncStartedAt(state.startupSync?.startedAt ?? null)}
+      />
       <StandaloneShareDialog
         open={Boolean(state.standaloneShareUrl)}
         shareUrl={state.standaloneShareUrl ?? ""}

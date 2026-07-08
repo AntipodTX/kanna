@@ -55,6 +55,106 @@ async function collectStream(stream: AsyncIterable<any>) {
 }
 
 describe("CodexAppServerManager", () => {
+  test("lists threads using the snake_case updated_at sort key", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/list") {
+        child.writeServerMessage({
+          id: message.id,
+          result: {
+            data: [],
+            nextCursor: null,
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    const threads = await manager.listThreads({
+      cwd: "/tmp/project",
+    })
+
+    expect(threads).toEqual([])
+    const threadList = process.messages.find((message: any) => message.method === "thread/list") as
+      | { method: "thread/list"; params: { sortKey?: string } }
+      | undefined
+    expect(threadList?.params.sortKey).toBe("updated_at")
+  })
+
+  test("lists available models through the app-server", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "model/list") {
+        child.writeServerMessage({
+          id: message.id,
+          result: {
+            data: [
+              {
+                id: "gpt-5.4-mini",
+                model: "gpt-5.4-mini",
+                displayName: "GPT-5.4-Mini",
+                description: "Small, fast, and cost-efficient model for simpler coding tasks.",
+                hidden: false,
+                supportedReasoningEfforts: [
+                  { reasoningEffort: "low", description: "Fast responses with lighter reasoning" },
+                  { reasoningEffort: "medium", description: "Balances speed and reasoning depth" },
+                ],
+                defaultReasoningEffort: "medium",
+                inputModalities: ["text"],
+                serviceTiers: [],
+                defaultServiceTier: null,
+                isDefault: false,
+              },
+            ],
+            nextCursor: null,
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    const models = await manager.listModels({ cwd: "/tmp/project" })
+
+    expect(models.map((model) => model.id)).toEqual(["gpt-5.4-mini"])
+    const modelList = process.messages.find((message: any) => message.method === "model/list") as
+      | { method: "model/list"; params: { cursor?: string | null; includeHidden?: boolean; limit?: number } }
+      | undefined
+    expect(modelList?.params).toEqual({
+      cursor: null,
+      includeHidden: false,
+      limit: 200,
+    })
+  })
+
+  test("stops utility sessions when initialization fails", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({
+          id: message.id,
+          error: { message: "initialize failed" },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    await expect(manager.listThreads({
+      cwd: "/tmp/project",
+    })).rejects.toThrow("initialize failed")
+
+    expect(process.killed).toBe(true)
+  })
+
   test("initializes app-server and starts a fresh thread", async () => {
     const process = new FakeCodexProcess((message, child) => {
       if (message.method === "initialize") {
@@ -82,6 +182,7 @@ describe("CodexAppServerManager", () => {
     expect((process.messages[0] as any).method).toBe("initialize")
     expect((process.messages[1] as any).method).toBe("initialized")
     expect((process.messages[2] as any).method).toBe("thread/start")
+    expect((process.messages[2] as any).params.persistExtendedHistory).toBe(true)
   })
 
   test("falls back to thread/start when thread/resume is recoverably missing", async () => {
@@ -118,6 +219,8 @@ describe("CodexAppServerManager", () => {
       "thread/resume",
       "thread/start",
     ])
+    expect((process.messages[2] as any).params.persistExtendedHistory).toBe(true)
+    expect((process.messages[3] as any).params.persistExtendedHistory).toBe(true)
   })
 
   test("forks a thread when a pending fork session token is provided", async () => {
@@ -345,12 +448,218 @@ describe("CodexAppServerManager", () => {
     const result = await manager.generateStructured({
       cwd: "/tmp/project",
       prompt: "Return JSON",
+      model: "gpt-5.3-codex",
+      effort: "low",
+      outputSchema: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+        },
+        required: ["title"],
+        additionalProperties: false,
+      },
     })
 
     expect(result).toBe("{\"title\":\"Codex title\"}")
     expect(process.killed).toBe(true)
-    expect((process.messages.find((message: any) => message.method === "thread/start") as any)?.params.model).toBe("gpt-5.5")
-    expect((process.messages.find((message: any) => message.method === "turn/start") as any)?.params.model).toBe("gpt-5.5")
+    const threadStart = process.messages.find((message: any) => message.method === "thread/start") as
+      | { method: "thread/start"; params: { model?: string } }
+      | undefined
+    const turnStart = process.messages.find((message: any) => message.method === "turn/start") as
+      | { method: "turn/start"; params: { model?: string; effort?: string; outputSchema?: unknown } }
+      | undefined
+    expect(threadStart?.params.model).toBe("gpt-5.3-codex")
+    expect(turnStart?.params.model).toBe("gpt-5.3-codex")
+    expect(turnStart?.params.effort).toBe("low")
+    expect(turnStart?.params.outputSchema).toEqual({
+      type: "object",
+      properties: {
+        title: { type: "string" },
+      },
+      required: ["title"],
+      additionalProperties: false,
+    })
+  })
+
+  test("generateStructured reads structured JSON from raw response items", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-structured" }, model: "gpt-5.5", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-structured", status: "completed", error: null } },
+        })
+        child.writeServerMessage({
+          method: "rawResponseItem/completed",
+          params: {
+            threadId: "thread-structured",
+            turnId: "turn-structured",
+            item: {
+              type: "message",
+              role: "assistant",
+              content: [
+                {
+                  type: "output_text",
+                  text: "{\"title\":\"Raw Codex title\"}",
+                },
+              ],
+              phase: "final_answer",
+            },
+          },
+        })
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-structured",
+            turn: { id: "turn-structured", status: "completed", error: null },
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    const result = await manager.generateStructured({
+      cwd: "/tmp/project",
+      prompt: "Return JSON",
+      model: "gpt-5.3-codex",
+      effort: "low",
+      outputSchema: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+        },
+        required: ["title"],
+        additionalProperties: false,
+      },
+    })
+
+    expect(result).toBe("{\"title\":\"Raw Codex title\"}")
+    expect(process.killed).toBe(true)
+  })
+
+  test("generateStructured reads structured JSON from agent message deltas", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-structured" }, model: "gpt-5.5", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-structured", status: "completed", error: null } },
+        })
+        child.writeServerMessage({
+          method: "item/agentMessage/delta",
+          params: {
+            threadId: "thread-structured",
+            turnId: "turn-structured",
+            itemId: "msg-structured",
+            delta: "{\"title\":",
+          },
+        })
+        child.writeServerMessage({
+          method: "item/agentMessage/delta",
+          params: {
+            threadId: "thread-structured",
+            turnId: "turn-structured",
+            itemId: "msg-structured",
+            delta: "\"Delta Codex title\"}",
+          },
+        })
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-structured",
+            turn: { id: "turn-structured", status: "completed", error: null },
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    const result = await manager.generateStructured({
+      cwd: "/tmp/project",
+      prompt: "Return JSON",
+      model: "gpt-5.3-codex",
+      effort: "low",
+      outputSchema: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+        },
+        required: ["title"],
+        additionalProperties: false,
+      },
+    })
+
+    expect(result).toBe("{\"title\":\"Delta Codex title\"}")
+    expect(process.killed).toBe(true)
+  })
+
+  test("generateStructured throws Codex error notification details", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-structured" }, model: "gpt-5.5", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-structured", status: "inProgress", error: null } },
+        })
+        child.writeServerMessage({
+          method: "error",
+          params: {
+            error: {
+              message: "Reconnecting... 2/5",
+              additionalDetails: "unexpected status 503 Service Unavailable: No accounts with a plan supporting model",
+            },
+            willRetry: true,
+            threadId: "thread-structured",
+            turnId: "turn-structured",
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    await expect(manager.generateStructured({
+      cwd: "/tmp/project",
+      prompt: "Return JSON",
+      model: "gpt-5.3-codex",
+      effort: "low",
+      outputSchema: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+        },
+        required: ["title"],
+        additionalProperties: false,
+      },
+    })).rejects.toThrow("No accounts with a plan supporting model")
+
+    expect(process.killed).toBe(true)
   })
 
   test("maps command execution and agent output into the shared transcript stream", async () => {
