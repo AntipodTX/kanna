@@ -11,6 +11,7 @@ import {
   type CodexModelOptions,
   type CodexReasoningEffort,
   type ProviderCatalogEntry,
+  isCodexReasoningEffortSupported,
   supportsClaudeMaxReasoningEffort,
 } from "../../../shared/types"
 import { cn } from "../../lib/utils"
@@ -49,6 +50,13 @@ function OpenAIIcon({ className, ...props }: SVGProps<SVGSVGElement>) {
 export const PROVIDER_ICONS: Record<AgentProvider, IconComponent> = {
   claude: AnthropicIcon,
   codex: OpenAIIcon,
+}
+
+const CODEX_CLI_REQUIREMENT_HINTS: Record<string, string> = {
+  "gpt-5.6-sol": "codex-cli >= 0.144",
+  "gpt-5.6-terra": "codex-cli >= 0.144",
+  "gpt-5.6-luna": "codex-cli >= 0.144",
+  "gpt-5.5": "codex-cli >= 0.124",
 }
 
 export function PopoverMenuItem({
@@ -177,9 +185,13 @@ export function ChatPreferenceControls({
   const showPlanMode = includePlanMode && providerConfig?.supportsPlanMode && onPlanModeChange
   const claudeModelOptions = selectedProvider === "claude" ? modelOptions as ClaudeModelOptions : null
   const codexModelOptions = selectedProvider === "codex" ? modelOptions as CodexModelOptions : null
-  const contextWindowOptions = providerConfig.models.find((candidate) => candidate.id === model)?.contextWindowOptions ?? []
+  const selectedModelOption = providerConfig.models.find((candidate) => candidate.id === model)
+  const contextWindowOptions = selectedModelOption?.contextWindowOptions ?? []
   const selectedContextWindow = claudeModelOptions?.contextWindow ?? CLAUDE_CONTEXT_WINDOW_OPTIONS[0].id
   const ContextWindowIcon = selectedContextWindow === "1m" ? SquareMenu : SquareMinus
+  const codexReasoningOptions = CODEX_REASONING_OPTIONS.filter((effort) =>
+    isCodexReasoningEffortSupported(selectedModelOption, effort.id)
+  )
 
   return (
     <div className={cn("flex md:justify-center items-center gap-0.5", className)}>
@@ -221,6 +233,9 @@ export function ChatPreferenceControls({
       >
         {(close) => providerConfig.models.map((candidate) => {
           const Icon = Box
+          const codexCliRequirementHint = showCodexCliRequirementHints && selectedProvider === "codex"
+            ? CODEX_CLI_REQUIREMENT_HINTS[candidate.id]
+            : undefined
           return (
             <PopoverMenuItem
               key={candidate.id}
@@ -231,12 +246,12 @@ export function ChatPreferenceControls({
               selected={model === candidate.id}
               icon={<Icon className="h-4 w-4 text-muted-foreground" />}
               label={
-                showCodexCliRequirementHints && selectedProvider === "codex" && candidate.id === "gpt-5.5"
+                codexCliRequirementHint
                   ? (
                     <>
                       {candidate.label}{" "}
                       <span className="text-xs font-normal text-muted-foreground">
-                        codex-cli &gt;= 0.124
+                        {codexCliRequirementHint}
                       </span>
                     </>
                   )
@@ -274,7 +289,7 @@ export function ChatPreferenceControls({
                 disabled={effort.id === "max" && !supportsClaudeMaxReasoningEffort(model)}
               />
             ))
-            : CODEX_REASONING_OPTIONS.map((effort) => (
+            : codexReasoningOptions.map((effort) => (
               <PopoverMenuItem
                 key={effort.id}
                 onClick={() => {

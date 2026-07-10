@@ -784,9 +784,10 @@ export class AgentCoordinator {
       }
     }
 
-    const modelOptions = normalizeCodexModelOptions(options.modelOptions, options.effort)
+    const model = normalizeServerModel(provider, options.model)
+    const modelOptions = normalizeCodexModelOptions(model, options.modelOptions, options.effort)
     return {
-      model: normalizeServerModel(provider, options.model),
+      model,
       effort: modelOptions.reasoningEffort,
       serviceTier: codexServiceTierFromModelOptions(modelOptions),
       planMode: catalog.supportsPlanMode ? Boolean(options.planMode) : false,

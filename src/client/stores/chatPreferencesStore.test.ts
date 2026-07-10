@@ -42,7 +42,7 @@ describe("migrateChatPreferencesState", () => {
         },
         codex: {
           model: "gpt-5.3-codex",
-          modelOptions: { reasoningEffort: "minimal", fastMode: true },
+          modelOptions: { reasoningEffort: "minimal" as never, fastMode: true },
           planMode: false,
         },
       },
@@ -63,8 +63,8 @@ describe("migrateChatPreferencesState", () => {
           planMode: true,
         },
         codex: {
-          model: "gpt-5.5",
-          modelOptions: { reasoningEffort: "minimal", fastMode: true },
+          model: "gpt-5.3-codex",
+          modelOptions: { reasoningEffort: "medium", fastMode: true },
           planMode: false,
         },
       },
@@ -107,7 +107,7 @@ describe("migrateChatPreferencesState", () => {
     })
   })
 
-  test("rewrites persisted Codex defaults to gpt-5.5 during migration", () => {
+  test("preserves persisted Codex defaults during migration", () => {
     const migrated = migrateChatPreferencesState({
       defaultProvider: "last_used",
       providerDefaults: {
@@ -120,13 +120,13 @@ describe("migrateChatPreferencesState", () => {
     })
 
     expect(migrated.providerDefaults.codex).toEqual({
-      model: "gpt-5.5",
+      model: "gpt-5.3-codex",
       modelOptions: { reasoningEffort: "low", fastMode: true },
       planMode: false,
     })
   })
 
-  test("rewrites persisted Codex composer state to gpt-5.5 during migration", () => {
+  test("preserves persisted Codex composer state during migration", () => {
     const migrated = migrateChatPreferencesState({
       defaultProvider: "codex",
       providerDefaults: {
@@ -153,19 +153,19 @@ describe("migrateChatPreferencesState", () => {
     })
 
     expect(migrated.providerDefaults.codex).toEqual({
-      model: "gpt-5.5",
+      model: "gpt-5.3-codex-spark",
       modelOptions: { reasoningEffort: "low", fastMode: true },
       planMode: true,
     })
     expect(migrated.chatStates.chatA).toEqual({
       provider: "codex",
-      model: "gpt-5.5",
+      model: "gpt-5.4",
       modelOptions: { reasoningEffort: "medium", fastMode: false },
       planMode: false,
     })
     expect(migrated.legacyComposerState).toEqual({
       provider: "codex",
-      model: "gpt-5.5",
+      model: "gpt-5.3-codex",
       modelOptions: { reasoningEffort: "xhigh", fastMode: true },
       planMode: true,
     })
@@ -173,10 +173,10 @@ describe("migrateChatPreferencesState", () => {
 })
 
 describe("chat preference store", () => {
-  test("starts with gpt-5.5 as the default Codex model", () => {
+  test("starts with gpt-5.6-sol as the default Codex model", () => {
     expect(INITIAL_STATE.providerDefaults.codex).toEqual({
-      model: "gpt-5.5",
-      modelOptions: { reasoningEffort: "high", fastMode: false },
+      model: "gpt-5.6-sol",
+      modelOptions: { reasoningEffort: "low", fastMode: false },
       planMode: false,
     })
   })
@@ -185,7 +185,7 @@ describe("chat preference store", () => {
     useChatPreferencesStore.getState().setComposerState("chat-a", {
       provider: "codex",
       model: "gpt-5.3-codex",
-      modelOptions: { reasoningEffort: "minimal", fastMode: true },
+      modelOptions: { reasoningEffort: "medium", fastMode: true },
       planMode: true,
     })
 
@@ -199,7 +199,7 @@ describe("chat preference store", () => {
     expect(useChatPreferencesStore.getState().getComposerState("chat-a")).toEqual({
       provider: "codex",
       model: "gpt-5.3-codex",
-      modelOptions: { reasoningEffort: "minimal", fastMode: true },
+      modelOptions: { reasoningEffort: "medium", fastMode: true },
       planMode: true,
     })
   })
@@ -216,7 +216,7 @@ describe("chat preference store", () => {
     store.setComposerState("chat-b", {
       provider: "codex",
       model: "gpt-5.3-codex",
-      modelOptions: { reasoningEffort: "minimal", fastMode: true },
+      modelOptions: { reasoningEffort: "medium", fastMode: true },
       planMode: true,
     })
     store.setChatComposerPlanMode("chat-a", true)
@@ -230,7 +230,7 @@ describe("chat preference store", () => {
     expect(store.getComposerState("chat-b")).toEqual({
       provider: "codex",
       model: "gpt-5.3-codex",
-      modelOptions: { reasoningEffort: "minimal", fastMode: true },
+      modelOptions: { reasoningEffort: "medium", fastMode: true },
       planMode: true,
     })
   })
@@ -254,6 +254,25 @@ describe("chat preference store", () => {
     })
   })
 
+  test("switching Codex chat model clears unsupported reasoning efforts", () => {
+    const store = useChatPreferencesStore.getState()
+
+    store.setComposerState("chat-a", {
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      modelOptions: { reasoningEffort: "ultra", fastMode: true },
+      planMode: false,
+    })
+    store.setChatComposerModel("chat-a", "gpt-5.5")
+
+    expect(store.getComposerState("chat-a")).toEqual({
+      provider: "codex",
+      model: "gpt-5.5",
+      modelOptions: { reasoningEffort: "medium", fastMode: true },
+      planMode: false,
+    })
+  })
+
   test("resetChatComposerFromProvider copies provider defaults into the target chat", () => {
     useChatPreferencesStore.setState({
       ...INITIAL_STATE,
@@ -261,7 +280,7 @@ describe("chat preference store", () => {
         ...INITIAL_STATE.providerDefaults,
         codex: {
           model: "gpt-5.3-codex",
-          modelOptions: { reasoningEffort: "minimal", fastMode: true },
+          modelOptions: { reasoningEffort: "medium", fastMode: true },
           planMode: true,
         },
       },
@@ -272,7 +291,7 @@ describe("chat preference store", () => {
     expect(useChatPreferencesStore.getState().getComposerState("chat-a")).toEqual({
       provider: "codex",
       model: "gpt-5.3-codex",
-      modelOptions: { reasoningEffort: "minimal", fastMode: true },
+      modelOptions: { reasoningEffort: "medium", fastMode: true },
       planMode: true,
     })
   })
@@ -285,7 +304,7 @@ describe("chat preference store", () => {
         ...INITIAL_STATE.providerDefaults,
         codex: {
           model: "gpt-5.3-codex-spark",
-          modelOptions: { reasoningEffort: "minimal", fastMode: true },
+          modelOptions: { reasoningEffort: "medium", fastMode: true },
           planMode: true,
         },
       },
@@ -296,7 +315,7 @@ describe("chat preference store", () => {
     expect(useChatPreferencesStore.getState().getComposerState("chat-a")).toEqual({
       provider: "codex",
       model: "gpt-5.3-codex-spark",
-      modelOptions: { reasoningEffort: "minimal", fastMode: true },
+      modelOptions: { reasoningEffort: "medium", fastMode: true },
       planMode: true,
     })
   })

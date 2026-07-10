@@ -9,21 +9,19 @@ import type {
   ServiceTier,
 } from "../shared/types"
 import {
+  CODEX_CLI_MODEL_OPTIONS,
   DEFAULT_CLAUDE_MODEL_OPTIONS,
+  DEFAULT_CODEX_CLI_MODEL,
   DEFAULT_CODEX_MODEL_OPTIONS,
   PROVIDERS,
   normalizeClaudeContextWindow,
+  normalizeCodexReasoningEffort,
   normalizeProviderModelId,
   isClaudeReasoningEffort,
   isCodexReasoningEffort,
 } from "../shared/types"
 
-const HARD_CODED_CODEX_MODELS: ProviderModelOption[] = [
-  { id: "gpt-5.5", label: "GPT-5.5", supportsEffort: false },
-  { id: "gpt-5.4", label: "GPT-5.4", supportsEffort: false },
-  { id: "gpt-5.3-codex", label: "GPT-5.3 Codex", supportsEffort: false },
-  { id: "gpt-5.3-codex-spark", label: "GPT-5.3 Codex Spark", supportsEffort: false },
-]
+const HARD_CODED_CODEX_MODELS: ProviderModelOption[] = CODEX_CLI_MODEL_OPTIONS.map((model) => ({ ...model }))
 
 export interface ClaudeSdkModelInfo {
   value: string
@@ -39,7 +37,7 @@ function createServerProviders(): ProviderCatalogEntry[] {
     provider.id === "codex"
       ? {
           ...provider,
-          defaultModel: "gpt-5.5",
+          defaultModel: DEFAULT_CODEX_CLI_MODEL,
           models: HARD_CODED_CODEX_MODELS,
         }
       : provider
@@ -137,14 +135,19 @@ export function normalizeClaudeModelOptions(
   }
 }
 
-export function normalizeCodexModelOptions(modelOptions?: ModelOptions, legacyEffort?: string): CodexModelOptions {
+export function normalizeCodexModelOptions(
+  model: string,
+  modelOptions?: ModelOptions,
+  legacyEffort?: string
+): CodexModelOptions {
   const reasoningEffort = modelOptions?.codex?.reasoningEffort
+  const normalizedEffort = isCodexReasoningEffort(reasoningEffort)
+    ? reasoningEffort
+    : isCodexReasoningEffort(legacyEffort)
+      ? legacyEffort
+      : undefined
   return {
-    reasoningEffort: isCodexReasoningEffort(reasoningEffort)
-      ? reasoningEffort
-      : isCodexReasoningEffort(legacyEffort)
-        ? legacyEffort
-        : DEFAULT_CODEX_MODEL_OPTIONS.reasoningEffort,
+    reasoningEffort: normalizeCodexReasoningEffort(model, normalizedEffort),
     fastMode: typeof modelOptions?.codex?.fastMode === "boolean"
       ? modelOptions.codex.fastMode
       : DEFAULT_CODEX_MODEL_OPTIONS.fastMode,

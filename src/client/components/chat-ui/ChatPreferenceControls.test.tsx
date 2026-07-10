@@ -25,6 +25,24 @@ describe("ChatPreferenceControls", () => {
     expect(html).not.toContain("Plan Mode")
   })
 
+  test("renders Codex reasoning labels for CLI effort levels", () => {
+    const html = renderToStaticMarkup(
+      <ChatPreferenceControls
+        availableProviders={PROVIDERS}
+        selectedProvider="codex"
+        model="gpt-5.6-sol"
+        modelOptions={{ reasoningEffort: "ultra", fastMode: true }}
+        onProviderChange={() => {}}
+        onModelChange={() => {}}
+        onModelOptionChange={() => {}}
+        includePlanMode={false}
+      />
+    )
+
+    expect(html).toContain("Ultra")
+    expect(html).not.toContain("Minimal")
+  })
+
   test("renders claude plan mode controls when enabled", () => {
     const html = renderToStaticMarkup(
       <ChatPreferenceControls

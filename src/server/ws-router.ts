@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import type { ServerWebSocket } from "bun"
-import { PROTOCOL_VERSION } from "../shared/types"
+import { DEFAULT_CODEX_CLI_MODEL, DEFAULT_CODEX_MODEL_OPTIONS, PROTOCOL_VERSION } from "../shared/types"
 import type { ClientEnvelope, ServerEnvelope, SubscriptionTopic } from "../shared/protocol"
 import { isClientEnvelope } from "../shared/protocol"
 import type { AgentCoordinator } from "./agent"
@@ -473,11 +473,8 @@ export function createWsRouter({
         planMode: false,
       },
       codex: {
-        model: "gpt-5.5",
-        modelOptions: {
-          reasoningEffort: "high",
-          fastMode: false,
-        },
+        model: DEFAULT_CODEX_CLI_MODEL,
+        modelOptions: { ...DEFAULT_CODEX_MODEL_OPTIONS },
         planMode: false,
       },
     },

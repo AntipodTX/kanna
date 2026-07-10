@@ -44,9 +44,9 @@ function expectedSettingsSnapshot(filePath: string, overrides: Partial<AppSettin
         planMode: false,
       },
       codex: {
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         modelOptions: {
-          reasoningEffort: "high",
+          reasoningEffort: "low",
           fastMode: false,
         },
         planMode: false,
