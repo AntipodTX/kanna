@@ -6,12 +6,14 @@ import path from "node:path"
 import { getSettingsFilePath, LOG_PREFIX } from "../shared/branding"
 import {
   DEFAULT_CLAUDE_MODEL_OPTIONS,
+  DEFAULT_CODEX_CLI_MODEL,
   DEFAULT_CODEX_MODEL_OPTIONS,
   isClaudeReasoningEffort,
   isCodexReasoningEffort,
   normalizeClaudeContextWindow,
   normalizeClaudeModelId,
   normalizeCodexModelId,
+  normalizeCodexReasoningEffort,
   supportsClaudeMaxReasoningEffort,
   type AppSettingsPatch,
   type AppSettingsSnapshot,
@@ -104,7 +106,7 @@ function createDefaultProviderDefaults(): ChatProviderPreferences {
       planMode: false,
     },
     codex: {
-      model: "gpt-5.5",
+      model: DEFAULT_CODEX_CLI_MODEL,
       modelOptions: { ...DEFAULT_CODEX_MODEL_OPTIONS },
       planMode: false,
     },
@@ -188,14 +190,16 @@ function normalizeCodexPreference(value?: {
   planMode?: unknown
 }): ProviderPreference<CodexModelOptions> {
   const reasoningEffort = value?.modelOptions?.reasoningEffort
+  const model = normalizeCodexModelId(typeof value?.model === "string" ? value.model : undefined)
+  const normalizedEffort = isCodexReasoningEffort(reasoningEffort)
+    ? reasoningEffort
+    : isCodexReasoningEffort(value?.effort)
+      ? value.effort
+      : undefined
   return {
-    model: normalizeCodexModelId(typeof value?.model === "string" ? value.model : undefined),
+    model,
     modelOptions: {
-      reasoningEffort: isCodexReasoningEffort(reasoningEffort)
-        ? reasoningEffort
-        : isCodexReasoningEffort(value?.effort)
-          ? value.effort
-          : DEFAULT_CODEX_MODEL_OPTIONS.reasoningEffort,
+      reasoningEffort: normalizeCodexReasoningEffort(model, normalizedEffort),
       fastMode: typeof value?.modelOptions?.fastMode === "boolean"
         ? value.modelOptions.fastMode
         : DEFAULT_CODEX_MODEL_OPTIONS.fastMode,

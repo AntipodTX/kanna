@@ -2,13 +2,14 @@ import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { createInterface } from "node:readline"
 import type { Readable, Writable } from "node:stream"
-import type {
-  AskUserQuestionItem,
-  CodexReasoningEffort,
-  ContextWindowUsageSnapshot,
-  ServiceTier,
-  TodoItem,
-  TranscriptEntry,
+import {
+  DEFAULT_CODEX_CLI_MODEL,
+  type AskUserQuestionItem,
+  type CodexReasoningEffort,
+  type ContextWindowUsageSnapshot,
+  type ServiceTier,
+  type TodoItem,
+  type TranscriptEntry,
 } from "../shared/types"
 import type { HarnessEvent, HarnessToolRequest, HarnessTurn } from "./harness-types"
 import {
@@ -928,14 +929,14 @@ export class CodexAppServerManager {
       await this.startSession({
         chatId,
         cwd: args.cwd,
-        model: args.model ?? "gpt-5.5",
+        model: args.model ?? DEFAULT_CODEX_CLI_MODEL,
         serviceTier: args.serviceTier ?? "fast",
         sessionToken: null,
       })
 
       turn = await this.startTurn({
         chatId,
-        model: args.model ?? "gpt-5.5",
+        model: args.model ?? DEFAULT_CODEX_CLI_MODEL,
         effort: args.effort,
         serviceTier: args.serviceTier ?? "fast",
         content: args.prompt,

@@ -8,6 +8,7 @@ export type ChatSoundPreference = "never" | "unfocused" | "always"
 export type ChatSoundId = "blow" | "bottle" | "frog" | "funk" | "glass" | "ping" | "pop" | "purr" | "tink"
 export type DefaultProviderPreference = "last_used" | AgentProvider
 export type EditorPreset = "cursor" | "vscode" | "xcode" | "windsurf" | "custom"
+export const DEFAULT_CODEX_CLI_MODEL = "gpt-5.6-sol"
 export const DEFAULT_OPENAI_SDK_MODEL = "gpt-5.4-mini"
 export const DEFAULT_OPENROUTER_SDK_MODEL = "moonshotai/kimi-k2.5:nitro"
 
@@ -137,6 +138,8 @@ export interface ProviderModelOption {
   label: string
   supportsEffort: boolean
   aliases?: readonly string[]
+  defaultEffort?: CodexReasoningEffort
+  supportedEffortLevels?: readonly CodexReasoningEffort[]
   contextWindowOptions?: readonly ProviderContextWindowOption[]
   supportsMaxReasoningEffort?: boolean
 }
@@ -159,11 +162,12 @@ export const CLAUDE_REASONING_OPTIONS = [
 ] as const satisfies readonly ProviderEffortOption[]
 
 export const CODEX_REASONING_OPTIONS = [
-  { id: "minimal", label: "Minimal" },
   { id: "low", label: "Low" },
   { id: "medium", label: "Medium" },
   { id: "high", label: "High" },
   { id: "xhigh", label: "XHigh" },
+  { id: "max", label: "Max" },
+  { id: "ultra", label: "Ultra" },
 ] as const satisfies readonly ProviderEffortOption[]
 
 export type ClaudeReasoningEffort = (typeof CLAUDE_REASONING_OPTIONS)[number]["id"]
@@ -180,6 +184,23 @@ export interface CodexModelOptions {
   reasoningEffort: CodexReasoningEffort
   fastMode: boolean
 }
+
+export const CODEX_STANDARD_REASONING_EFFORT_LEVELS = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+] as const satisfies readonly CodexReasoningEffort[]
+
+export const CODEX_MAX_REASONING_EFFORT_LEVELS = [
+  ...CODEX_STANDARD_REASONING_EFFORT_LEVELS,
+  "max",
+] as const satisfies readonly CodexReasoningEffort[]
+
+export const CODEX_ULTRA_REASONING_EFFORT_LEVELS = [
+  ...CODEX_MAX_REASONING_EFFORT_LEVELS,
+  "ultra",
+] as const satisfies readonly CodexReasoningEffort[]
 
 export interface ProviderModelOptionsByProvider {
   claude: ClaudeModelOptions
@@ -207,7 +228,7 @@ export const DEFAULT_CLAUDE_MODEL_OPTIONS = {
 } as const satisfies ClaudeModelOptions
 
 export const DEFAULT_CODEX_MODEL_OPTIONS = {
-  reasoningEffort: "high",
+  reasoningEffort: "low",
   fastMode: false,
 } as const satisfies CodexModelOptions
 
@@ -227,6 +248,59 @@ export const CLAUDE_CONTEXT_WINDOW_OPTIONS = [
 export function isClaudeContextWindow(value: unknown): value is ClaudeContextWindow {
   return CLAUDE_CONTEXT_WINDOW_OPTIONS.some((option) => option.id === value)
 }
+
+export const CODEX_CLI_MODEL_OPTIONS = [
+  {
+    id: "gpt-5.6-sol",
+    label: "GPT-5.6 Sol",
+    supportsEffort: true,
+    defaultEffort: "low",
+    supportedEffortLevels: [...CODEX_ULTRA_REASONING_EFFORT_LEVELS],
+  },
+  {
+    id: "gpt-5.6-terra",
+    label: "GPT-5.6 Terra",
+    supportsEffort: true,
+    defaultEffort: "medium",
+    supportedEffortLevels: [...CODEX_ULTRA_REASONING_EFFORT_LEVELS],
+  },
+  {
+    id: "gpt-5.6-luna",
+    label: "GPT-5.6 Luna",
+    supportsEffort: true,
+    defaultEffort: "medium",
+    supportedEffortLevels: [...CODEX_MAX_REASONING_EFFORT_LEVELS],
+  },
+  {
+    id: "gpt-5.5",
+    label: "GPT-5.5",
+    supportsEffort: true,
+    defaultEffort: "medium",
+    supportedEffortLevels: [...CODEX_STANDARD_REASONING_EFFORT_LEVELS],
+  },
+  {
+    id: "gpt-5.4",
+    label: "GPT-5.4",
+    supportsEffort: true,
+    defaultEffort: "medium",
+    supportedEffortLevels: [...CODEX_STANDARD_REASONING_EFFORT_LEVELS],
+  },
+  {
+    id: "gpt-5.3-codex",
+    label: "GPT-5.3 Codex",
+    supportsEffort: true,
+    aliases: ["gpt-5-codex"],
+    defaultEffort: "medium",
+    supportedEffortLevels: [...CODEX_STANDARD_REASONING_EFFORT_LEVELS],
+  },
+  {
+    id: "gpt-5.3-codex-spark",
+    label: "GPT-5.3 Codex Spark",
+    supportsEffort: true,
+    defaultEffort: "medium",
+    supportedEffortLevels: [...CODEX_STANDARD_REASONING_EFFORT_LEVELS],
+  },
+] as const satisfies readonly ProviderModelOption[]
 
 function titleCaseWord(value: string) {
   return value.length === 0 ? value : `${value[0]?.toUpperCase() ?? ""}${value.slice(1)}`
@@ -288,15 +362,11 @@ export const PROVIDERS: ProviderCatalogEntry[] = [
   {
     id: "codex",
     label: "Codex",
-    defaultModel: "gpt-5.5",
+    defaultModel: DEFAULT_CODEX_CLI_MODEL,
+    defaultEffort: DEFAULT_CODEX_MODEL_OPTIONS.reasoningEffort,
     supportsPlanMode: true,
-    models: [
-      { id: "gpt-5.5", label: "GPT-5.5", supportsEffort: false },
-      { id: "gpt-5.4", label: "GPT-5.4", supportsEffort: false },
-      { id: "gpt-5.3-codex", label: "GPT-5.3 Codex", supportsEffort: false, aliases: ["gpt-5-codex"] },
-      { id: "gpt-5.3-codex-spark", label: "GPT-5.3 Codex Spark", supportsEffort: false },
-    ],
-    efforts: [],
+    models: [...CODEX_CLI_MODEL_OPTIONS],
+    efforts: [...CODEX_REASONING_OPTIONS],
   },
 ]
 
@@ -330,7 +400,7 @@ export function normalizeClaudeModelId(modelId?: string, fallbackModelId = "clau
   return normalizeProviderModelId("claude", modelId, fallbackModelId)
 }
 
-export function normalizeCodexModelId(modelId?: string, fallbackModelId = "gpt-5.5"): string {
+export function normalizeCodexModelId(modelId?: string, fallbackModelId = DEFAULT_CODEX_CLI_MODEL): string {
   return normalizeProviderModelId("codex", modelId, fallbackModelId)
 }
 
@@ -343,8 +413,36 @@ export function getClaudeModelOption(modelId: string): ProviderModelOption | und
   return getProviderModelOption("claude", modelId)
 }
 
+export function getCodexModelOption(modelId: string): ProviderModelOption | undefined {
+  return getProviderModelOption("codex", modelId)
+}
+
 export function supportsClaudeMaxReasoningEffort(modelId: string): boolean {
   return Boolean(getClaudeModelOption(modelId)?.supportsMaxReasoningEffort)
+}
+
+export function isCodexReasoningEffortSupported(
+  model: ProviderModelOption | undefined,
+  effort: CodexReasoningEffort
+): boolean {
+  if (!model?.supportsEffort) return false
+  const supportedEffortLevels = model.supportedEffortLevels ?? CODEX_STANDARD_REASONING_EFFORT_LEVELS
+  return supportedEffortLevels.includes(effort)
+}
+
+function getCodexDefaultReasoningEffort(modelId: string): CodexReasoningEffort {
+  const defaultEffort = getCodexModelOption(modelId)?.defaultEffort
+  return isCodexReasoningEffort(defaultEffort)
+    ? defaultEffort
+    : DEFAULT_CODEX_MODEL_OPTIONS.reasoningEffort
+}
+
+export function normalizeCodexReasoningEffort(modelId: string, effort?: unknown): CodexReasoningEffort {
+  const defaultEffort = getCodexDefaultReasoningEffort(modelId)
+  const normalizedEffort = isCodexReasoningEffort(effort) ? effort : defaultEffort
+  return isCodexReasoningEffortSupported(getCodexModelOption(modelId), normalizedEffort)
+    ? normalizedEffort
+    : defaultEffort
 }
 
 export function getClaudeContextWindowOptions(modelId: string): readonly ProviderContextWindowOption[] {

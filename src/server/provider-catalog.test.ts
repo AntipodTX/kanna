@@ -44,27 +44,38 @@ describe("provider catalog normalization", () => {
   })
 
   test("normalizes Codex model options and fast mode defaults", () => {
-    expect(normalizeCodexModelOptions(undefined)).toEqual({
-      reasoningEffort: "high",
+    expect(normalizeCodexModelOptions("gpt-5.6-sol", undefined)).toEqual({
+      reasoningEffort: "low",
       fastMode: false,
     })
 
-    const normalized = normalizeCodexModelOptions({
+    const normalized = normalizeCodexModelOptions("gpt-5.6-sol", {
       codex: {
-        reasoningEffort: "xhigh",
+        reasoningEffort: "ultra",
         fastMode: true,
       },
     })
 
     expect(normalized).toEqual({
-      reasoningEffort: "xhigh",
+      reasoningEffort: "ultra",
       fastMode: true,
     })
     expect(codexServiceTierFromModelOptions(normalized)).toBe("fast")
+
+    expect(normalizeCodexModelOptions("gpt-5.5", {
+      codex: {
+        reasoningEffort: "max",
+        fastMode: true,
+      },
+    })).toEqual({
+      reasoningEffort: "medium",
+      fastMode: true,
+    })
   })
 
   test("normalizes server model ids through the shared alias catalog", () => {
-    expect(normalizeServerModel("codex")).toBe("gpt-5.5")
+    expect(normalizeServerModel("codex")).toBe("gpt-5.6-sol")
+    expect(normalizeServerModel("codex", "gpt-5.6-luna")).toBe("gpt-5.6-luna")
     expect(normalizeServerModel("claude", "fable")).toBe("fable")
     expect(normalizeServerModel("claude", "opus")).toBe("claude-opus-4-8")
     expect(normalizeServerModel("codex", "gpt-5-codex")).toBe("gpt-5.3-codex")
