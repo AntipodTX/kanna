@@ -1249,6 +1249,75 @@ describe("AgentCoordinator codex integration", () => {
 })
 
 describe("AgentCoordinator claude integration", () => {
+  test("tracks Claude startup as active so cancel and queuing work before the session is ready", async () => {
+    const events = new AsyncEventQueue<any>()
+    let resolveStartRequested!: () => void
+    const startRequested = new Promise<void>((resolve) => {
+      resolveStartRequested = resolve
+    })
+    let resolveStartSession!: (turn: any) => void
+    const startSessionGate = new Promise<any>((resolve) => {
+      resolveStartSession = resolve
+    })
+    let startAttempts = 0
+
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => {
+        startAttempts += 1
+        resolveStartRequested()
+        if (startAttempts > 1) {
+          throw new Error("Claude startup should not be re-entered")
+        }
+        return await startSessionGate
+      },
+    })
+
+    const firstSend = coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first prompt",
+      model: "claude-opus-4-1",
+    })
+
+    await startRequested
+
+    expect(coordinator.getActiveStatuses().get("chat-1")).toBe("starting")
+
+    await expect(coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "second prompt",
+      model: "claude-opus-4-1",
+    })).resolves.toMatchObject({ chatId: "chat-1", queued: true })
+    expect(startAttempts).toBe(1)
+    expect(store.queuedMessages.map((message) => message.content)).toEqual(["second prompt"])
+
+    let interrupted = false
+    resolveStartSession({
+      provider: "claude",
+      stream: events,
+      getAccountInfo: async () => null,
+      interrupt: async () => {
+        interrupted = true
+      },
+      close: () => {},
+      setModel: async () => {},
+      setPermissionMode: async () => {},
+      sendPrompt: async () => {},
+    })
+    await firstSend
+
+    await coordinator.cancel("chat-1")
+    expect(interrupted).toBe(true)
+
+    events.close()
+  })
+
   test("tracks analytics for new chats, queued messages, and forks", async () => {
     const events = new AsyncEventQueue<any>()
     const analyticsEvents: string[] = []

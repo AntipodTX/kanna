@@ -169,6 +169,181 @@ describe("processTranscriptMessages", () => {
     if (messages[0]?.kind !== "tool") throw new Error("unexpected message")
     expect(messages[0].result).toEqual({ answers: { "Provider?": ["Codex"] } })
   })
+
+  test("preserves Claude plan adjustment text when a later echoed tool result arrives", () => {
+    const messages = processTranscriptMessages([
+      entry({
+        kind: "tool_call",
+        tool: {
+          kind: "tool",
+          toolKind: "exit_plan_mode",
+          toolName: "ExitPlanMode",
+          toolId: "exit-plan-1",
+          input: { plan: "## Plan" },
+        },
+      }),
+      entry({
+        kind: "tool_result",
+        toolId: "exit-plan-1",
+        content: { confirmed: false, message: "Keep the existing deployment order" },
+      }),
+      entry({
+        kind: "tool_result",
+        toolId: "exit-plan-1",
+        content: "User wants to suggest edits to the plan: Keep the existing deployment order",
+        isError: true,
+        debugRaw: JSON.stringify({
+          type: "user",
+          tool_use_result: "Error: User wants to suggest edits to the plan: Keep the existing deployment order",
+        }),
+      }),
+    ])
+
+    expect(messages[0]?.kind).toBe("tool")
+    if (messages[0]?.kind !== "tool") throw new Error("unexpected message")
+    expect(messages[0].result).toEqual({
+      confirmed: false,
+      clearContext: undefined,
+      message: "Keep the existing deployment order",
+    })
+  })
+
+  test("recovers an empty Claude ExitPlanMode input from prior plan write and edit events", () => {
+    const planPath = "/home/test/.claude/plans/current-plan.md"
+    const messages = processTranscriptMessages([
+      entry({
+        kind: "tool_call",
+        tool: {
+          kind: "tool",
+          toolKind: "write_file",
+          toolName: "Write",
+          toolId: "write-plan",
+          input: { filePath: planPath, content: "## Plan\n\n- First step" },
+        },
+      }),
+      entry({
+        kind: "tool_result",
+        toolId: "write-plan",
+        content: "The file has been written successfully.",
+      }),
+      entry({
+        kind: "tool_call",
+        tool: {
+          kind: "tool",
+          toolKind: "edit_file",
+          toolName: "Edit",
+          toolId: "edit-plan",
+          input: {
+            filePath: planPath,
+            oldString: "- First step",
+            newString: "- Updated first step",
+          },
+        },
+      }),
+      entry({
+        kind: "tool_result",
+        toolId: "edit-plan",
+        content: "The file has been updated successfully.",
+      }),
+      entry({
+        kind: "tool_call",
+        tool: {
+          kind: "tool",
+          toolKind: "exit_plan_mode",
+          toolName: "ExitPlanMode",
+          toolId: "exit-plan-empty",
+          input: {},
+        },
+      }),
+    ])
+
+    const exitPlan = messages.find(
+      (message) => message.kind === "tool" && message.toolId === "exit-plan-empty",
+    )
+    expect(exitPlan?.kind).toBe("tool")
+    if (exitPlan?.kind !== "tool" || exitPlan.toolKind !== "exit_plan_mode") {
+      throw new Error("unexpected message")
+    }
+    expect(exitPlan.input.plan).toBe("## Plan\n\n- Updated first step")
+  })
+
+  test("does not reuse an inline plan for a later unrelated empty ExitPlanMode call", () => {
+    const messages = processTranscriptMessages([
+      entry({
+        kind: "tool_call",
+        tool: {
+          kind: "tool",
+          toolKind: "exit_plan_mode",
+          toolName: "ExitPlanMode",
+          toolId: "exit-plan-inline",
+          input: { plan: "## Earlier plan" },
+        },
+      }),
+      entry({
+        kind: "tool_call",
+        tool: {
+          kind: "tool",
+          toolKind: "exit_plan_mode",
+          toolName: "ExitPlanMode",
+          toolId: "exit-plan-unrelated",
+          input: {},
+        },
+      }),
+    ])
+
+    const unrelatedExitPlan = messages.find(
+      (message) => message.kind === "tool" && message.toolId === "exit-plan-unrelated",
+    )
+    expect(unrelatedExitPlan?.kind).toBe("tool")
+    if (unrelatedExitPlan?.kind !== "tool" || unrelatedExitPlan.toolKind !== "exit_plan_mode") {
+      throw new Error("unexpected message")
+    }
+    expect(unrelatedExitPlan.input.plan).toBeUndefined()
+  })
+
+  test("does not mutate the source transcript input when recovering a plan", () => {
+    const planPath = "/home/test/.claude/plans/source-plan.md"
+    const sourceInput: Record<string, never> = {}
+    const exitPlanEntry = entry({
+      kind: "tool_call",
+      tool: {
+        kind: "tool",
+        toolKind: "exit_plan_mode",
+        toolName: "ExitPlanMode",
+        toolId: "exit-plan-source",
+        input: sourceInput,
+      },
+    })
+
+    const messages = processTranscriptMessages([
+      entry({
+        kind: "tool_call",
+        tool: {
+          kind: "tool",
+          toolKind: "write_file",
+          toolName: "Write",
+          toolId: "write-source-plan",
+          input: { filePath: planPath, content: "## Source plan" },
+        },
+      }),
+      entry({
+        kind: "tool_result",
+        toolId: "write-source-plan",
+        content: "The file has been written successfully.",
+      }),
+      exitPlanEntry,
+    ])
+
+    const exitPlan = messages.find(
+      (message) => message.kind === "tool" && message.toolId === "exit-plan-source",
+    )
+    expect(exitPlan?.kind).toBe("tool")
+    if (exitPlan?.kind !== "tool" || exitPlan.toolKind !== "exit_plan_mode") {
+      throw new Error("unexpected message")
+    }
+    expect(exitPlan.input.plan).toBe("## Source plan")
+    expect(sourceInput).toEqual({})
+  })
 })
 
 describe("getLatestToolIds", () => {

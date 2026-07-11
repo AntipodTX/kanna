@@ -59,7 +59,7 @@ interface PendingToolRequest {
 interface ActiveTurn {
   chatId: string
   provider: AgentProvider
-  turn: HarnessTurn
+  turn: HarnessTurn | null
   claudePromptSeq?: number
   model: string
   effort?: string
@@ -835,6 +835,19 @@ export class AgentCoordinator {
     return true
   }
 
+  private async interruptAndCloseTurn(turn: HarnessTurn | null) {
+    if (!turn) return
+    try {
+      await Promise.race([
+        turn.interrupt(),
+        new Promise((resolve) => setTimeout(resolve, 5_000)),
+      ])
+    } catch {
+      // interrupt() failed; close below is the best-effort cleanup path.
+    }
+    turn.close()
+  }
+
   private async startTurnForChat(args: {
     chatId: string
     provider: AgentProvider
@@ -935,23 +948,70 @@ export class AgentCoordinator {
       })
     }
 
+    const createActiveTurn = (turn: HarnessTurn | null, status: KannaStatus): ActiveTurn => ({
+      chatId: args.chatId,
+      provider: args.provider,
+      turn,
+      model: args.model,
+      effort: args.effort,
+      serviceTier: args.serviceTier,
+      planMode: args.planMode,
+      status,
+      pendingTool: null,
+      postToolFollowUp: null,
+      hasFinalResult: false,
+      cancelRequested: false,
+      cancelRecorded: false,
+      clientTraceId: args.profile?.traceId,
+      profilingStartedAt: args.profile?.startedAt,
+    })
+    const registerActiveTurn = (activeTurn: ActiveTurn) => {
+      this.activeTurns.set(args.chatId, activeTurn)
+      logSendToStartingProfile(args.profile, "start_turn.active_turn_registered", {
+        chatId: args.chatId,
+        status: activeTurn.status,
+      })
+      this.emitStateChange(args.chatId, { immediate: activeTurn.status === "starting" })
+      logSendToStartingProfile(args.profile, "start_turn.state_change_emitted", {
+        chatId: args.chatId,
+        status: activeTurn.status,
+      })
+    }
+
     let turn: HarnessTurn
+    let active: ActiveTurn
     if (args.provider === "claude") {
+      active = createActiveTurn(null, "starting")
+      registerActiveTurn(active)
       logSendToStartingProfile(args.profile, "start_turn.provider_boot.begin", {
         chatId: args.chatId,
         provider: args.provider,
         model: args.model,
       })
-      turn = await this.startClaudeTurn({
-        chatId: args.chatId,
-        localPath: project.localPath,
-        model: args.model,
-        effort: args.effort,
-        planMode: args.planMode,
-        sessionToken: chat.pendingForkSessionToken ?? chat.sessionToken,
-        forkSession: Boolean(chat.pendingForkSessionToken),
-        onToolRequest,
-      })
+      try {
+        turn = await this.startClaudeTurn({
+          chatId: args.chatId,
+          localPath: project.localPath,
+          model: args.model,
+          effort: args.effort,
+          planMode: args.planMode,
+          sessionToken: chat.pendingForkSessionToken ?? chat.sessionToken,
+          forkSession: Boolean(chat.pendingForkSessionToken),
+          onToolRequest,
+        })
+      } catch (error) {
+        if (this.activeTurns.get(args.chatId) === active) {
+          this.activeTurns.delete(args.chatId)
+          this.emitStateChange(args.chatId)
+        }
+        throw error
+      }
+      // Fill the registered provisional turn so later cancellation targets the live SDK turn.
+      active.turn = turn
+      if (active.cancelRequested || this.activeTurns.get(args.chatId) !== active) {
+        await this.interruptAndCloseTurn(turn)
+        return
+      }
       logSendToStartingProfile(args.profile, "start_turn.provider_boot.ready", {
         chatId: args.chatId,
         provider: args.provider,
@@ -993,35 +1053,9 @@ export class AgentCoordinator {
         provider: args.provider,
         model: args.model,
       })
+      active = createActiveTurn(turn, "starting")
+      registerActiveTurn(active)
     }
-
-    const active: ActiveTurn = {
-      chatId: args.chatId,
-      provider: args.provider,
-      turn,
-      model: args.model,
-      effort: args.effort,
-      serviceTier: args.serviceTier,
-      planMode: args.planMode,
-      status: args.provider === "claude" ? "running" : "starting",
-      pendingTool: null,
-      postToolFollowUp: null,
-      hasFinalResult: false,
-      cancelRequested: false,
-      cancelRecorded: false,
-      clientTraceId: args.profile?.traceId,
-      profilingStartedAt: args.profile?.startedAt,
-    }
-    this.activeTurns.set(args.chatId, active)
-    logSendToStartingProfile(args.profile, "start_turn.active_turn_registered", {
-      chatId: args.chatId,
-      status: active.status,
-    })
-    this.emitStateChange(args.chatId, { immediate: active.status === "starting" })
-    logSendToStartingProfile(args.profile, "start_turn.state_change_emitted", {
-      chatId: args.chatId,
-      status: active.status,
-    })
 
     if (turn.getAccountInfo) {
       void turn.getAccountInfo()
@@ -1043,6 +1077,10 @@ export class AgentCoordinator {
     }
 
     if (args.provider === "claude") {
+      if (active.cancelRequested || this.activeTurns.get(args.chatId) !== active) {
+        await this.interruptAndCloseTurn(turn)
+        return
+      }
       const session = this.claudeSessions.get(args.chatId)
       if (!session) {
         throw new Error("Claude session was not initialized")
@@ -1051,6 +1089,8 @@ export class AgentCoordinator {
       session.nextPromptSeq = promptSeq
       session.pendingPromptSeqs.push(promptSeq)
       active.claudePromptSeq = promptSeq
+      active.status = "running"
+      this.emitStateChange(args.chatId)
       logClaudeSteer("claude_prompt_sent", {
         chatId: args.chatId,
         sessionId: session.id,
@@ -1066,7 +1106,7 @@ export class AgentCoordinator {
       return
     }
 
-    void this.runTurn(active)
+    void this.runTurn(active as ActiveTurn & { turn: HarnessTurn })
   }
 
   private async startClaudeTurn(args: {
@@ -1376,7 +1416,7 @@ export class AgentCoordinator {
     }
   }
 
-  private async runTurn(active: ActiveTurn) {
+  private async runTurn(active: ActiveTurn & { turn: HarnessTurn }) {
     try {
       for await (const event of active.turn.stream) {
         // Once cancelled, stop processing further stream events.
@@ -1559,15 +1599,7 @@ export class AgentCoordinator {
     // Now attempt to interrupt/close the underlying stream in the background.
     // This is best-effort — the turn is already removed from active state above,
     // and runTurn()'s finally block will also call close().
-    try {
-      await Promise.race([
-        active.turn.interrupt(),
-        new Promise((resolve) => setTimeout(resolve, 5_000)),
-      ])
-    } catch {
-      // interrupt() failed — force close
-    }
-    active.turn.close()
+    await this.interruptAndCloseTurn(active.turn)
   }
 
   async respondTool(command: Extract<ClientCommand, { type: "chat.respondTool" }>) {
