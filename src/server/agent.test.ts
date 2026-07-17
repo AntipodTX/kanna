@@ -3,9 +3,12 @@ import {
   AgentCoordinator,
   buildAttachmentHintText,
   buildPromptText,
+  classifyClaudeBackgroundWorkState,
+  createClaudeStopHook,
   maxClaudeContextWindowFromModelUsage,
   normalizeClaudeStreamMessage,
   normalizeClaudeUsageSnapshot,
+  type ClaudeBackgroundWorkState,
 } from "./agent"
 import type { HarnessTurn } from "./harness-types"
 import type { ChatAttachment, TranscriptEntry } from "../shared/types"
@@ -58,6 +61,71 @@ class AsyncEventQueue<T> implements AsyncIterable<T> {
     }
   }
 }
+
+describe("Claude background work snapshots", () => {
+  test("classifies complete Stop snapshots as active or inactive", () => {
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: [],
+      session_crons: [],
+    })).toBe("inactive")
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: [{} as never],
+      session_crons: [],
+    })).toBe("active")
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: [],
+      session_crons: [{} as never],
+    })).toBe("active")
+  })
+
+  test("classifies incomplete or malformed Stop snapshots as unknown", () => {
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: [],
+    })).toBe("unknown")
+    expect(classifyClaudeBackgroundWorkState({
+      session_crons: [],
+    })).toBe("unknown")
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: null as never,
+      session_crons: [],
+    })).toBe("unknown")
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: [],
+      session_crons: {} as never,
+    })).toBe("unknown")
+  })
+
+  test("reports Stop state without propagating observer failures", async () => {
+    const states: ClaudeBackgroundWorkState[] = []
+    const hook = createClaudeStopHook((state) => states.push(state))
+    const stopInput = {
+      hook_event_name: "Stop",
+      background_tasks: [],
+      session_crons: [],
+    } as never
+    const hookOptions = { signal: new AbortController().signal }
+
+    await expect(hook(stopInput, undefined, hookOptions)).resolves.toEqual({})
+    expect(states).toEqual(["inactive"])
+
+    const failingHook = createClaudeStopHook(() => {
+      throw new Error("observer failed")
+    })
+    await expect(failingHook(stopInput, undefined, hookOptions)).resolves.toEqual({})
+
+    let firstObservation = true
+    const recoveredStates: ClaudeBackgroundWorkState[] = []
+    const recoveringHook = createClaudeStopHook((state) => {
+      if (firstObservation) {
+        firstObservation = false
+        throw new Error("first observation failed")
+      }
+      recoveredStates.push(state)
+    })
+    await expect(recoveringHook(stopInput, undefined, hookOptions)).resolves.toEqual({})
+    expect(recoveredStates).toEqual(["unknown"])
+  })
+})
 
 describe("normalizeClaudeStreamMessage", () => {
   test("normalizes assistant tool calls", () => {
@@ -201,6 +269,75 @@ describe("attachment prompt helpers", () => {
 })
 
 describe("AgentCoordinator codex integration", () => {
+  test("closes Codex sessions when a chat is closed", async () => {
+    const stoppedChatIds: string[] = []
+    const coordinator = new AgentCoordinator({
+      store: createFakeStore() as never,
+      onStateChange: () => {},
+      codexManager: {
+        stopSession(chatId: string) {
+          stoppedChatIds.push(chatId)
+        },
+      } as never,
+    })
+
+    await coordinator.closeChat("chat-1")
+
+    expect(stoppedChatIds).toEqual(["chat-1"])
+  })
+
+  test("closes inactive Codex sessions after the configured idle timeout", async () => {
+    const stoppedChatIds: string[] = []
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async startSession() {},
+        hasSession: () => true,
+        getSessionChatIds: () => [],
+        async startTurn(): Promise<HarnessTurn> {
+          async function* stream() {
+            yield {
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            }
+          }
+
+          return {
+            provider: "codex",
+            stream: stream(),
+            interrupt: async () => {},
+            close: () => {},
+          }
+        },
+        stopSession(chatId: string) {
+          stoppedChatIds.push(chatId)
+        },
+      } as never,
+    })
+    coordinator.setIdleSessionTimeoutMs(20)
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "codex",
+      content: "first message",
+      model: "gpt-5.4",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+    await waitFor(() => stoppedChatIds.includes("chat-1"))
+
+    expect(stoppedChatIds).toEqual(["chat-1"])
+  })
+
   test("generates a chat title in the background on the first user message", async () => {
     let releaseTitle!: () => void
     const titleGate = new Promise<void>((resolve) => {
@@ -1242,6 +1379,314 @@ describe("AgentCoordinator codex integration", () => {
 })
 
 describe("AgentCoordinator claude integration", () => {
+  function createIdleAwareClaudeHarness(timeoutMs = 40) {
+    const closeCalls: number[] = []
+    const backgroundStateCallbacks: Array<(state: ClaudeBackgroundWorkState) => void> = []
+    const eventStreams: Array<AsyncEventQueue<any>> = []
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        const stream = new AsyncEventQueue<any>()
+        const sessionIndex = eventStreams.push(stream) - 1
+        backgroundStateCallbacks.push(args.onBackgroundWorkStateChange)
+        return {
+          provider: "claude",
+          stream,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {
+            closeCalls.push(sessionIndex)
+            stream.close()
+          },
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async () => {
+            stream.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+    coordinator.setIdleSessionTimeoutMs(timeoutMs)
+
+    return {
+      coordinator,
+      store,
+      closeCalls,
+      backgroundStateCallbacks,
+      eventStreams,
+    }
+  }
+
+  test("closes Claude sessions when a chat is closed", async () => {
+    const closeCalls: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => ({
+        provider: "claude",
+        stream: events,
+        getAccountInfo: async () => null,
+        interrupt: async () => {},
+        close: () => {
+          closeCalls.push("close")
+          events.close()
+        },
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        sendPrompt: async () => {},
+      }),
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await coordinator.closeChat("chat-1")
+
+    expect(closeCalls.length).toBeGreaterThan(0)
+  })
+
+  test("keeps unknown and active Claude background sessions out of idle cleanup", async () => {
+    const harness = createIdleAwareClaudeHarness(20)
+
+    await harness.coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await waitFor(() => harness.store.turnFinishedCount === 1)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(harness.closeCalls).toEqual([])
+    expect(harness.backgroundStateCallbacks).toHaveLength(1)
+
+    harness.coordinator.setIdleSessionTimeoutMs(25)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(harness.closeCalls).toEqual([])
+
+    harness.backgroundStateCallbacks[0]?.("active")
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(harness.closeCalls).toEqual([])
+
+    await harness.coordinator.closeChat("chat-1")
+    expect(harness.closeCalls).toEqual([0])
+  })
+
+  test("starts the Claude idle timeout when background work becomes inactive", async () => {
+    const harness = createIdleAwareClaudeHarness(50)
+
+    await harness.coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await waitFor(() => harness.store.turnFinishedCount === 1)
+    harness.backgroundStateCallbacks[0]?.("active")
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(harness.closeCalls).toEqual([])
+
+    harness.backgroundStateCallbacks[0]?.("inactive")
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    expect(harness.closeCalls).toEqual([])
+    await waitFor(() => harness.closeCalls.length > 0, 500)
+    expect(harness.closeCalls).toEqual([0])
+  })
+
+  test("cancels a pending Claude idle close when background work becomes active", async () => {
+    const harness = createIdleAwareClaudeHarness(50)
+
+    await harness.coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await waitFor(() => harness.store.turnFinishedCount === 1)
+    harness.backgroundStateCallbacks[0]?.("inactive")
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    harness.backgroundStateCallbacks[0]?.("active")
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(harness.closeCalls).toEqual([])
+
+    await harness.coordinator.closeChat("chat-1")
+    expect(harness.closeCalls).toEqual([0])
+  })
+
+  test("ignores background work callbacks from a replaced Claude session", async () => {
+    const harness = createIdleAwareClaudeHarness(30)
+
+    await harness.coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-8",
+      modelOptions: {
+        claude: { reasoningEffort: "low", contextWindow: "200k" },
+      },
+    })
+    await waitFor(() => harness.store.turnFinishedCount === 1)
+    harness.backgroundStateCallbacks[0]?.("active")
+
+    await harness.coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "second message",
+      model: "claude-opus-4-8",
+      modelOptions: {
+        claude: { reasoningEffort: "high", contextWindow: "200k" },
+      },
+    })
+    await waitFor(() => harness.backgroundStateCallbacks.length === 2)
+    harness.backgroundStateCallbacks[1]?.("active")
+    await waitFor(() => harness.store.turnFinishedCount === 2)
+
+    const closeCountAfterReplacement = harness.closeCalls.length
+    harness.backgroundStateCallbacks[0]?.("inactive")
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(harness.closeCalls).toHaveLength(closeCountAfterReplacement)
+
+    harness.backgroundStateCallbacks[1]?.("inactive")
+    await waitFor(() => harness.closeCalls.includes(1), 500)
+    expect(harness.closeCalls).toContain(1)
+  })
+
+  test("closes inactive Claude sessions after the configured idle timeout", async () => {
+    const closeCalls: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => ({
+        provider: "claude",
+        stream: events,
+        getAccountInfo: async () => null,
+        interrupt: async () => {},
+        close: () => {
+          closeCalls.push("close")
+          events.close()
+        },
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        sendPrompt: async () => {
+          args.onBackgroundWorkStateChange("inactive")
+          events.push({
+            type: "transcript" as const,
+            entry: timestamped({
+              kind: "result",
+              subtype: "success",
+              isError: false,
+              durationMs: 0,
+              result: "done",
+            }),
+          })
+        },
+      }),
+    })
+    coordinator.setIdleSessionTimeoutMs(20)
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+    await waitFor(() => closeCalls.length > 0)
+
+    expect(closeCalls.length).toBeGreaterThan(0)
+  })
+
+  test("resets the Claude idle timeout when a persistent session emits after the result", async () => {
+    const closeCalls: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => ({
+        provider: "claude",
+        stream: events,
+        getAccountInfo: async () => null,
+        interrupt: async () => {},
+        close: () => {
+          closeCalls.push("close")
+          events.close()
+        },
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        sendPrompt: async () => {
+          args.onBackgroundWorkStateChange("inactive")
+          events.push({
+            type: "transcript" as const,
+            entry: timestamped({
+              kind: "result",
+              subtype: "success",
+              isError: false,
+              durationMs: 0,
+              result: "done",
+            }),
+          })
+        },
+      }),
+    })
+    coordinator.setIdleSessionTimeoutMs(50)
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    events.push({
+      type: "transcript" as const,
+      entry: timestamped({
+        kind: "account_info",
+        accountInfo: {
+          accountId: "acct-1",
+          email: "dev@example.com",
+        },
+      }),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 35))
+
+    expect(closeCalls).toEqual([])
+
+    await waitFor(() => closeCalls.length > 0)
+  })
+
   test("tracks analytics for new chats, queued messages, and forks", async () => {
     const events = new AsyncEventQueue<any>()
     const analyticsEvents: string[] = []

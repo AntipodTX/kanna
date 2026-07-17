@@ -922,6 +922,16 @@ export class CodexAppServerManager {
     }
   }
 
+  hasSession(chatId: string) {
+    const context = this.sessions.get(chatId)
+    return Boolean(context && !context.closed)
+  }
+
+  getSessionChatIds() {
+    return [...this.sessions.entries()]
+      .filter(([, context]) => !context.closed)
+      .map(([chatId]) => chatId)
+  }
   private requireSession(chatId: string) {
     const context = this.sessions.get(chatId)
     if (!context || context.closed) {

@@ -27,6 +27,7 @@ import {
   type CursorModelOptions,
   type DefaultProviderPreference,
   type EditorPreset,
+  type IdleSessionTimeoutPreference,
   type ProviderPreference,
 } from "../shared/types"
 
@@ -37,6 +38,7 @@ interface AppSettingsFile {
   theme?: unknown
   chatSoundPreference?: unknown
   chatSoundId?: unknown
+  idleSessionTimeout?: unknown
   terminal?: {
     scrollbackLines?: unknown
     minColumnWidth?: unknown
@@ -72,6 +74,7 @@ const MAX_TERMINAL_MIN_COLUMN_WIDTH = 900
 const DEFAULT_EDITOR_PRESET: EditorPreset = "cursor"
 const DEFAULT_CHAT_SOUND_PREFERENCE: ChatSoundPreference = "always"
 const DEFAULT_CHAT_SOUND_ID: ChatSoundId = "funk"
+const DEFAULT_IDLE_SESSION_TIMEOUT: IdleSessionTimeoutPreference = "1h"
 
 function formatDisplayPath(filePath: string) {
   const homePath = homedir()
@@ -154,6 +157,12 @@ function normalizeChatSoundId(value: unknown): ChatSoundId {
 
 function normalizeDefaultProvider(value: unknown): DefaultProviderPreference {
   return value === "claude" || value === "codex" || value === "cursor" || value === "last_used" ? value : "last_used"
+}
+
+function normalizeIdleSessionTimeout(value: unknown): IdleSessionTimeoutPreference {
+  return value === "never" || value === "15m" || value === "30m" || value === "1h"
+    ? value
+    : DEFAULT_IDLE_SESSION_TIMEOUT
 }
 
 function normalizeEditorPreset(value: unknown): EditorPreset {
@@ -247,6 +256,7 @@ function toFilePayload(state: AppSettingsState) {
     theme: state.theme,
     chatSoundPreference: state.chatSoundPreference,
     chatSoundId: state.chatSoundId,
+    idleSessionTimeout: state.idleSessionTimeout,
     terminal: state.terminal,
     editor: state.editor,
     defaultProvider: state.defaultProvider,
@@ -261,6 +271,7 @@ function toSnapshot(state: AppSettingsState): AppSettingsSnapshot {
     theme: state.theme,
     chatSoundPreference: state.chatSoundPreference,
     chatSoundId: state.chatSoundId,
+    idleSessionTimeout: state.idleSessionTimeout,
     terminal: state.terminal,
     editor: state.editor,
     defaultProvider: state.defaultProvider,
@@ -305,6 +316,7 @@ function normalizeAppSettings(
     theme: normalizeTheme(source?.theme),
     chatSoundPreference: normalizeChatSoundPreference(source?.chatSoundPreference),
     chatSoundId: normalizeChatSoundId(source?.chatSoundId),
+    idleSessionTimeout: normalizeIdleSessionTimeout(source?.idleSessionTimeout),
     terminal: {
       scrollbackLines: clampNumber(source?.terminal?.scrollbackLines, DEFAULT_TERMINAL_SCROLLBACK, MIN_TERMINAL_SCROLLBACK, MAX_TERMINAL_SCROLLBACK),
       minColumnWidth: clampNumber(source?.terminal?.minColumnWidth, DEFAULT_TERMINAL_MIN_COLUMN_WIDTH, MIN_TERMINAL_MIN_COLUMN_WIDTH, MAX_TERMINAL_MIN_COLUMN_WIDTH),
@@ -339,6 +351,7 @@ function toComparablePayload(source: AppSettingsFile) {
     theme: source.theme,
     chatSoundPreference: source.chatSoundPreference,
     chatSoundId: source.chatSoundId,
+    idleSessionTimeout: source.idleSessionTimeout,
     terminal: source.terminal,
     editor: source.editor,
     defaultProvider: source.defaultProvider,

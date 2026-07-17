@@ -31,6 +31,7 @@ import {
   type AgentProvider,
   type InstalledSkillSummary,
   type KeybindingAction,
+  type IdleSessionTimeoutPreference,
   type LlmProviderKind,
   type InstalledSkillsSnapshot,
   type SkillInstallResult,
@@ -119,6 +120,13 @@ const themeOptions = [
   { value: "light" as ThemePreference, label: "Light", icon: Sun },
   { value: "dark" as ThemePreference, label: "Dark", icon: Moon },
   { value: "system" as ThemePreference, label: "System", icon: Monitor },
+]
+
+const IDLE_SESSION_TIMEOUT_OPTIONS: Array<{ value: IdleSessionTimeoutPreference; label: string }> = [
+  { value: "never", label: "Never" },
+  { value: "15m", label: "15 min" },
+  { value: "30m", label: "30 min" },
+  { value: "1h", label: "1 hour" },
 ]
 
 const chatSoundPreferenceOptions: { value: ChatSoundPreference; label: string }[] = [
@@ -831,6 +839,7 @@ export function SettingsPage() {
   const setChatSoundId = useChatSoundPreferencesStore((store) => store.setChatSoundId)
   const keybindings = state.keybindings
   const appSettings = state.appSettings
+  const idleSessionTimeout = appSettings?.idleSessionTimeout ?? "1h"
   const llmProvider = state.llmProvider
   const defaultProvider = useChatPreferencesStore((store) => store.defaultProvider)
   const providerDefaults = useChatPreferencesStore((store) => store.providerDefaults)
@@ -1069,6 +1078,12 @@ export function SettingsPage() {
     } catch (error) {
       setAppSettingsError(error instanceof Error ? error.message : "Unable to save analytics settings.")
     }
+  }
+
+  function handleIdleSessionTimeoutChange(nextValue: IdleSessionTimeoutPreference) {
+    void handleWriteAppSettings({ idleSessionTimeout: nextValue }).catch((error) => {
+      setAppSettingsError(error instanceof Error ? error.message : "Unable to save session settings.")
+    })
   }
 
   function handleDefaultProviderChange(nextValue: "last_used" | AgentProvider) {
@@ -1460,6 +1475,29 @@ export function SettingsPage() {
                           <SelectContent>
                             <SelectGroup>
                               {CHAT_SOUND_OPTIONS.map((option) => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  {option.label}
+                                </SelectItem>
+                              ))}
+                            </SelectGroup>
+                          </SelectContent>
+                        </Select>
+                      </SettingsRow>
+
+                      <SettingsRow
+                        title="Idle Agent Sessions"
+                        description="Close inactive Claude Code and Codex sessions to release local process and MCP resources"
+                      >
+                        <Select
+                          value={idleSessionTimeout}
+                          onValueChange={(value) => handleIdleSessionTimeoutChange(value as IdleSessionTimeoutPreference)}
+                        >
+                          <SelectTrigger className="min-w-[180px]">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectGroup>
+                              {IDLE_SESSION_TIMEOUT_OPTIONS.map((option) => (
                                 <SelectItem key={option.value} value={option.value}>
                                   {option.label}
                                 </SelectItem>

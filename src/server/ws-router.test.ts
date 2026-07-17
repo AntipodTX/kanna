@@ -76,6 +76,7 @@ const DEFAULT_APP_SETTINGS_SNAPSHOT: AppSettingsSnapshot = {
   theme: "system",
   chatSoundPreference: "always",
   chatSoundId: "funk",
+  idleSessionTimeout: "1h",
   terminal: {
     scrollbackLines: 1_000,
     minColumnWidth: 450,
@@ -643,6 +644,60 @@ describe("ws-router", () => {
       "analytics_disabled",
       "analytics_enabled",
     ])
+  })
+
+  test("cancels and closes agent sessions before archiving chats", async () => {
+    const calls: string[] = []
+    const router = createWsRouter({
+      store: {
+        state: createEmptyState(),
+        archiveChat: async (chatId: string) => {
+          calls.push(`archive:${chatId}`)
+        },
+      } as never,
+      agent: {
+        getActiveStatuses: () => new Map(),
+        getDrainingChatIds: () => new Set(),
+        cancel: async (chatId: string) => {
+          calls.push(`cancel:${chatId}`)
+        },
+        closeChat: async (chatId: string) => {
+          calls.push(`close:${chatId}`)
+        },
+      } as never,
+      terminals: {
+        getSnapshot: () => null,
+        onEvent: () => () => {},
+      } as never,
+      keybindings: {
+        getSnapshot: () => DEFAULT_KEYBINDINGS_SNAPSHOT,
+        onChange: () => () => {},
+      } as never,
+      appSettings: {
+        getSnapshot: () => DEFAULT_APP_SETTINGS_SNAPSHOT,
+        write: async () => DEFAULT_APP_SETTINGS_SNAPSHOT,
+      },
+      refreshDiscovery: async () => [],
+      getDiscoveredProjects: () => [],
+      machineDisplayName: "Local Machine",
+      updateManager: null,
+    })
+    const ws = new FakeWebSocket()
+
+    await router.handleMessage(
+      ws as never,
+      JSON.stringify({
+        v: 1,
+        type: "command",
+        id: "archive-chat",
+        command: {
+          type: "chat.archive",
+          chatId: "chat-1",
+        },
+      })
+    )
+
+    expect(calls).toEqual(["cancel:chat-1", "close:chat-1", "archive:chat-1"])
   })
 
   test("tracks project lifecycle analytics", async () => {
