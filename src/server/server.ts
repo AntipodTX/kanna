@@ -1,7 +1,7 @@
 import path from "node:path"
 import { stat } from "node:fs/promises"
 import { APP_NAME, getRuntimeProfile } from "../shared/branding"
-import type { ChatAttachment } from "../shared/types"
+import type { ChatAttachment, IdleSessionTimeoutPreference } from "../shared/types"
 import type { ShareMode } from "../shared/share"
 import { createAuthManager } from "./auth"
 import { EventStore } from "./event-store"
@@ -23,6 +23,21 @@ import { getProjectUploadDir } from "./paths"
 const MAX_UPLOAD_FILES = 50
 const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024
 const STALE_EMPTY_CHAT_PRUNE_INTERVAL_MS = 60 * 1000
+
+function idleSessionTimeoutMs(value: IdleSessionTimeoutPreference): number | null {
+  switch (value) {
+    case "15m":
+      return 15 * 60 * 1000
+    case "30m":
+      return 30 * 60 * 1000
+    case "1h":
+      return 60 * 60 * 1000
+    case "never":
+      return null
+  }
+  const exhaustive: never = value
+  return exhaustive
+}
 
 export async function persistUploadedFiles(args: {
   projectId: string
@@ -137,6 +152,10 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
       }
       router.scheduleBroadcast()
     },
+  })
+  agent.setIdleSessionTimeoutMs(idleSessionTimeoutMs(appSettings.getSnapshot().idleSessionTimeout))
+  const disposeAgentIdleSettings = appSettings.onChange((snapshot) => {
+    agent.setIdleSessionTimeoutMs(idleSessionTimeoutMs(snapshot.idleSessionTimeout))
   })
   router = createWsRouter({
     store,
@@ -288,6 +307,8 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
       await agent.cancel(chatId)
     }
     router.dispose()
+    disposeAgentIdleSettings()
+    agent.closeAllSessions()
     appSettings.dispose()
     keybindings.dispose()
     terminals.closeAll()

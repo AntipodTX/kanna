@@ -454,6 +454,7 @@ export function createWsRouter({
     theme: "system",
     chatSoundPreference: "always",
     chatSoundId: "funk",
+    idleSessionTimeout: "1h",
     terminal: {
       scrollbackLines: 1_000,
       minColumnWidth: 450,
@@ -1284,6 +1285,8 @@ export function createWsRouter({
           return
         }
         case "chat.archive": {
+          await agent.cancel(command.chatId)
+          await agent.closeChat(command.chatId)
           await store.archiveChat(command.chatId)
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id })
           await broadcastFilteredSnapshots({ includeSidebar: true })
