@@ -152,6 +152,104 @@ describe("CodexAppServerManager", () => {
     ])
   })
 
+  test("rolls back an active app-server thread through the live session", async () => {
+    const processes: FakeCodexProcess[] = []
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => {
+        const process = new FakeCodexProcess((message, child) => {
+          if (message.method === "initialize") {
+            child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+          } else if (message.method === "thread/start") {
+            child.writeServerMessage({
+              id: message.id,
+              result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+            })
+          } else if (message.method === "thread/rollback") {
+            child.writeServerMessage({
+              id: message.id,
+              result: { thread: { id: "thread-1", turns: [] } },
+            })
+          }
+        })
+        processes.push(process)
+        return process as never
+      },
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    const thread = await manager.rollbackThread({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+      numTurns: 1,
+    })
+
+    expect(thread.id).toBe("thread-1")
+    expect(processes).toHaveLength(1)
+    expect(processes[0]?.messages.map((message: any) => message.method)).toEqual([
+      "initialize",
+      "initialized",
+      "thread/start",
+      "thread/rollback",
+    ])
+    const rollback = processes[0]?.messages.find((message: any) => message.method === "thread/rollback") as
+      | { method: "thread/rollback"; params: { threadId?: string; numTurns?: number } }
+      | undefined
+    expect(rollback?.params).toMatchObject({
+      threadId: "thread-1",
+      numTurns: 1,
+    })
+  })
+
+  test("resumes a stored thread before rolling back when no live session is available", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/resume") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "thread/rollback") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1", turns: [] } },
+        })
+      }
+    })
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    const thread = await manager.rollbackThread({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+      numTurns: 2,
+    })
+
+    expect(thread.id).toBe("thread-1")
+    expect(process.messages.map((message: any) => message.method)).toEqual([
+      "initialize",
+      "initialized",
+      "thread/resume",
+      "thread/rollback",
+    ])
+    expect((process.messages[2] as any).params).toMatchObject({
+      threadId: "thread-1",
+      cwd: "/tmp/project",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+      persistExtendedHistory: true,
+    })
+  })
+
   test("maps fast mode and reasoning into app-server params", async () => {
     const process = new FakeCodexProcess((message, child) => {
       if (message.method === "initialize") {

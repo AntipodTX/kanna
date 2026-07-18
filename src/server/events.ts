@@ -1,4 +1,4 @@
-import type { AgentProvider, ProjectSummary, QueuedChatMessage, TranscriptEntry } from "../shared/types"
+import type { AgentProvider, ModelOptions, ProjectSummary, QueuedChatMessage, TranscriptEntry } from "../shared/types"
 
 export interface ProjectRecord extends ProjectSummary {
   sidebarTitle?: string
@@ -17,9 +17,13 @@ export interface ChatRecord {
   doneAt?: number
   unread: boolean
   provider: AgentProvider | null
+  model?: string | null
+  modelOptions?: ModelOptions | null
   planMode: boolean
   sessionToken: string | null
   pendingForkSessionToken?: string | null
+  pendingForkResumeAt?: string | null
+  pendingForkUserPrompt?: boolean
   hasMessages?: boolean
   lastMessageAt?: number
   lastUserMessagePreview?: string
@@ -114,6 +118,14 @@ export type ChatEvent =
     }
   | {
       v: 2
+      type: "chat_model_settings_set"
+      timestamp: number
+      chatId: string
+      model: string | null
+      modelOptions: ModelOptions | null
+    }
+  | {
+      v: 2
       type: "chat_read_state_set"
       timestamp: number
       chatId: string
@@ -125,6 +137,16 @@ export type ChatEvent =
       timestamp: number
       chatId: string
       done: boolean
+    }
+  | {
+      v: 2
+      type: "chat_transcript_metadata_set"
+      timestamp: number
+      chatId: string
+      hasMessages: boolean
+      lastMessageAt: number | null
+      lastUserMessagePreview: string | null
+      lastAgentMessagePreview: string | null
     }
 
 export type MessageEvent = {
@@ -190,6 +212,20 @@ export type TurnEvent =
       timestamp: number
       chatId: string
       pendingForkSessionToken: string | null
+    }
+  | {
+      v: 2
+      type: "pending_fork_resume_at_set"
+      timestamp: number
+      chatId: string
+      pendingForkResumeAt: string | null
+    }
+  | {
+      v: 2
+      type: "pending_fork_user_prompt_set"
+      timestamp: number
+      chatId: string
+      pendingForkUserPrompt: boolean
     }
 
 export type StoreEvent = ProjectEvent | ChatEvent | MessageEvent | QueuedMessageEvent | TurnEvent

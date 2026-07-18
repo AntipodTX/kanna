@@ -3,6 +3,8 @@ import {
   applySidebarProjectOrder,
   countMatchingUserPrompts,
   getActiveChatSnapshot,
+  getEditUserPromptSendOptions,
+  getForkUserPromptSendOptions,
   getNextMeasuredInputHeight,
   getNewestRemainingChatId,
   getPreviousPrompt,
@@ -10,13 +12,14 @@ import {
   getUiUpdateReadinessPath,
   getUserPromptSignature,
   getUiUpdateRestartReconnectAction,
+  pruneLoadedHistoryForEditedPrompt,
   reconcileOptimisticUserPrompts,
   resolveComposeIntent,
   shouldHandleUiUpdateReloadRequest,
   shouldMarkActiveChatRead,
   shouldAutoFollowTranscript,
 } from "./useKannaState"
-import type { ChatAttachment, ChatSnapshot, SidebarData, UserPromptEntry } from "../../shared/types"
+import type { ChatAttachment, ChatProviderPreferences, ChatSnapshot, SidebarData, TranscriptEntry, UserPromptEntry } from "../../shared/types"
 
 function createSidebarData(): SidebarData {
   return {
@@ -281,6 +284,8 @@ describe("getActiveChatSnapshot", () => {
         status: "idle",
         isDraining: false,
         provider: "codex",
+        model: null,
+        modelOptions: null,
         planMode: false,
         sessionToken: null,
       },
@@ -307,6 +312,8 @@ describe("getActiveChatSnapshot", () => {
         status: "idle",
         isDraining: false,
         provider: "claude",
+        model: null,
+        modelOptions: null,
         planMode: false,
         sessionToken: null,
       },
@@ -321,6 +328,200 @@ describe("getActiveChatSnapshot", () => {
     }
 
     expect(getActiveChatSnapshot(snapshot, "chat-new")).toBeNull()
+  })
+})
+
+describe("pruneLoadedHistoryForEditedPrompt", () => {
+  test("drops an edited prompt and loaded messages after it", () => {
+    const entries = [
+      { _id: "before", kind: "user_prompt", content: "Before", attachments: [], createdAt: 1 },
+      { _id: "edited", kind: "user_prompt", content: "Edited", attachments: [], createdAt: 2 },
+      { _id: "after", kind: "assistant_text", text: "After", createdAt: 3 },
+    ] satisfies TranscriptEntry[]
+
+    expect(pruneLoadedHistoryForEditedPrompt(entries, "edited")).toEqual([entries[0]])
+  })
+
+  test("keeps loaded history unchanged when the edited prompt is in the recent snapshot", () => {
+    const entries = [
+      { _id: "older", kind: "user_prompt", content: "Older", attachments: [], createdAt: 1 },
+    ] satisfies TranscriptEntry[]
+
+    expect(pruneLoadedHistoryForEditedPrompt(entries, "recent")).toBe(entries)
+  })
+})
+
+describe("getEditUserPromptSendOptions", () => {
+  test("uses the current chat composer model settings instead of provider defaults", () => {
+    const providerDefaults: ChatProviderPreferences = {
+      claude: {
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "high", contextWindow: "200k", fastMode: false },
+        planMode: false,
+      },
+      codex: {
+        model: "gpt-5.5",
+        modelOptions: { reasoningEffort: "high", fastMode: false },
+        planMode: false,
+      },
+      cursor: {
+        model: "composer-2.5",
+        modelOptions: { fastMode: false },
+        planMode: false,
+      },
+    }
+
+    expect(getEditUserPromptSendOptions(
+      {
+        provider: "claude",
+        model: "claude-haiku-4-5-20251001",
+        modelOptions: { reasoningEffort: "low", contextWindow: "200k", fastMode: false },
+        planMode: true,
+      },
+      "claude",
+      providerDefaults,
+      true
+    )).toEqual({
+      model: "claude-haiku-4-5-20251001",
+      modelOptions: { claude: { reasoningEffort: "low", contextWindow: "200k", fastMode: false } },
+      planMode: true,
+    })
+  })
+
+  test("uses current chat composer settings for edits even when runtime has older settings", () => {
+    const providerDefaults: ChatProviderPreferences = {
+      claude: {
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "high", contextWindow: "200k", fastMode: false },
+        planMode: false,
+      },
+      codex: {
+        model: "gpt-5.5",
+        modelOptions: { reasoningEffort: "high", fastMode: false },
+        planMode: false,
+      },
+      cursor: {
+        model: "composer-2.5",
+        modelOptions: { fastMode: false },
+        planMode: false,
+      },
+    }
+
+    expect(getEditUserPromptSendOptions(
+      {
+        provider: "codex",
+        model: "gpt-5.5",
+        modelOptions: { reasoningEffort: "low", fastMode: true },
+        planMode: false,
+      },
+      "codex",
+      providerDefaults,
+      true,
+      {
+        chatId: "chat-1",
+        projectId: "project-1",
+        localPath: "/tmp/project",
+        title: "Chat",
+        status: "idle",
+        isDraining: false,
+        provider: "codex",
+        model: "gpt-5.4",
+        modelOptions: { codex: { reasoningEffort: "high", fastMode: false } },
+        planMode: true,
+        sessionToken: "codex-session-1",
+      }
+    )).toEqual({
+      model: "gpt-5.5",
+      modelOptions: { codex: { reasoningEffort: "low", fastMode: true } },
+      planMode: false,
+    })
+  })
+
+  test("uses Cursor defaults when an existing Cursor chat has no local composer state", () => {
+    const providerDefaults: ChatProviderPreferences = {
+      claude: {
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "high", contextWindow: "200k", fastMode: false },
+        planMode: false,
+      },
+      codex: {
+        model: "gpt-5.5",
+        modelOptions: { reasoningEffort: "high", fastMode: false },
+        planMode: false,
+      },
+      cursor: {
+        model: "composer-2.5",
+        modelOptions: { fastMode: true },
+        planMode: false,
+      },
+    }
+
+    expect(getEditUserPromptSendOptions(
+      {
+        provider: "claude",
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "high", contextWindow: "200k", fastMode: false },
+        planMode: true,
+      },
+      "cursor",
+      providerDefaults,
+      false,
+    )).toEqual({
+      model: "composer-2.5",
+      modelOptions: { cursor: { fastMode: true } },
+      planMode: false,
+    })
+  })
+})
+
+describe("getForkUserPromptSendOptions", () => {
+  test("uses persisted runtime model settings from the original chat", () => {
+    const providerDefaults: ChatProviderPreferences = {
+      claude: {
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "high", contextWindow: "200k", fastMode: false },
+        planMode: false,
+      },
+      codex: {
+        model: "gpt-5.5",
+        modelOptions: { reasoningEffort: "high", fastMode: false },
+        planMode: false,
+      },
+      cursor: {
+        model: "composer-2.5",
+        modelOptions: { fastMode: false },
+        planMode: false,
+      },
+    }
+
+    expect(getForkUserPromptSendOptions(
+      {
+        provider: "codex",
+        model: "gpt-5.5",
+        modelOptions: { reasoningEffort: "low", fastMode: true },
+        planMode: false,
+      },
+      "codex",
+      providerDefaults,
+      true,
+      {
+        chatId: "chat-1",
+        projectId: "project-1",
+        localPath: "/tmp/project",
+        title: "Chat",
+        status: "idle",
+        isDraining: false,
+        provider: "codex",
+        model: "gpt-5.4",
+        modelOptions: { codex: { reasoningEffort: "high", fastMode: false } },
+        planMode: true,
+        sessionToken: "codex-session-1",
+      }
+    )).toEqual({
+      model: "gpt-5.4",
+      modelOptions: { codex: { reasoningEffort: "high", fastMode: false } },
+      planMode: true,
+    })
   })
 })
 

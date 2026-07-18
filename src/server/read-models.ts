@@ -9,6 +9,7 @@ import type {
   SidebarData,
   SidebarProjectGroup,
 } from "../shared/types"
+import { cloneModelOptions } from "../shared/types"
 import type { ChatRecord, StoreState } from "./events"
 import { resolveLocalPath } from "./paths"
 import { SERVER_PROVIDERS } from "./provider-catalog"
@@ -226,6 +227,8 @@ export function deriveChatSnapshot(
     status: deriveStatus(chat, activeStatuses.get(chat.id)),
     isDraining: drainingChatIds.has(chat.id),
     provider: chat.provider,
+    model: chat.model ?? null,
+    modelOptions: cloneModelOptions(chat.modelOptions),
     planMode: chat.planMode,
     sessionToken: chat.sessionToken,
   }
