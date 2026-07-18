@@ -1496,18 +1496,19 @@ describe("ws-router", () => {
       lastTurnOutcome: null,
     })
 
-    const forkChatCalls: string[] = []
+    const forkChatCalls: Array<{ type: "chat.fork"; chatId: string }> = []
     const router = createWsRouter({
       store: { state } as never,
       agent: {
         getActiveStatuses: () => new Map(),
         getDrainingChatIds: () => new Set(),
-          forkChat: async (chatId: string) => {
-          forkChatCalls.push(chatId)
+        getPendingToolPreviews: () => new Map(),
+        forkChat: async (command: { type: "chat.fork"; chatId: string }) => {
+          forkChatCalls.push(command)
           state.chatsById.set("chat-fork-1", {
             id: "chat-fork-1",
             projectId: "project-1",
-            title: "Fork: Chat",
+            title: "Chat (forked)",
             createdAt: 2,
             updatedAt: 2,
             unread: false,
@@ -1556,7 +1557,7 @@ describe("ws-router", () => {
       })
     )
 
-    expect(forkChatCalls).toEqual(["chat-1"])
+    expect(forkChatCalls).toEqual([{ type: "chat.fork", chatId: "chat-1" }])
     expect(ws.sent.at(-2)).toEqual({
       v: PROTOCOL_VERSION,
       type: "ack",
@@ -1578,7 +1579,7 @@ describe("ws-router", () => {
               _id: "chat-fork-1",
               _creationTime: 2,
               chatId: "chat-fork-1",
-              title: "Fork: Chat",
+              title: "Chat (forked)",
               status: "idle",
               unread: false,
               localPath: "/tmp/project",

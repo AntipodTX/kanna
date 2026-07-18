@@ -162,6 +162,37 @@ describe("EventStore", () => {
     expect(oldestPage.olderCursor).toBeNull()
   })
 
+  test("persists replaced transcript metadata across restart", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    const first = entry("user_prompt", chat.createdAt + 1, { content: "first" })
+    const firstAnswer = entry("assistant_text", chat.createdAt + 2, { text: "first answer" })
+    const second = entry("user_prompt", chat.createdAt + 3, { content: "second" })
+    const staleAnswer = entry("assistant_text", chat.createdAt + 4, { text: "stale answer" })
+    await store.appendMessage(chat.id, first)
+    await store.appendMessage(chat.id, firstAnswer)
+    await store.appendMessage(chat.id, second)
+    await store.appendMessage(chat.id, staleAnswer)
+
+    await store.replaceTranscript(chat.id, [first, firstAnswer])
+
+    expect(store.requireChat(chat.id).lastMessageAt).toBe(first.createdAt)
+    expect(store.requireChat(chat.id).lastUserMessagePreview).toBe("first")
+    expect(store.requireChat(chat.id).lastAgentMessagePreview).toBe("first answer")
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+
+    expect(reloaded.requireChat(chat.id).hasMessages).toBe(true)
+    expect(reloaded.requireChat(chat.id).lastMessageAt).toBe(first.createdAt)
+    expect(reloaded.requireChat(chat.id).lastUserMessagePreview).toBe("first")
+    expect(reloaded.requireChat(chat.id).lastAgentMessagePreview).toBe("first answer")
+  })
+
   test("persists queued messages across restart and removes promoted entries", async () => {
     const dataDir = await createTempDataDir()
     const store = new EventStore(dataDir)
@@ -555,7 +586,7 @@ describe("EventStore", () => {
     const forked = await store.forkChat(source.id)
 
     expect(forked.id).not.toBe(source.id)
-    expect(forked.title).toBe("Fork: New Chat")
+    expect(forked.title).toBe("New Chat (forked)")
     expect(forked.provider).toBe("claude")
     expect(forked.planMode).toBe(true)
     expect(forked.sessionToken).toBeNull()
@@ -563,6 +594,120 @@ describe("EventStore", () => {
     expect(forked.lastTurnOutcome).toBeNull()
     expect(forked.lastMessageAt).toBeUndefined()
     expect(store.getMessages(forked.id)).toEqual(store.getMessages(source.id))
+  })
+
+  test("forks a chat with a selected transcript prefix", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const source = await store.createChat(project.id, { title: "Debug Session" })
+    await store.setChatProvider(source.id, "codex")
+    await store.setSessionToken(source.id, "thread-1")
+    const first = entry("user_prompt", source.createdAt + 1, { content: "first" })
+    const second = entry("assistant_text", source.createdAt + 2, { text: "done" })
+    const third = entry("user_prompt", source.createdAt + 3, { content: "second" })
+    await store.appendMessage(source.id, first)
+    await store.appendMessage(source.id, second)
+    await store.appendMessage(source.id, third)
+
+    const forked = await store.forkChat(source.id, {
+      transcriptEntries: [first, second],
+      pendingForkSessionToken: null,
+      pendingForkResumeAt: "assistant-msg-1",
+    })
+
+    expect(forked.id).not.toBe(source.id)
+    expect(forked.title).toBe("Debug Session (forked)")
+    expect(forked.provider).toBe("codex")
+    expect(forked.sessionToken).toBeNull()
+    expect(forked.pendingForkSessionToken).toBeNull()
+    expect(forked.pendingForkResumeAt).toBe("assistant-msg-1")
+    expect(store.getMessages(forked.id)).toEqual([first, second])
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    expect(reloaded.requireChat(forked.id).pendingForkResumeAt).toBe("assistant-msg-1")
+  })
+
+  test("persists a pending fork user prompt marker across reloads", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const source = await store.createChat(project.id, { title: "Claude Debug" })
+    await store.setChatProvider(source.id, "claude")
+    await store.setSessionToken(source.id, "session-1")
+    const prompt = entry("user_prompt", source.createdAt + 1, { content: "first" })
+    await store.appendMessage(source.id, prompt)
+
+    const forked = await store.forkChat(source.id, {
+      transcriptEntries: [prompt],
+      pendingForkSessionToken: null,
+      pendingForkUserPrompt: true,
+    })
+
+    expect(forked.pendingForkUserPrompt).toBe(true)
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    expect(reloaded.requireChat(forked.id).pendingForkUserPrompt).toBe(true)
+  })
+
+  test("persists chat model settings across reloads and copies them to forks", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project", "Project")
+    const chat = await store.createChat(project.id, { title: "Chat" })
+    await store.setChatProvider(chat.id, "claude")
+    await store.setPlanMode(chat.id, true)
+    await store.setSessionToken(chat.id, "claude-session-1")
+    await store.setChatModelSettings(chat.id, {
+      model: "claude-opus-4-7",
+      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "1m" } },
+    })
+    await store.compact()
+
+    const cursorChat = await store.createChat(project.id, { title: "Cursor chat" })
+    await store.setChatProvider(cursorChat.id, "cursor")
+    await store.setSessionToken(cursorChat.id, "cursor-session-1")
+    await store.setChatModelSettings(cursorChat.id, {
+      model: "composer-2.5",
+      modelOptions: { cursor: { fastMode: true } },
+    })
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    expect(reloaded.requireChat(chat.id)).toMatchObject({
+      model: "claude-opus-4-7",
+      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "1m" } },
+      planMode: true,
+    })
+    expect(reloaded.requireChat(cursorChat.id)).toMatchObject({
+      provider: "cursor",
+      model: "composer-2.5",
+      modelOptions: { cursor: { fastMode: true } },
+      planMode: false,
+    })
+
+    const forked = await reloaded.forkChat(chat.id)
+    expect(forked).toMatchObject({
+      provider: "claude",
+      model: "claude-opus-4-7",
+      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "1m" } },
+      planMode: true,
+    })
+
+    await reloaded.compact()
+    const compactedReload = new EventStore(dataDir)
+    await compactedReload.initialize()
+    expect(compactedReload.requireChat(cursorChat.id).modelOptions).toEqual({
+      cursor: { fastMode: true },
+    })
   })
 
   test("reopening a removed project restores its existing chats", async () => {

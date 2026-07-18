@@ -222,6 +222,16 @@ export type ModelOptions = Partial<{
   [K in AgentProvider]: Partial<ProviderModelOptionsByProvider[K]>
 }>
 
+export function cloneModelOptions(modelOptions: ModelOptions | null | undefined): ModelOptions | null {
+  if (!modelOptions) return null
+  return Object.fromEntries(
+    Object.entries(modelOptions).map(([provider, options]) => [
+      provider,
+      options ? { ...options } : options,
+    ])
+  ) as ModelOptions
+}
+
 export const DEFAULT_CLAUDE_MODEL_OPTIONS = {
   reasoningEffort: "high",
   contextWindow: "1m",
@@ -1238,6 +1248,8 @@ export interface ChatRuntime {
   status: KannaStatus
   isDraining: boolean
   provider: AgentProvider | null
+  model: string | null
+  modelOptions: ModelOptions | null
   planMode: boolean
   sessionToken: string | null
 }

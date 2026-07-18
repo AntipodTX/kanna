@@ -56,6 +56,20 @@ export interface ThreadForkParams {
   persistExtendedHistory: boolean
 }
 
+export interface ThreadRollbackParams {
+  threadId: string
+  numTurns: number
+}
+
+export interface Thread {
+  id: string
+  turns?: unknown[]
+}
+
+export interface ThreadRollbackResponse {
+  thread: Thread
+}
+
 export interface TextUserInput {
   type: "text"
   text: string

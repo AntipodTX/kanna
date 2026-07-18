@@ -1304,7 +1304,7 @@ export function createWsRouter({
           return
         }
         case "chat.fork": {
-          const result = await agent.forkChat(command.chatId)
+          const result = await agent.forkChat(command)
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
           await broadcastFilteredSnapshots({ includeSidebar: true })
           return
@@ -1555,6 +1555,11 @@ export function createWsRouter({
         case "chat.stopDraining": {
           await agent.stopDraining(command.chatId)
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id })
+          return
+        }
+        case "chat.editUserPrompt": {
+          const result = await agent.editUserPrompt(command)
+          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
           return
         }
         case "chat.exportStandalone": {

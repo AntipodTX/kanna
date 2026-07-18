@@ -23,6 +23,12 @@ import {
 } from "./utils"
 import type { EditorOpenSettings, EditorPreset, OpenExternalAction } from "../../../shared/protocol"
 
+interface TranscriptViewportExtraData {
+  toolGroupExpanded: Record<string, boolean>
+  isEditUserPromptDisabled: boolean
+  isForkUserPromptDisabled: boolean
+}
+
 interface ChatTranscriptViewportProps {
   activeChatId: string | null
   listRef: React.RefObject<LegendListRef | null>
@@ -44,6 +50,10 @@ interface ChatTranscriptViewportProps {
   onOpenLocalLink: KannaState["handleOpenLocalLink"]
   onAskUserQuestionSubmit: KannaState["handleAskUserQuestion"]
   onExitPlanModeConfirm: KannaState["handleExitPlanMode"]
+  onEditUserPrompt?: KannaState["handleEditUserPrompt"]
+  isEditUserPromptDisabled?: boolean
+  onForkUserPrompt?: KannaState["handleForkUserPrompt"]
+  isForkUserPromptDisabled?: boolean
   showScrollButton: boolean
   onIsAtEndChange: (isAtEnd: boolean) => void
   scrollToBottom: () => void
@@ -80,6 +90,10 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
   onOpenLocalLink,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  onEditUserPrompt,
+  isEditUserPromptDisabled = false,
+  onForkUserPrompt,
+  isForkUserPromptDisabled = false,
   showScrollButton,
   onIsAtEndChange,
   scrollToBottom,
@@ -214,17 +228,27 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
     })
   }, [onOpenLocalLink])
 
-  const renderItem = useCallback(({ item }: { item: ResolvedTranscriptRow }) => (
+  const transcriptExtraData = useMemo<TranscriptViewportExtraData>(() => ({
+    toolGroupExpanded,
+    isEditUserPromptDisabled,
+    isForkUserPromptDisabled,
+  }), [isEditUserPromptDisabled, isForkUserPromptDisabled, toolGroupExpanded])
+
+  const renderItem = useCallback(({ item, extraData }: { item: ResolvedTranscriptRow; extraData: TranscriptViewportExtraData }) => (
     <div className="mx-auto w-full max-w-[800px] pb-5" data-transcript-row-id={item.id}>
       <KannaTranscriptRow
         row={item}
-        toolGroupExpanded={item.kind === "tool-group" ? (toolGroupExpanded[item.id] ?? false) : undefined}
+        toolGroupExpanded={item.kind === "tool-group" ? (extraData.toolGroupExpanded[item.id] ?? false) : undefined}
         onToolGroupExpandedChange={handleToolGroupExpandedChange}
         onAskUserQuestionSubmit={onAskUserQuestionSubmit}
         onExitPlanModeConfirm={onExitPlanModeConfirm}
+        onEditUserPrompt={onEditUserPrompt}
+        isEditUserPromptDisabled={extraData.isEditUserPromptDisabled}
+        onForkUserPrompt={onForkUserPrompt}
+        isForkUserPromptDisabled={extraData.isForkUserPromptDisabled}
       />
     </div>
-  ), [handleToolGroupExpandedChange, onAskUserQuestionSubmit, onExitPlanModeConfirm, toolGroupExpanded])
+  ), [handleToolGroupExpandedChange, onAskUserQuestionSubmit, onEditUserPrompt, onExitPlanModeConfirm, onForkUserPrompt])
 
   const listHeader = (
     <div className="mx-auto w-full max-w-[800px]" style={{ paddingTop: `${headerOffsetPx}px` }}>
@@ -271,7 +295,7 @@ export const ChatTranscriptViewport = memo(function ChatTranscriptViewport({
         <LegendList<ResolvedTranscriptRow>
           ref={listRef}
           data={resolvedRows}
-          extraData={toolGroupExpanded}
+          extraData={transcriptExtraData}
           keyExtractor={keyExtractor}
           renderItem={renderItem}
           estimatedItemSize={96}

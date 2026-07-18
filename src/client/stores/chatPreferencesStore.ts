@@ -18,6 +18,7 @@ import {
   type CodexModelOptions,
   type CursorModelOptions,
   type DefaultProviderPreference,
+  type ModelOptions,
   type ProviderPreference,
   type ProviderModelOptionsByProvider,
 } from "../../shared/types"
@@ -212,7 +213,7 @@ export function normalizeProviderPreference(
   }
 }
 
-function composerStateForProvider(provider: AgentProvider, value?: ProviderPreferenceInput): ComposerState {
+export function composerStateForProvider(provider: AgentProvider, value?: ProviderPreferenceInput): ComposerState {
   switch (provider) {
     case "claude":
       return { provider, ...normalizeClaudePreference(value) }
@@ -223,6 +224,20 @@ function composerStateForProvider(provider: AgentProvider, value?: ProviderPrefe
     default:
       return assertNever(provider)
   }
+}
+
+export function composerStateFromModelSettings(settings?: {
+  provider?: AgentProvider | null
+  model?: string | null
+  modelOptions?: ModelOptions | null
+  planMode?: boolean
+} | null): ComposerState | null {
+  if (!settings?.provider || !settings.model) return null
+  return composerStateForProvider(settings.provider, {
+    model: settings.model,
+    modelOptions: settings.modelOptions?.[settings.provider],
+    planMode: settings.planMode,
+  })
 }
 
 export function createDefaultProviderDefaults(): ChatProviderPreferences {
@@ -470,6 +485,7 @@ interface ChatPreferencesState {
   defaultProvider: DefaultProviderPreference
   providerDefaults: ChatProviderPreferences
   chatStates: Record<string, ComposerState>
+  runtimeHydratedChatIds: Record<string, true>
   legacyComposerState: ComposerState | null
   setDefaultProvider: (provider: DefaultProviderPreference) => void
   syncProviderDefaults: (defaultProvider: DefaultProviderPreference, providerDefaults: ChatProviderPreferences) => void
@@ -482,6 +498,7 @@ interface ChatPreferencesState {
   getComposerState: (chatId: string) => ComposerState
   initializeComposerForChat: (chatId: string, options?: { sourceState?: ComposerState | null }) => void
   setComposerState: (chatId: string, composerState: ComposerState) => void
+  hydrateComposerFromRuntime: (chatId: string, composerState: ComposerState) => void
   setChatComposerProvider: (chatId: string, provider: AgentProvider) => void
   setChatComposerModel: (chatId: string, model: string) => void
   setChatComposerModelOptions: (
@@ -522,6 +539,7 @@ export const useChatPreferencesStore = create<ChatPreferencesState>()(
     defaultProvider: "last_used",
     providerDefaults: createDefaultProviderDefaults(),
     chatStates: {},
+    runtimeHydratedChatIds: {},
     legacyComposerState: null,
     setDefaultProvider: (defaultProvider) => set({ defaultProvider }),
     syncProviderDefaults: (defaultProvider, providerDefaults) =>
@@ -539,7 +557,9 @@ export const useChatPreferencesStore = create<ChatPreferencesState>()(
         const chatStates = Object.fromEntries(
           Object.entries(state.chatStates).map(([chatId, composerState]) => [
             chatId,
-            sameComposerState(composerState, oldNewChatFallback) ? nextNewChatFallback : composerState,
+            !state.runtimeHydratedChatIds[chatId] && sameComposerState(composerState, oldNewChatFallback)
+              ? nextNewChatFallback
+              : composerState,
           ])
         )
 
@@ -606,21 +626,18 @@ export const useChatPreferencesStore = create<ChatPreferencesState>()(
         set((state) => ({
           chatStates: {
             ...state.chatStates,
-            [chatId]: composerState.provider === "claude"
-              ? {
-                provider: "claude",
-                model: normalizeClaudePreference(composerState).model,
-                modelOptions: normalizeClaudePreference(composerState).modelOptions,
-                planMode: composerState.planMode,
-              }
-              : composerState.provider === "codex"
-                ? {
-                  provider: "codex",
-                  model: normalizeCodexPreference(composerState).model,
-                  modelOptions: normalizeCodexPreference(composerState).modelOptions,
-                  planMode: composerState.planMode,
-                }
-                : cloneComposerState(composerState),
+            [chatId]: composerStateForProvider(composerState.provider, composerState),
+          },
+        })),
+      hydrateComposerFromRuntime: (chatId, composerState) =>
+        set((state) => ({
+          chatStates: {
+            ...state.chatStates,
+            [chatId]: composerStateForProvider(composerState.provider, composerState),
+          },
+          runtimeHydratedChatIds: {
+            ...state.runtimeHydratedChatIds,
+            [chatId]: true,
           },
         })),
       setChatComposerProvider: (chatId, provider) =>

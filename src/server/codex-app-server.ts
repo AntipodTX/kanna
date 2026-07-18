@@ -34,7 +34,10 @@ import {
   type PlanDeltaNotification,
   type ServerNotification,
   type ServerRequest,
+  type Thread,
   type ThreadItem,
+  type ThreadRollbackParams,
+  type ThreadRollbackResponse,
   type ThreadResumeParams,
   type ThreadResumeResponse,
   type ThreadForkParams,
@@ -688,6 +691,35 @@ export class CodexAppServerManager {
       }) as unknown as CodexAppServerProcess)
   }
 
+  async rollbackThread(args: { chatId?: string; cwd: string; threadId: string; numTurns: number }): Promise<Thread> {
+    const activeContext = args.chatId ? this.sessions.get(args.chatId) : null
+    if (activeContext && !activeContext.closed && activeContext.cwd === args.cwd && activeContext.sessionToken === args.threadId) {
+      if (activeContext.pendingTurn) {
+        throw new Error("Cannot rollback Codex thread while a turn is running")
+      }
+      const response = await this.sendRequest<ThreadRollbackResponse>(activeContext, "thread/rollback", {
+        threadId: args.threadId,
+        numTurns: args.numTurns,
+      } satisfies ThreadRollbackParams)
+      return response.thread
+    }
+
+    return await this.withUtilityContext(args.cwd, async (context) => {
+      await this.sendRequest<ThreadResumeResponse>(context, "thread/resume", {
+        threadId: args.threadId,
+        cwd: args.cwd,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+        persistExtendedHistory: true,
+      } satisfies ThreadResumeParams)
+      const response = await this.sendRequest<ThreadRollbackResponse>(context, "thread/rollback", {
+        threadId: args.threadId,
+        numTurns: args.numTurns,
+      } satisfies ThreadRollbackParams)
+      return response.thread
+    })
+  }
+
   async startSession(args: StartCodexSessionArgs) {
     const existing = this.sessions.get(args.chatId)
     if (existing && !existing.closed && existing.cwd === args.cwd && !args.pendingForkSessionToken) {
@@ -919,6 +951,46 @@ export class CodexAppServerManager {
   stopAll() {
     for (const chatId of this.sessions.keys()) {
       this.stopSession(chatId)
+    }
+  }
+
+  private async withUtilityContext<TResult>(cwd: string, callback: (context: SessionContext) => Promise<TResult>) {
+    const child = this.spawnProcess(cwd)
+    const context: SessionContext = {
+      chatId: `utility-${randomUUID()}`,
+      cwd,
+      child,
+      pendingRequests: new Map(),
+      pendingTurn: null,
+      sessionToken: null,
+      stderrLines: [],
+      closed: false,
+    }
+    this.attachListeners(context)
+
+    try {
+      await this.sendRequest(context, "initialize", {
+        clientInfo: {
+          name: "kanna_desktop",
+          title: "Kanna",
+          version: "0.1.0",
+        },
+        capabilities: {
+          experimentalApi: true,
+        },
+      } satisfies InitializeParams)
+      this.writeMessage(context, {
+        method: "initialized",
+      })
+      return await callback(context)
+    } finally {
+      context.closed = true
+      context.pendingTurn?.queue.finish()
+      try {
+        context.child.kill("SIGKILL")
+      } catch {
+        // ignore kill failures
+      }
     }
   }
 

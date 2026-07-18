@@ -115,17 +115,27 @@ export function normalizeServerModel(provider: AgentProvider, model?: string): s
 export function normalizeClaudeModelOptions(
   model: string,
   modelOptions?: ModelOptions,
-  legacyEffort?: string
+  legacyEffort?: string,
+  fallbackModelOptions?: ModelOptions,
 ): ClaudeModelOptions {
   const reasoningEffort = modelOptions?.claude?.reasoningEffort
+  const fallbackReasoningEffort = fallbackModelOptions?.claude?.reasoningEffort
   return {
     reasoningEffort: isClaudeReasoningEffort(reasoningEffort)
       ? reasoningEffort
       : isClaudeReasoningEffort(legacyEffort)
         ? legacyEffort
-        : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort,
-    contextWindow: normalizeClaudeContextWindow(model, modelOptions?.claude?.contextWindow as ClaudeContextWindow | undefined),
-    fastMode: normalizeClaudeFastMode(model, modelOptions?.claude?.fastMode),
+        : isClaudeReasoningEffort(fallbackReasoningEffort)
+          ? fallbackReasoningEffort
+          : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort,
+    contextWindow: normalizeClaudeContextWindow(
+      model,
+      (modelOptions?.claude?.contextWindow ?? fallbackModelOptions?.claude?.contextWindow) as ClaudeContextWindow | undefined,
+    ),
+    fastMode: normalizeClaudeFastMode(
+      model,
+      modelOptions?.claude?.fastMode ?? fallbackModelOptions?.claude?.fastMode,
+    ),
   }
 }
 
@@ -133,16 +143,28 @@ export function normalizeCodexModelOptions(
   model: string,
   modelOptions?: ModelOptions,
   legacyEffort?: string,
+  fallbackModelOptions?: ModelOptions,
 ): CodexModelOptions {
   const reasoningEffort = modelOptions?.codex?.reasoningEffort
+  const fallbackReasoningEffort = fallbackModelOptions?.codex?.reasoningEffort
   return {
     reasoningEffort: normalizeCodexReasoningEffort(
       model,
-      isCodexReasoningEffort(reasoningEffort) ? reasoningEffort : legacyEffort,
+      isCodexReasoningEffort(reasoningEffort)
+        ? reasoningEffort
+        : isCodexReasoningEffort(legacyEffort)
+          ? legacyEffort
+          : fallbackReasoningEffort,
     ),
     // Spawn-time gating: fast mode only reaches models that support it
     // (per Codex docs: GPT-5.6/5.5/5.4 — not 5.3 Codex or Spark).
-    fastMode: supportsProviderFastMode("codex", model) && modelOptions?.codex?.fastMode === true,
+    fastMode: supportsProviderFastMode("codex", model) && (
+      typeof modelOptions?.codex?.fastMode === "boolean"
+        ? modelOptions.codex.fastMode
+        : typeof fallbackModelOptions?.codex?.fastMode === "boolean"
+          ? fallbackModelOptions.codex.fastMode
+          : false
+    ),
   }
 }
 
@@ -151,11 +173,16 @@ export function serviceTierFromModelOptions(modelOptions: { fastMode: boolean })
   return modelOptions.fastMode ? "fast" : undefined
 }
 
-export function normalizeCursorModelOptions(modelOptions?: ModelOptions): CursorModelOptions {
+export function normalizeCursorModelOptions(
+  modelOptions?: ModelOptions,
+  fallbackModelOptions?: ModelOptions,
+): CursorModelOptions {
   return {
     fastMode: typeof modelOptions?.cursor?.fastMode === "boolean"
       ? modelOptions.cursor.fastMode
-      : DEFAULT_CURSOR_MODEL_OPTIONS.fastMode,
+      : typeof fallbackModelOptions?.cursor?.fastMode === "boolean"
+        ? fallbackModelOptions.cursor.fastMode
+        : DEFAULT_CURSOR_MODEL_OPTIONS.fastMode,
   }
 }
 

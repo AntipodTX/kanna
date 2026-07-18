@@ -3,8 +3,8 @@ import { existsSync, readFileSync as readFileSyncImmediate } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { getDataDir, LOG_PREFIX } from "../shared/branding"
-import type { AgentProvider, ChatHistoryPage, ChatHistorySnapshot, QueuedChatMessage, TranscriptEntry } from "../shared/types"
-import { STORE_VERSION } from "../shared/types"
+import type { AgentProvider, ChatHistoryPage, ChatHistorySnapshot, ModelOptions, QueuedChatMessage, TranscriptEntry } from "../shared/types"
+import { cloneModelOptions, STORE_VERSION } from "../shared/types"
 import {
   type ChatEvent,
   type ProjectEvent,
@@ -97,30 +97,35 @@ function getReplayEventPriority(event: StoreEvent) {
     case "chat_renamed":
     case "chat_provider_set":
     case "chat_plan_mode_set":
+    case "chat_model_settings_set":
       return 2
     case "message_appended":
       return 3
+    case "chat_transcript_metadata_set":
+      return 4
     case "queued_message_enqueued":
     case "queued_message_removed":
-      return 4
-    case "turn_started":
       return 5
+    case "turn_started":
+      return 6
     case "session_token_set":
-      return 6
-    case "pending_fork_session_token_set":
-      return 6
-    case "turn_cancelled":
       return 7
+    case "pending_fork_session_token_set":
+    case "pending_fork_resume_at_set":
+    case "pending_fork_user_prompt_set":
+      return 7
+    case "turn_cancelled":
+      return 8
     case "turn_finished":
     case "turn_failed":
-      return 8
+      return 9
     case "chat_read_state_set":
     case "chat_done_state_set":
-      return 9
+      return 10
     case "chat_deleted":
     case "chat_archived":
     case "chat_unarchived":
-      return 10
+      return 11
   }
 }
 
@@ -150,8 +155,11 @@ function getHistorySnapshot(page: TranscriptPageResult, recentLimit: number): Ch
 
 function getForkedChatTitle(title: string) {
   const trimmed = title.trim()
-  if (!trimmed) return "Fork: New Chat"
-  return trimmed.startsWith("Fork: ") ? trimmed : `Fork: ${trimmed}`
+  return `${trimmed || "New Chat"} (forked)`
+}
+
+function sameModelOptions(left: ModelOptions | null | undefined, right: ModelOptions | null | undefined) {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null)
 }
 
 export class EventStore {
@@ -278,7 +286,11 @@ export class EventStore {
         this.state.chatsById.set(chat.id, {
           ...chat,
           unread: chat.unread ?? false,
+          model: chat.model ?? null,
+          modelOptions: cloneModelOptions(chat.modelOptions),
           pendingForkSessionToken: chat.pendingForkSessionToken ?? null,
+          pendingForkResumeAt: chat.pendingForkResumeAt ?? null,
+          pendingForkUserPrompt: Boolean(chat.pendingForkUserPrompt),
         })
       }
       this.legacySidebarProjectOrder = normalizeSidebarProjectOrder(parsed.sidebarProjectOrder)
@@ -511,9 +523,13 @@ export class EventStore {
           updatedAt: event.timestamp,
           unread: false,
           provider: null,
+          model: null,
+          modelOptions: null,
           planMode: false,
           sessionToken: null,
           pendingForkSessionToken: null,
+          pendingForkResumeAt: null,
+          pendingForkUserPrompt: false,
           hasMessages: false,
           lastTurnOutcome: null,
         }
@@ -563,6 +579,14 @@ export class EventStore {
         chat.updatedAt = event.timestamp
         break
       }
+      case "chat_model_settings_set": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (!chat) break
+        chat.model = event.model
+        chat.modelOptions = cloneModelOptions(event.modelOptions)
+        chat.updatedAt = event.timestamp
+        break
+      }
       case "chat_read_state_set": {
         const chat = this.state.chatsById.get(event.chatId)
         if (!chat) break
@@ -579,6 +603,15 @@ export class EventStore {
           delete chat.doneAt
         }
         chat.updatedAt = event.timestamp
+        break
+      }
+      case "chat_transcript_metadata_set": {
+        this.applyTranscriptMetadata(event.chatId, {
+          hasMessages: event.hasMessages,
+          lastMessageAt: event.lastMessageAt,
+          lastUserMessagePreview: event.lastUserMessagePreview,
+          lastAgentMessagePreview: event.lastAgentMessagePreview,
+        }, event.timestamp)
         break
       }
       case "message_appended": {
@@ -660,6 +693,20 @@ export class EventStore {
         chat.updatedAt = event.timestamp
         break
       }
+      case "pending_fork_resume_at_set": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (!chat) break
+        chat.pendingForkResumeAt = event.pendingForkResumeAt
+        chat.updatedAt = event.timestamp
+        break
+      }
+      case "pending_fork_user_prompt_set": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (!chat) break
+        chat.pendingForkUserPrompt = event.pendingForkUserPrompt
+        chat.updatedAt = event.timestamp
+        break
+      }
     }
   }
 
@@ -678,6 +725,37 @@ export class EventStore {
       if (preview) chat.lastAgentMessagePreview = preview
     }
     chat.updatedAt = Math.max(chat.updatedAt, entry.createdAt)
+  }
+
+  private applyTranscriptMetadata(
+    chatId: string,
+    metadata: {
+      hasMessages: boolean
+      lastMessageAt: number | null
+      lastUserMessagePreview: string | null
+      lastAgentMessagePreview: string | null
+    },
+    timestamp: number
+  ) {
+    const chat = this.state.chatsById.get(chatId)
+    if (!chat) return
+    chat.hasMessages = metadata.hasMessages
+    if (metadata.lastMessageAt === null) {
+      delete chat.lastMessageAt
+    } else {
+      chat.lastMessageAt = metadata.lastMessageAt
+    }
+    if (metadata.lastUserMessagePreview === null) {
+      delete chat.lastUserMessagePreview
+    } else {
+      chat.lastUserMessagePreview = metadata.lastUserMessagePreview
+    }
+    if (metadata.lastAgentMessagePreview === null) {
+      delete chat.lastAgentMessagePreview
+    } else {
+      chat.lastAgentMessagePreview = metadata.lastAgentMessagePreview
+    }
+    chat.updatedAt = Math.max(chat.updatedAt, timestamp)
   }
 
   private append<TEvent extends StoreEvent>(filePath: string, event: TEvent) {
@@ -792,7 +870,7 @@ export class EventStore {
     return this.writeChain
   }
 
-  async createChat(projectId: string) {
+  async createChat(projectId: string, options: { title?: string } = {}) {
     const project = this.state.projectsById.get(projectId)
     if (!project || project.deletedAt) {
       throw new Error("Project not found")
@@ -804,16 +882,27 @@ export class EventStore {
       timestamp: Date.now(),
       chatId,
       projectId,
-      title: "New Chat",
+      title: options.title?.trim() || "New Chat",
     }
     await this.append(this.chatsLogPath, event)
     return this.state.chatsById.get(chatId)!
   }
 
-  async forkChat(sourceChatId: string) {
+  async forkChat(
+    sourceChatId: string,
+    options: {
+      transcriptEntries?: TranscriptEntry[]
+      pendingForkSessionToken?: string | null
+      pendingForkResumeAt?: string | null
+      pendingForkUserPrompt?: boolean
+    } = {}
+  ) {
     const sourceChat = this.requireChat(sourceChatId)
     const sourceSessionToken = sourceChat.sessionToken ?? sourceChat.pendingForkSessionToken ?? null
-    if (!sourceChat.provider || !sourceSessionToken) {
+    const pendingForkSessionToken = options.pendingForkSessionToken !== undefined
+      ? options.pendingForkSessionToken
+      : sourceSessionToken
+    if (!sourceChat.provider || (!sourceSessionToken && options.pendingForkSessionToken === undefined)) {
       throw new Error("Chat cannot be forked")
     }
 
@@ -830,9 +919,15 @@ export class EventStore {
     await this.append(this.chatsLogPath, createEvent)
     await this.setChatProvider(chatId, sourceChat.provider)
     await this.setPlanMode(chatId, sourceChat.planMode)
-    await this.setPendingForkSessionToken(chatId, sourceSessionToken)
+    await this.setChatModelSettings(chatId, {
+      model: sourceChat.model ?? null,
+      modelOptions: cloneModelOptions(sourceChat.modelOptions),
+    })
+    await this.setPendingForkSessionToken(chatId, pendingForkSessionToken)
+    await this.setPendingForkResumeAt(chatId, options.pendingForkResumeAt ?? null)
+    await this.setPendingForkUserPrompt(chatId, Boolean(options.pendingForkUserPrompt))
 
-    const sourceEntries = this.getMessages(sourceChatId)
+    const sourceEntries = options.transcriptEntries ?? this.getMessages(sourceChatId)
     if (sourceEntries.length > 0) {
       const transcriptPath = this.transcriptPath(chatId)
       const payload = sourceEntries.map((entry) => JSON.stringify(entry)).join("\n")
@@ -971,6 +1066,22 @@ export class EventStore {
     await this.append(this.chatsLogPath, event)
   }
 
+  async setChatModelSettings(chatId: string, settings: { model: string | null; modelOptions: ModelOptions | null }) {
+    const chat = this.requireChat(chatId)
+    const model = settings.model?.trim() || null
+    const modelOptions = cloneModelOptions(settings.modelOptions)
+    if (chat.model === model && sameModelOptions(chat.modelOptions, modelOptions)) return
+    const event: ChatEvent = {
+      v: STORE_VERSION,
+      type: "chat_model_settings_set",
+      timestamp: Date.now(),
+      chatId,
+      model,
+      modelOptions,
+    }
+    await this.append(this.chatsLogPath, event)
+  }
+
   async setChatReadState(chatId: string, unread: boolean) {
     const chat = this.requireChat(chatId)
     if (chat.unread === unread) return
@@ -1022,6 +1133,26 @@ export class EventStore {
         appendMs: Number((afterAppendAt - beforeAppendAt).toFixed(1)),
         totalMs: Number((afterAppendAt - queuedAt).toFixed(1)),
       })
+    })
+    return this.writeChain
+  }
+
+  async replaceTranscript(chatId: string, entries: TranscriptEntry[]) {
+    this.requireChat(chatId)
+    const transcriptPath = this.transcriptPath(chatId)
+    const tempPath = `${transcriptPath}.${crypto.randomUUID()}.tmp`
+    const payload = entries.map((entry) => JSON.stringify(entry)).join("\n")
+    const metadataEvent = this.createTranscriptMetadataEvent(chatId, entries)
+    this.writeChain = this.writeChain.then(async () => {
+      await mkdir(this.transcriptsDir, { recursive: true })
+      await writeFile(tempPath, payload ? `${payload}\n` : "", "utf8")
+      await rename(tempPath, transcriptPath)
+      await appendFile(this.chatsLogPath, `${JSON.stringify(metadataEvent)}\n`, "utf8")
+      this.applyEvent(metadataEvent)
+      this.cachedTranscript = {
+        chatId,
+        entries: cloneTranscriptEntries(entries),
+      }
     })
     return this.writeChain
   }
@@ -1132,6 +1263,32 @@ export class EventStore {
       timestamp: Date.now(),
       chatId,
       pendingForkSessionToken,
+    }
+    await this.append(this.turnsLogPath, event)
+  }
+
+  async setPendingForkResumeAt(chatId: string, pendingForkResumeAt: string | null) {
+    const chat = this.requireChat(chatId)
+    if ((chat.pendingForkResumeAt ?? null) === pendingForkResumeAt) return
+    const event: TurnEvent = {
+      v: STORE_VERSION,
+      type: "pending_fork_resume_at_set",
+      timestamp: Date.now(),
+      chatId,
+      pendingForkResumeAt,
+    }
+    await this.append(this.turnsLogPath, event)
+  }
+
+  async setPendingForkUserPrompt(chatId: string, pendingForkUserPrompt: boolean) {
+    const chat = this.requireChat(chatId)
+    if (Boolean(chat.pendingForkUserPrompt) === pendingForkUserPrompt) return
+    const event: TurnEvent = {
+      v: STORE_VERSION,
+      type: "pending_fork_user_prompt_set",
+      timestamp: Date.now(),
+      chatId,
+      pendingForkUserPrompt,
     }
     await this.append(this.turnsLogPath, event)
   }
@@ -1293,7 +1450,7 @@ export class EventStore {
       projects: this.listProjects().map((project) => ({ ...project })),
       chats: [...this.state.chatsById.values()]
         .filter((chat) => !chat.deletedAt)
-        .map((chat) => ({ ...chat })),
+        .map((chat) => ({ ...chat, modelOptions: cloneModelOptions(chat.modelOptions) })),
       queuedMessages: [...this.state.queuedMessagesByChatId.entries()]
         .map(([chatId, entries]) => ({
           chatId,
@@ -1302,6 +1459,39 @@ export class EventStore {
             attachments: [...entry.attachments],
           })),
         })),
+    }
+  }
+
+  private createTranscriptMetadataEvent(chatId: string, entries: TranscriptEntry[]): ChatEvent {
+    let lastMessageAt: number | undefined
+    let lastUserMessagePreview: string | undefined
+    let lastAgentMessagePreview: string | undefined
+    for (const entry of entries) {
+      if (entry.kind === "user_prompt") {
+        lastMessageAt = Math.max(lastMessageAt ?? 0, entry.createdAt)
+        if (!entry.hidden) {
+          const preview = buildChatMessagePreview(entry.content)
+          if (preview) {
+            lastUserMessagePreview = preview
+          }
+        }
+      } else if (entry.kind === "assistant_text" && !entry.hidden) {
+        const preview = buildChatMessagePreview(entry.text)
+        if (preview) {
+          lastAgentMessagePreview = preview
+        }
+      }
+    }
+
+    return {
+      v: STORE_VERSION,
+      type: "chat_transcript_metadata_set",
+      timestamp: Date.now(),
+      chatId,
+      hasMessages: entries.length > 0,
+      lastMessageAt: lastMessageAt ?? null,
+      lastUserMessagePreview: lastUserMessagePreview ?? null,
+      lastAgentMessagePreview: lastAgentMessagePreview ?? null,
     }
   }
 
@@ -1336,6 +1526,8 @@ export class EventStore {
       const payload = entries.map((entry) => JSON.stringify(entry)).join("\n")
       await writeFile(tempPath, payload ? `${payload}\n` : "", "utf8")
       await rename(tempPath, transcriptPath)
+      const metadataEvent = this.createTranscriptMetadataEvent(chatId, entries)
+      this.applyEvent(metadataEvent)
       if (logEveryChat || (index + 1) % 25 === 0 || index === messageSets.length - 1) {
         onProgress?.(`${LOG_PREFIX} transcript migration: ${index + 1}/${messageSets.length} chats`)
       }

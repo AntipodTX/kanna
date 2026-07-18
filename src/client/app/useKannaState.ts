@@ -1,8 +1,14 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router-dom"
 import { useShallow } from "zustand/react/shallow"
-import { PROVIDERS, type AgentProvider, type AppSettingsPatch, type AppSettingsSnapshot, type AskUserQuestionAnswerMap, type ChatAttachment, type ChatDiffSnapshot, type ChatHistoryPage, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type TranscriptEntry, type UpdateInstallResult, type UpdateSnapshot, type UserPromptEntry } from "../../shared/types"
-import { NEW_CHAT_COMPOSER_ID, type ComposerState, useChatPreferencesStore } from "../stores/chatPreferencesStore"
+import { PROVIDERS, type AgentProvider, type AppSettingsPatch, type AppSettingsSnapshot, type AskUserQuestionAnswerMap, type ChatAttachment, type ChatDiffSnapshot, type ChatHistoryPage, type ChatProviderPreferences, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type TranscriptEntry, type UpdateInstallResult, type UpdateSnapshot, type UserPromptEntry } from "../../shared/types"
+import {
+  composerStateForProvider,
+  composerStateFromModelSettings,
+  NEW_CHAT_COMPOSER_ID,
+  type ComposerState,
+  useChatPreferencesStore,
+} from "../stores/chatPreferencesStore"
 import { useRightSidebarStore } from "../stores/rightSidebarStore"
 import { useTerminalLayoutStore } from "../stores/terminalLayoutStore"
 import { getEditorPresetLabel, useTerminalPreferencesStore } from "../stores/terminalPreferencesStore"
@@ -30,6 +36,8 @@ function sameRuntime(left: ChatSnapshot["runtime"] | null | undefined, right: Ch
     && left.status === right.status
     && left.isDraining === right.isDraining
     && left.provider === right.provider
+    && left.model === right.model
+    && JSON.stringify(left.modelOptions) === JSON.stringify(right.modelOptions)
     && left.planMode === right.planMode
     && left.sessionToken === right.sessionToken
 }
@@ -180,6 +188,11 @@ function mergeTranscriptEntries(olderHistoryEntries: TranscriptEntry[], recentEn
     deduped.set(entry._id, entry)
   }
   return [...deduped.values()]
+}
+
+export function pruneLoadedHistoryForEditedPrompt(entries: TranscriptEntry[], messageId: string) {
+  const editedIndex = entries.findIndex((entry) => entry._id === messageId)
+  return editedIndex >= 0 ? entries.slice(0, editedIndex) : entries
 }
 
 export function getPreviousPrompt(messages: ReturnType<typeof processTranscriptMessages>) {
@@ -481,38 +494,56 @@ function logSendToStartingTrace(
   })
 }
 
-function composerStateFromSendOptions(options?: {
-  provider?: AgentProvider
-  model?: string
-  modelOptions?: ModelOptions
-  planMode?: boolean
-}): ComposerState | null {
-  if (options?.provider === "claude" && options.model && options.modelOptions?.claude) {
-    return {
-      provider: "claude",
-      model: options.model,
-      modelOptions: {
-        reasoningEffort: options.modelOptions.claude.reasoningEffort ?? "high",
-        contextWindow: options.modelOptions.claude.contextWindow ?? "1m",
-        fastMode: options.modelOptions.claude.fastMode ?? false,
-      },
-      planMode: Boolean(options.planMode),
-    }
+function getComposerStateForActiveProvider(
+  composerState: ComposerState,
+  activeProvider: AgentProvider | null,
+  providerDefaults: ChatProviderPreferences
+): ComposerState {
+  if (!activeProvider || composerState.provider === activeProvider) {
+    return composerState
   }
 
-  if (options?.provider === "codex" && options.model && options.modelOptions?.codex) {
-    return {
-      provider: "codex",
-      model: options.model,
-      modelOptions: {
-        reasoningEffort: options.modelOptions.codex.reasoningEffort ?? "medium",
-        fastMode: options.modelOptions.codex.fastMode ?? false,
-      },
-      planMode: Boolean(options.planMode),
-    }
-  }
+  return composerStateForProvider(activeProvider, {
+    ...providerDefaults[activeProvider],
+    planMode: composerState.planMode,
+  })
+}
 
-  return null
+function getComposerStateModelOptions(composerState: ComposerState): ModelOptions {
+  return {
+    [composerState.provider]: { ...composerState.modelOptions },
+  } as ModelOptions
+}
+
+export function getEditUserPromptSendOptions(
+  composerState: ComposerState,
+  activeProvider: AgentProvider | null,
+  providerDefaults: ChatProviderPreferences,
+  supportsPlanMode: boolean,
+  _runtime?: ChatSnapshot["runtime"] | null
+): { model: string; modelOptions: ModelOptions; planMode: boolean } {
+  const providerComposerState = getComposerStateForActiveProvider(composerState, activeProvider, providerDefaults)
+  return {
+    model: providerComposerState.model,
+    modelOptions: getComposerStateModelOptions(providerComposerState),
+    planMode: supportsPlanMode ? providerComposerState.planMode : false,
+  }
+}
+
+export function getForkUserPromptSendOptions(
+  composerState: ComposerState,
+  activeProvider: AgentProvider | null,
+  providerDefaults: ChatProviderPreferences,
+  supportsPlanMode: boolean,
+  runtime?: ChatSnapshot["runtime"] | null
+): { model: string; modelOptions: ModelOptions; planMode: boolean } {
+  const providerComposerState = composerStateFromModelSettings(runtime)
+    ?? getComposerStateForActiveProvider(composerState, activeProvider, providerDefaults)
+  return {
+    model: providerComposerState.model,
+    modelOptions: getComposerStateModelOptions(providerComposerState),
+    planMode: supportsPlanMode ? providerComposerState.planMode : false,
+  }
 }
 
 function getProjectIdForChat(projectGroups: SidebarData["projectGroups"], chatId: string | null) {
@@ -705,7 +736,9 @@ export interface KannaState {
   handleWriteLlmProvider: (value: Pick<LlmProviderSnapshot, "provider" | "apiKey" | "model" | "baseUrl">) => Promise<void>
   handleValidateLlmProvider: (value: Pick<LlmProviderSnapshot, "provider" | "apiKey" | "model" | "baseUrl">) => Promise<LlmProviderValidationResult>
   handleSignOut: () => Promise<void>
-  handleSend: (content: string, options?: { provider?: AgentProvider; model?: string; modelOptions?: ModelOptions; planMode?: boolean }) => Promise<void>
+  handleSend: (content: string, options?: { provider?: AgentProvider; model?: string; modelOptions?: ModelOptions; planMode?: boolean; attachments?: ChatAttachment[] }) => Promise<void>
+  handleEditUserPrompt: (messageId: string, content: string) => Promise<void>
+  handleForkUserPrompt: (messageId: string) => Promise<void>
   handleSteerQueuedMessage: (queuedMessageId: string) => Promise<void>
   handleRemoveQueuedMessage: (queuedMessageId: string) => Promise<void>
   handleCancel: () => Promise<void>
@@ -776,6 +809,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
   const [optimisticUserPrompts, setOptimisticUserPrompts] = useState<OptimisticUserPrompt[]>([])
   const [optimisticProcessing, setOptimisticProcessing] = useState<OptimisticProcessingState | null>(null)
   const [focusEpoch, setFocusEpoch] = useState(0)
+  const olderHistoryEntriesRef = useRef<TranscriptEntry[]>([])
   const sendToStartingProfilesRef = useRef<Map<string, SendToStartingTrace>>(new Map())
   const draftChatIds = useChatInputStore(useShallow((state) => Object.keys(state.drafts).sort()))
   const attachmentDraftChatIds = useChatInputStore(
@@ -1150,10 +1184,15 @@ export function useKannaState(activeChatId: string | null): KannaState {
 
   useEffect(() => {
     setOlderHistoryEntries([])
+    olderHistoryEntriesRef.current = []
     setIsHistoryLoading(false)
     setHistoryCursor(null)
     setHasOlderHistory(false)
   }, [activeChatId])
+
+  useEffect(() => {
+    olderHistoryEntriesRef.current = olderHistoryEntries
+  }, [olderHistoryEntries])
 
   const activeChatSnapshot = useMemo(
     () => getActiveChatSnapshot(chatSnapshot, activeChatId),
@@ -1235,6 +1274,12 @@ export function useKannaState(activeChatId: string | null): KannaState {
   const previousPrompt = useMemo(() => getPreviousPrompt(messages), [messages])
   const latestToolIds = useMemo(() => getLatestToolIds(messages), [messages])
   const runtime = activeChatSnapshot?.runtime ?? null
+  const runtimeModelOptionsKey = JSON.stringify(runtime?.modelOptions)
+  useLayoutEffect(() => {
+    const runtimeComposerState = composerStateFromModelSettings(runtime)
+    if (!runtime || !runtimeComposerState) return
+    useChatPreferencesStore.getState().hydrateComposerFromRuntime(runtime.chatId, runtimeComposerState)
+  }, [runtime?.chatId, runtime?.model, runtime?.planMode, runtime?.provider, runtimeModelOptionsKey])
   const queuedMessages = activeChatSnapshot?.queuedMessages ?? []
   const optimisticRuntimeStatus = optimisticProcessing?.scopeId === optimisticScopeId && (!runtime || runtime.status === "idle")
     ? "starting"
@@ -1552,6 +1597,12 @@ export function useKannaState(activeChatId: string | null): KannaState {
       }
     }
 
+    if (activeChatId && !runtime) {
+      const error = new Error("Chat settings are still loading")
+      setCommandError(error.message)
+      throw error
+    }
+
     const optimisticId = generateUUID()
     const clientTraceId = generateUUID()
     const signature = getUserPromptSignature(content, attachments)
@@ -1645,7 +1696,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
         const chatPreferences = useChatPreferencesStore.getState()
         chatPreferences.setComposerState(
           result.chatId,
-          composerStateFromSendOptions(options) ?? chatPreferences.getComposerState(NEW_CHAT_COMPOSER_ID)
+          composerStateFromModelSettings(options) ?? chatPreferences.getComposerState(NEW_CHAT_COMPOSER_ID)
         )
         setPendingChatId(result.chatId)
         navigate(`/chat/${result.chatId}`)
@@ -1661,7 +1712,92 @@ export function useKannaState(activeChatId: string | null): KannaState {
       setCommandError(error instanceof Error ? error.message : String(error))
       throw error
     }
-  }, [activeChatId, fallbackLocalProjectPath, isProcessing, navigate, optimisticUserPrompts, selectedProjectId, serverTranscriptEntries, sidebarProjectGroups, socket])
+  }, [activeChatId, fallbackLocalProjectPath, isProcessing, navigate, optimisticUserPrompts, runtime, selectedProjectId, serverTranscriptEntries, sidebarProjectGroups, socket])
+
+  const handleEditUserPrompt = useCallback(async (messageId: string, content: string) => {
+    if (!activeChatId) return
+    if (isProcessing || isDraining) {
+      const message = "Wait for the current turn to finish before editing history"
+      setCommandError(message)
+      throw new Error(message)
+    }
+
+    const previousOlderHistoryEntries = olderHistoryEntriesRef.current
+    const nextOlderHistoryEntries = pruneLoadedHistoryForEditedPrompt(previousOlderHistoryEntries, messageId)
+    if (nextOlderHistoryEntries !== previousOlderHistoryEntries) {
+      olderHistoryEntriesRef.current = nextOlderHistoryEntries
+      setOlderHistoryEntries(nextOlderHistoryEntries)
+    }
+
+    try {
+      const chatPreferences = useChatPreferencesStore.getState()
+      const composerState = chatPreferences.getComposerState(activeChatId)
+      const activeProvider = runtime?.provider ?? null
+      const commandOptions = getEditUserPromptSendOptions(
+        composerState,
+        activeProvider,
+        chatPreferences.providerDefaults,
+        availableProviders.find((provider) => provider.id === (activeProvider ?? composerState.provider))?.supportsPlanMode ?? false,
+        runtime
+      )
+      await socket.command({
+        type: "chat.editUserPrompt",
+        chatId: activeChatId,
+        messageId,
+        content,
+        model: commandOptions.model,
+        modelOptions: commandOptions.modelOptions,
+        planMode: commandOptions.planMode,
+      })
+      setCommandError(null)
+    } catch (error) {
+      if (nextOlderHistoryEntries !== previousOlderHistoryEntries) {
+        olderHistoryEntriesRef.current = previousOlderHistoryEntries
+        setOlderHistoryEntries(previousOlderHistoryEntries)
+      }
+      setCommandError(error instanceof Error ? error.message : String(error))
+      throw error
+    }
+  }, [activeChatId, availableProviders, isDraining, isProcessing, runtime, socket])
+
+  const handleForkUserPrompt = useCallback(async (messageId: string) => {
+    if (!activeChatId) return
+    if (isProcessing || isDraining) {
+      const message = "Wait for the current turn to finish before forking history"
+      setCommandError(message)
+      throw new Error(message)
+    }
+
+    try {
+      const chatPreferences = useChatPreferencesStore.getState()
+      const composerState = chatPreferences.getComposerState(activeChatId)
+      const activeProvider = runtime?.provider ?? null
+      const commandOptions = getForkUserPromptSendOptions(
+        composerState,
+        activeProvider,
+        chatPreferences.providerDefaults,
+        availableProviders.find((provider) => provider.id === (activeProvider ?? composerState.provider))?.supportsPlanMode ?? false,
+        runtime
+      )
+      const result = await socket.command<{ chatId: string }>({
+        type: "chat.fork",
+        chatId: activeChatId,
+        messageId,
+        model: commandOptions.model,
+        modelOptions: commandOptions.modelOptions,
+        planMode: commandOptions.planMode,
+      })
+      chatPreferences.initializeComposerForChat(result.chatId, {
+        sourceState: composerStateFromModelSettings(runtime) ?? chatPreferences.getComposerState(activeChatId),
+      })
+      setPendingChatId(result.chatId)
+      navigate(`/chat/${result.chatId}`)
+      setCommandError(null)
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : String(error))
+      throw error
+    }
+  }, [activeChatId, availableProviders, isDraining, isProcessing, navigate, runtime, socket])
 
   const handleSteerQueuedMessage = useCallback(async (queuedMessageId: string) => {
     if (!activeChatId) return
@@ -2093,6 +2229,8 @@ export function useKannaState(activeChatId: string | null): KannaState {
     handleValidateLlmProvider,
     handleSignOut,
     handleSend,
+    handleEditUserPrompt,
+    handleForkUserPrompt,
     handleSteerQueuedMessage,
     handleRemoveQueuedMessage,
     handleCancel,

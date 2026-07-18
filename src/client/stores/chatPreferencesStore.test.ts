@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import {
+  composerStateFromModelSettings,
   migrateChatPreferencesState,
   NEW_CHAT_COMPOSER_ID,
   useChatPreferencesStore,
@@ -200,6 +201,51 @@ describe("migrateChatPreferencesState", () => {
 })
 
 describe("chat preference store", () => {
+  test("normalizes persisted model settings for every provider", () => {
+    expect(composerStateFromModelSettings({
+      provider: "claude",
+      model: "opus",
+      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "1m" } },
+      planMode: true,
+    })).toMatchObject({
+      provider: "claude",
+      model: "claude-opus-4-8",
+      modelOptions: { reasoningEffort: "max", contextWindow: "1m" },
+      planMode: true,
+    })
+    expect(composerStateFromModelSettings({
+      provider: "codex",
+      model: "gpt-5.6-luna",
+      modelOptions: { codex: { reasoningEffort: "ultra", fastMode: true } },
+      planMode: true,
+    })).toEqual({
+      provider: "codex",
+      model: "gpt-5.6-luna",
+      modelOptions: { reasoningEffort: "max", fastMode: true },
+      planMode: true,
+    })
+    expect(composerStateFromModelSettings({
+      provider: "cursor",
+      model: "composer-2.5",
+      modelOptions: { cursor: { fastMode: true } },
+      planMode: true,
+    })).toEqual({
+      provider: "cursor",
+      model: "composer-2.5",
+      modelOptions: { fastMode: true },
+      planMode: false,
+    })
+    expect(composerStateFromModelSettings({
+      provider: "codex",
+      model: "gpt-5.6-sol",
+    })).toEqual({
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      modelOptions: { reasoningEffort: "medium", fastMode: false },
+      planMode: false,
+    })
+  })
+
   test("starts with GPT-5.6 Sol and Medium as the default Codex configuration", () => {
     expect(INITIAL_STATE.providerDefaults.codex).toEqual({
       model: "gpt-5.6-sol",
@@ -460,6 +506,28 @@ describe("chat preference store", () => {
       modelOptions: { reasoningEffort: "max", contextWindow: "1m", fastMode: false },
       planMode: true,
     })
+  })
+
+  test("syncProviderDefaults preserves runtime-hydrated chat settings", () => {
+    const store = useChatPreferencesStore.getState()
+    const persistedState = {
+      provider: "claude" as const,
+      model: INITIAL_STATE.providerDefaults.claude.model,
+      modelOptions: { ...INITIAL_STATE.providerDefaults.claude.modelOptions },
+      planMode: INITIAL_STATE.providerDefaults.claude.planMode,
+    }
+
+    store.hydrateComposerFromRuntime("chat-a", persistedState)
+    store.syncProviderDefaults("claude", {
+      ...INITIAL_STATE.providerDefaults,
+      claude: {
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "low", contextWindow: "1m" },
+        planMode: true,
+      },
+    })
+
+    expect(useChatPreferencesStore.getState().getComposerState("chat-a")).toEqual(persistedState)
   })
 
   test("syncProviderDefaults does not replace a changed new-chat state", () => {

@@ -5,6 +5,7 @@ import {
   getRightSidebarSizePx,
   getIgnoreFolderEntryFromDiffPath,
   hasFileDragTypes,
+  resolveTranscriptEditUserPromptControls,
   shouldUseMobileRightSidebarOverlay,
   shouldAutoFollowTranscriptResize,
 } from "./ChatPage"
@@ -83,5 +84,58 @@ describe("right sidebar pixel sizing", () => {
 
   test("converts the panel percentage back to pixels", () => {
     expect(getRightSidebarSizePx(35, 1_200)).toBe(420)
+  })
+})
+
+describe("resolveTranscriptEditUserPromptControls", () => {
+  test("keeps the edit handler visible while disabling edits during a replacement turn", () => {
+    const handler = async () => {}
+    const forkHandler = async () => {}
+
+    expect(resolveTranscriptEditUserPromptControls({
+      isProcessing: true,
+      isDraining: false,
+      handleEditUserPrompt: handler,
+      handleForkUserPrompt: forkHandler,
+    })).toEqual({
+      onEditUserPrompt: handler,
+      isEditUserPromptDisabled: true,
+      onForkUserPrompt: forkHandler,
+      isForkUserPromptDisabled: true,
+    })
+  })
+
+  test("keeps the edit handler visible while disabling edits during stream draining", () => {
+    const handler = async () => {}
+    const forkHandler = async () => {}
+
+    expect(resolveTranscriptEditUserPromptControls({
+      isProcessing: false,
+      isDraining: true,
+      handleEditUserPrompt: handler,
+      handleForkUserPrompt: forkHandler,
+    })).toEqual({
+      onEditUserPrompt: handler,
+      isEditUserPromptDisabled: true,
+      onForkUserPrompt: forkHandler,
+      isForkUserPromptDisabled: true,
+    })
+  })
+
+  test("enables edit controls while idle", () => {
+    const handler = async () => {}
+    const forkHandler = async () => {}
+
+    expect(resolveTranscriptEditUserPromptControls({
+      isProcessing: false,
+      isDraining: false,
+      handleEditUserPrompt: handler,
+      handleForkUserPrompt: forkHandler,
+    })).toEqual({
+      onEditUserPrompt: handler,
+      isEditUserPromptDisabled: false,
+      onForkUserPrompt: forkHandler,
+      isForkUserPromptDisabled: false,
+    })
   })
 })
