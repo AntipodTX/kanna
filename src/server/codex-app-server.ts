@@ -17,6 +17,7 @@ import { timestamped } from "./transcript"
 import {
   type CollabAgentToolCallItem,
   type ContextCompactedNotification,
+  type CodexApprovalPolicy,
   type CodexRequestId,
   type CommandExecutionApprovalDecision,
   type CommandExecutionRequestApprovalParams,
@@ -55,6 +56,8 @@ import {
   isServerNotification,
   isServerRequest,
 } from "./codex-app-server-protocol"
+
+const CODEX_APPROVAL_POLICY: CodexApprovalPolicy = "on-request"
 
 interface CodexAppServerProcess {
   stdin: Writable
@@ -730,7 +733,7 @@ export class CodexAppServerManager {
       model: args.model,
       cwd: args.cwd,
       serviceTier: args.serviceTier,
-      approvalPolicy: "never",
+      approvalPolicy: CODEX_APPROVAL_POLICY,
       sandbox: "danger-full-access",
       experimentalRawEvents: false,
       persistExtendedHistory: false,
@@ -743,7 +746,7 @@ export class CodexAppServerManager {
         model: args.model,
         cwd: args.cwd,
         serviceTier: args.serviceTier,
-        approvalPolicy: "never",
+        approvalPolicy: CODEX_APPROVAL_POLICY,
         sandbox: "danger-full-access",
         persistExtendedHistory: false,
       } satisfies ThreadForkParams)
@@ -754,7 +757,7 @@ export class CodexAppServerManager {
           model: args.model,
           cwd: args.cwd,
           serviceTier: args.serviceTier,
-          approvalPolicy: "never",
+          approvalPolicy: CODEX_APPROVAL_POLICY,
           sandbox: "danger-full-access",
           persistExtendedHistory: false,
         } satisfies ThreadResumeParams)
@@ -814,7 +817,7 @@ export class CodexAppServerManager {
             text_elements: [],
           },
         ],
-        approvalPolicy: "never",
+        approvalPolicy: CODEX_APPROVAL_POLICY,
         model: args.model,
         effort: args.effort,
         serviceTier: args.serviceTier,

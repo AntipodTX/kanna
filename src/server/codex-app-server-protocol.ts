@@ -25,11 +25,25 @@ export interface InitializeParams {
   }
 }
 
+export type CodexApprovalPolicy =
+  | "never"
+  | "on-request"
+  | "untrusted"
+  | {
+      granular: {
+        sandbox_approval: boolean
+        rules: boolean
+        skill_approval: boolean
+        request_permissions: boolean
+        mcp_elicitations: boolean
+      }
+    }
+
 export interface ThreadStartParams {
   model?: string | null
   cwd?: string | null
   serviceTier?: ServiceTier | null
-  approvalPolicy?: "never" | "on-request" | "on-failure" | "untrusted" | null
+  approvalPolicy?: CodexApprovalPolicy | null
   sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null
   experimentalRawEvents: boolean
   persistExtendedHistory: boolean
@@ -40,7 +54,7 @@ export interface ThreadResumeParams {
   model?: string | null
   cwd?: string | null
   serviceTier?: ServiceTier | null
-  approvalPolicy?: "never" | "on-request" | "on-failure" | "untrusted" | null
+  approvalPolicy?: CodexApprovalPolicy | null
   sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null
   persistExtendedHistory: boolean
 }
@@ -50,7 +64,7 @@ export interface ThreadForkParams {
   model?: string | null
   cwd?: string | null
   serviceTier?: ServiceTier | null
-  approvalPolicy?: "never" | "on-request" | "on-failure" | "untrusted" | null
+  approvalPolicy?: CodexApprovalPolicy | null
   sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null
   ephemeral?: boolean
   persistExtendedHistory: boolean
@@ -78,7 +92,7 @@ export type ReasoningEffort = CodexReasoningEffort
 export interface TurnStartParams {
   threadId: string
   input: CodexUserInput[]
-  approvalPolicy?: "never" | "on-request" | "on-failure" | "untrusted" | null
+  approvalPolicy?: CodexApprovalPolicy | null
   model?: string | null
   effort?: ReasoningEffort | null
   serviceTier?: ServiceTier | null

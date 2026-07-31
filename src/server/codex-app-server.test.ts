@@ -82,6 +82,9 @@ describe("CodexAppServerManager", () => {
     expect((process.messages[0] as any).method).toBe("initialize")
     expect((process.messages[1] as any).method).toBe("initialized")
     expect((process.messages[2] as any).method).toBe("thread/start")
+    expect((process.messages[2] as any).params).toMatchObject({
+      approvalPolicy: "on-request",
+    })
   })
 
   test("falls back to thread/start when thread/resume is recoverably missing", async () => {
@@ -118,6 +121,12 @@ describe("CodexAppServerManager", () => {
       "thread/resume",
       "thread/start",
     ])
+    expect((process.messages[2] as any).params).toMatchObject({
+      approvalPolicy: "on-request",
+    })
+    expect((process.messages[3] as any).params).toMatchObject({
+      approvalPolicy: "on-request",
+    })
   })
 
   test("forks a thread when a pending fork session token is provided", async () => {
@@ -150,6 +159,9 @@ describe("CodexAppServerManager", () => {
       "initialized",
       "thread/fork",
     ])
+    expect((process.messages[2] as any).params).toMatchObject({
+      approvalPolicy: "on-request",
+    })
   })
 
   test("maps fast mode and reasoning into app-server params", async () => {
@@ -201,13 +213,15 @@ describe("CodexAppServerManager", () => {
     await collectStream(turn.stream)
 
     const threadStart = process.messages.find((message: any) => message.method === "thread/start") as
-      | { method: "thread/start"; params: { serviceTier?: string } }
+      | { method: "thread/start"; params: { approvalPolicy?: string; serviceTier?: string } }
       | undefined
     const turnStart = process.messages.find((message: any) => message.method === "turn/start") as
-      | { method: "turn/start"; params: { effort?: string; serviceTier?: string; collaborationMode?: { settings?: { reasoning_effort?: string | null } } } }
+      | { method: "turn/start"; params: { approvalPolicy?: string; effort?: string; serviceTier?: string; collaborationMode?: { settings?: { reasoning_effort?: string | null } } } }
       | undefined
 
+    expect(threadStart?.params.approvalPolicy).toBe("on-request")
     expect(threadStart?.params.serviceTier).toBe("fast")
+    expect(turnStart?.params.approvalPolicy).toBe("on-request")
     expect(turnStart?.params.effort).toBe("xhigh")
     expect(turnStart?.params.serviceTier).toBe("fast")
     expect(turnStart?.params.collaborationMode?.settings?.reasoning_effort).toBe("xhigh")
