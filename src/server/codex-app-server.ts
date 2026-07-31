@@ -113,6 +113,7 @@ interface SessionContext {
   pendingRequests: Map<CodexRequestId, PendingRequest<unknown>>
   pendingTurn: PendingTurn | null
   sessionToken: string | null
+  syntheticSystemInitEmitted: boolean
   stderrLines: string[]
   closed: boolean
 }
@@ -706,6 +707,7 @@ export class CodexAppServerManager {
       pendingRequests: new Map(),
       pendingTurn: null,
       sessionToken: null,
+      syntheticSystemInitEmitted: false,
       stderrLines: [],
       closed: false,
     }
@@ -783,7 +785,10 @@ export class CodexAppServerManager {
     if (context.sessionToken) {
       queue.push({ type: "session_token", sessionToken: context.sessionToken })
     }
-    queue.push({ type: "transcript", entry: codexSystemInitEntry(args.model) })
+    const shouldEmitSystemInit = !context.syntheticSystemInitEmitted
+    if (shouldEmitSystemInit) {
+      queue.push({ type: "transcript", entry: codexSystemInitEntry(args.model) })
+    }
 
     const pendingTurn: PendingTurn = {
       turnId: null,
@@ -831,6 +836,9 @@ export class CodexAppServerManager {
         context.pendingTurn.turnId = response.turn.id
       } else {
         pendingTurn.turnId = response.turn.id
+      }
+      if (shouldEmitSystemInit) {
+        context.syntheticSystemInitEmitted = true
       }
     } catch (error) {
       context.pendingTurn = null

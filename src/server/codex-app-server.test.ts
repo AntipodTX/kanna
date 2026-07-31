@@ -282,6 +282,134 @@ describe("CodexAppServerManager", () => {
     }
   })
 
+  test("does not emit a new synthetic system init entry for every turn in a reused session", async () => {
+    let turnNumber = 0
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        turnNumber += 1
+        const turnId = `turn-${turnNumber}`
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: turnId, status: "completed", error: null } },
+        })
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: turnId, status: "completed", error: null },
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    const firstTurn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "Hello",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    })
+    const firstEvents = await collectStream(firstTurn.stream)
+
+    const secondTurn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "Follow up",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    })
+    const secondEvents = await collectStream(secondTurn.stream)
+
+    expect(firstEvents.some((event) => event.type === "transcript" && event.entry.kind === "system_init")).toBe(true)
+    expect(secondEvents.some((event) => event.type === "transcript" && event.entry.kind === "system_init")).toBe(false)
+  })
+
+  test("re-emits synthetic system init after a failed first turn start", async () => {
+    let turnStartRequests = 0
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        turnStartRequests += 1
+        if (turnStartRequests === 1) {
+          child.writeServerMessage({
+            id: message.id,
+            error: { message: "transient turn/start failure" },
+          })
+          return
+        }
+
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-2", status: "completed", error: null } },
+        })
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: "turn-2", status: "completed", error: null },
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    await expect(
+      manager.startTurn({
+        chatId: "chat-1",
+        model: "gpt-5.4",
+        content: "Hello",
+        planMode: false,
+        onToolRequest: async () => ({}),
+      })
+    ).rejects.toThrow("turn/start failed: transient turn/start failure")
+
+    const retryTurn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "Retry",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    })
+    const retryEvents = await collectStream(retryTurn.stream)
+
+    expect(turnStartRequests).toBe(2)
+    expect(retryEvents.some((event) => event.type === "transcript" && event.entry.kind === "system_init")).toBe(true)
+  })
+
   test("maps thread token usage updates into context window transcript entries", async () => {
     const process = new FakeCodexProcess((message, child) => {
       if (message.method === "initialize") {
