@@ -117,6 +117,19 @@ interface SessionContext {
   closed: boolean
 }
 
+function isActiveTurnNotification(
+  context: SessionContext,
+  pendingTurn: PendingTurn,
+  threadId?: string,
+  turnId?: string
+): boolean {
+  // Unscoped notifications, notably protocol-level errors, apply to the active turn.
+  if (!threadId && !turnId) return true
+  if (context.sessionToken && threadId && threadId !== context.sessionToken) return false
+  if (pendingTurn.turnId && turnId && turnId !== pendingTurn.turnId) return false
+  return true
+}
+
 export interface StartCodexSessionArgs {
   chatId: string
   cwd: string
@@ -1134,11 +1147,15 @@ export class CodexAppServerManager {
 
   private async handleNotification(context: SessionContext, notification: ServerNotification) {
     if (notification.method === "thread/started") {
-      context.sessionToken = notification.params.thread.id
+      const threadId = notification.params.thread.id
+      if (context.sessionToken && threadId !== context.sessionToken) {
+        return
+      }
+      context.sessionToken = threadId
       if (context.pendingTurn) {
         context.pendingTurn.queue.push({
           type: "session_token",
-          sessionToken: notification.params.thread.id,
+          sessionToken: threadId,
         })
       }
       return
@@ -1149,27 +1166,41 @@ export class CodexAppServerManager {
 
     switch (notification.method) {
       case "thread/tokenUsage/updated":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId)) return
         this.handleTokenUsageUpdated(pendingTurn, notification.params)
         return
       case "turn/plan/updated":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turnId)) return
         this.handlePlanUpdated(pendingTurn, notification.params)
         return
       case "item/started":
-        this.handleItemStarted(pendingTurn, notification.params)
+        this.handleItemStarted(
+          pendingTurn,
+          notification.params,
+          isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turnId)
+        )
         return
       case "item/completed":
-        this.handleItemCompleted(pendingTurn, notification.params)
+        this.handleItemCompleted(
+          pendingTurn,
+          notification.params,
+          isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turnId)
+        )
         return
       case "item/plan/delta":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turnId)) return
         this.handlePlanDelta(pendingTurn, notification.params)
         return
       case "turn/completed":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turn.id)) return
         await this.handleTurnCompleted(context, notification.params)
         return
       case "thread/compacted":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turnId)) return
         this.handleContextCompacted(pendingTurn, notification.params)
         return
       case "error":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turnId)) return
         this.failContext(context, notification.params.error.message)
         return
       default:
@@ -1177,8 +1208,13 @@ export class CodexAppServerManager {
     }
   }
 
-  private handleItemStarted(pendingTurn: PendingTurn, notification: ItemStartedNotification) {
+  private handleItemStarted(
+    pendingTurn: PendingTurn,
+    notification: ItemStartedNotification,
+    isActiveTurn: boolean
+  ) {
     if (notification.item.type === "plan") {
+      if (!isActiveTurn) return
       pendingTurn.planTextByItemId.set(notification.item.id, notification.item.text)
       pendingTurn.latestPlanText = notification.item.text
       return
@@ -1210,7 +1246,11 @@ export class CodexAppServerManager {
     }
   }
 
-  private handleItemCompleted(pendingTurn: PendingTurn, notification: ItemCompletedNotification) {
+  private handleItemCompleted(
+    pendingTurn: PendingTurn,
+    notification: ItemCompletedNotification,
+    isActiveTurn: boolean
+  ) {
     if (notification.item.type === "agentMessage") {
       pendingTurn.queue.push({
         type: "transcript",
@@ -1219,7 +1259,11 @@ export class CodexAppServerManager {
           text: notification.item.text,
         }),
       })
-      if (pendingTurn.pendingWebSearchResultToolId && notification.item.text.trim()) {
+      if (
+        isActiveTurn
+        && pendingTurn.pendingWebSearchResultToolId
+        && notification.item.text.trim()
+      ) {
         pendingTurn.queue.push({
           type: "transcript",
           entry: timestamped({
@@ -1234,6 +1278,7 @@ export class CodexAppServerManager {
     }
 
     if (notification.item.type === "plan") {
+      if (!isActiveTurn) return
       pendingTurn.planTextByItemId.set(notification.item.id, notification.item.text)
       pendingTurn.latestPlanText = notification.item.text
       return
@@ -1258,7 +1303,12 @@ export class CodexAppServerManager {
     const resultEntries = itemToToolResults(notification.item)
     for (const entry of resultEntries) {
       pendingTurn.queue.push({ type: "transcript", entry })
-      if (notification.item.type === "webSearch" && entry.kind === "tool_result" && !entry.isError) {
+      if (
+        isActiveTurn
+        && notification.item.type === "webSearch"
+        && entry.kind === "tool_result"
+        && !entry.isError
+      ) {
         pendingTurn.pendingWebSearchResultToolId = notification.item.id
       }
     }
