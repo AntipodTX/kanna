@@ -7,6 +7,7 @@
 
 ### Fixes
 
+- Keep runtime-discovered models available in default-model settings after reading or saving preferences.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
