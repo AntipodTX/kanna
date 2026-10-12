@@ -4,6 +4,7 @@
 
 ### Features
 
+- Codex-style chat input semantics: `/` completes executable commands, `$` completes one or more skills (including plugin-qualified names), and `/compact` runs native thread compaction.
 
 ### Fixes
 

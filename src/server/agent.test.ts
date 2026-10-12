@@ -374,6 +374,76 @@ describe("buildSteeredMessageContent", () => {
 })
 
 describe("AgentCoordinator codex integration", () => {
+  test("lists and executes /compact without sending prompt text", async () => {
+    const slashCommandCalls: Array<{ chatId?: string; cwd: string; threadId: string; command: string }> = []
+    const startedTurns: string[] = []
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async listSkills() {
+          return []
+        },
+        async runSlashCommand(args: { chatId?: string; cwd: string; threadId: string; command: string }) {
+          slashCommandCalls.push(args)
+        },
+        async startTurn(args: { content: string }): Promise<HarnessTurn> {
+          startedTurns.push(args.content)
+          async function* stream() {}
+          return { provider: "codex", stream: stream(), interrupt: async () => {}, close: () => {} }
+        },
+      } as never,
+    })
+
+    const listed = await coordinator.listSkills({ type: "chat.listSkills", provider: "codex", chatId: "chat-1" })
+    expect(listed.skills).toContainEqual({
+      name: "compact",
+      description: "Compact the current Codex thread",
+      source: "command",
+    })
+
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact", model: "gpt-5.4" })
+
+    expect(slashCommandCalls).toEqual([{
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+      command: "/compact",
+    }])
+    expect(startedTurns).toEqual([])
+    expect(store.messages.at(-1)?.kind).toBe("compact_boundary")
+  })
+
+  test.each(["success", "failure"])("publishes a manual Codex compaction boundary only after successful completion (%s)", async (outcome) => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    let finish!: () => void
+    let fail!: (error: Error) => void
+    const completion = new Promise<void>((resolve, reject) => { finish = resolve; fail = reject })
+    let started = false
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      codexManager: { async runSlashCommand() { started = true; await completion } } as never,
+    })
+    const result = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+      .catch((error: Error) => error)
+    await waitFor(() => started)
+    expect(store.messages).toEqual([])
+    if (outcome === "success") finish()
+    else fail(new Error("compaction process lost"))
+    const response = await result
+    if (outcome === "success") {
+      expect(response).toEqual({ chatId: "chat-1" })
+      expect(store.messages.map((entry) => entry.kind)).toEqual(["compact_boundary"])
+    } else {
+      expect(response).toMatchObject({ message: "compaction process lost" })
+      expect(store.messages).toEqual([])
+    }
+  })
+
   test("generates a chat title in the background on the first user message", async () => {
     let releaseTitle!: () => void
     const titleGate = new Promise<void>((resolve) => {
@@ -2257,7 +2327,7 @@ describe("concurrent agents notice injection", () => {
     await coordinator.send({ type: "chat.send", chatId: "chat-2", provider: "claude", content: "second prompt", model: "claude-opus-4-1" })
 
     expect(prompts).toHaveLength(2)
-    // chat-1 started alone — nothing is appended.
+    // chat-1 started alone — no automatic instructions.
     expect(prompts[0]).toBe("first prompt")
     // chat-2 started while chat-1 was running in the same directory.
     expect(prompts[1]?.startsWith("second prompt")).toBe(true)
@@ -2344,6 +2414,49 @@ describe("skill mentions", () => {
 
     queues.forEach((queue) => queue.close())
     rmSync(projectDir, { recursive: true, force: true })
+  })
+
+  test("codex sends every $skill as a structured item and keeps slash commands separate", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    const turns: Array<{ content: string; skills?: Array<{ name: string; path: string }> }> = []
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async startSession() {
+          return { sessionToken: "thread-1", resumeFellBack: false }
+        },
+        async listSkills() {
+          return [
+            { name: "review", description: "Review", path: "/skills/review/SKILL.md", scope: "user", enabled: true },
+            { name: "template-bridge:verify", description: "Verify", path: "/plugins/template-bridge/verify/SKILL.md", scope: "user", enabled: true },
+          ]
+        },
+        async startTurn(args: { content: string; skills?: Array<{ name: string; path: string }> }): Promise<HarnessTurn> {
+          turns.push({ content: args.content, skills: args.skills })
+          async function* stream() {
+            yield {
+              type: "transcript" as const,
+              entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+            }
+          }
+          return { provider: "codex", stream: stream(), interrupt: async () => {}, close: () => {} }
+        },
+      } as never,
+    })
+
+    const content = "Use $review and $template-bridge:verify, then mention $review again; do not run /compact"
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content, model: "gpt-5.4" })
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(turns).toHaveLength(1)
+    expect(turns[0]?.content.startsWith(content)).toBe(true)
+    expect(turns[0]?.skills).toEqual([
+      { name: "review", path: "/skills/review/SKILL.md" },
+      { name: "template-bridge:verify", path: "/plugins/template-bridge/verify/SKILL.md" },
+    ])
   })
 })
 

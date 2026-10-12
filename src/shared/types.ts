@@ -133,6 +133,9 @@ export interface ChatSkillsSnapshot {
   origin: "live" | "filesystem"
 }
 
+/** Slash commands Kanna can execute through the Codex app-server protocol. */
+export const CODEX_SLASH_COMMANDS = ["/compact"] as const
+
 export interface ChatAttachment {
   id: string
   kind: AttachmentKind
