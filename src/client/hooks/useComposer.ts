@@ -111,8 +111,8 @@ export function useComposer(args: {
   )
 
   const updateEffectiveState = useCallback((transform: (state: ComposerState) => ComposerState) => {
-    useChatPreferencesStore.getState().setComposerState(view.composerChatId, transform(view.effectiveState))
-  }, [view.composerChatId, view.effectiveState])
+    useChatPreferencesStore.getState().setComposerState(view.composerChatId, transform(view.effectiveState), { providerConfig: view.providerConfig })
+  }, [view.composerChatId, view.effectiveState, view.providerConfig])
 
   const selectProvider = useCallback((provider: AgentProvider) => {
     const store = useChatPreferencesStore.getState()
@@ -134,7 +134,8 @@ export function useComposer(args: {
     // a chat whose session pinned a different harness).
     useChatPreferencesStore.getState().setComposerState(
       view.composerChatId,
-      applyModelToComposerState(view.effectiveState, modelId, view.providerConfig)
+      applyModelToComposerState(view.effectiveState, modelId, view.providerConfig),
+      { providerConfig: view.providerConfig }
     )
     return true
   }, [view])

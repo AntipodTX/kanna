@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { AppSettingsManager, readAppSettingsSnapshot } from "./app-settings"
+import { applyClaudeSdkModels, resetServerProvidersForTests } from "./provider-catalog"
 import type { AppSettingsSnapshot } from "../shared/types"
 
 let tempDirs: string[] = []
@@ -10,6 +11,7 @@ let tempDirs: string[] = []
 afterEach(async () => {
   await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true })))
   tempDirs = []
+  resetServerProvidersForTests()
 })
 
 async function createTempFilePath() {
@@ -106,6 +108,35 @@ describe("readAppSettingsSnapshot", () => {
     const snapshot = await readAppSettingsSnapshot(filePath)
 
     expect(snapshot).toEqual(expectedSettingsSnapshot(filePath))
+  })
+
+  test("preserves a Claude effort enabled by the live SDK catalog", async () => {
+    expect(applyClaudeSdkModels([
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5",
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "medium", "high", "xhigh"],
+      },
+    ])).toBe(true)
+    const filePath = await createTempFilePath()
+    await writeFile(filePath, JSON.stringify({
+      providerDefaults: {
+        claude: {
+          model: "sonnet",
+          modelOptions: { reasoningEffort: "ultracode", contextWindow: "200k" },
+        },
+      },
+    }), "utf8")
+
+    await expect(readAppSettingsSnapshot(filePath)).resolves.toMatchObject({
+      providerDefaults: {
+        claude: {
+          model: "sonnet",
+          modelOptions: { reasoningEffort: "ultracode", contextWindow: "200k" },
+        },
+      },
+    })
   })
 
   test("devbox extra is server-computed: in every snapshot, never persisted", async () => {
