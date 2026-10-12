@@ -15,6 +15,9 @@ import { shouldShowChatBrowserNotification, showChatBrowserNotification } from "
 import { getSetupLaunchAction, useProviderAuthStore } from "../stores/providerAuthStore"
 import { SetupWizard } from "../components/auth/SetupWizard"
 import type { ChatPreview, ChatTouchedFilesResult, ProviderAuthSnapshot } from "../../shared/types"
+import type { ProjectChatSearchCommandResult, ProjectChatSearchEntryResult } from "../../shared/chatSearch"
+import { ProjectChatSearchPopover } from "./ProjectChatSearchPopover"
+import { getProjectSearchResultNavigation } from "./projectSearch"
 import { playChatNotificationSound, shouldPlayChatSound } from "../lib/chatSounds"
 import { getBrowserWindowTitle, getChatNotificationEvents, getChatSoundBurstCount, type ChatNotificationEvent } from "./chatNotifications"
 import { KannaSidebar } from "./KannaSidebar"
@@ -298,6 +301,29 @@ function KannaLayout() {
   const handleSidebarDeleteChat = useCallback((chat: Parameters<typeof state.handleDeleteChat>[0]) => {
     void state.handleDeleteChat(chat)
   }, [state.handleDeleteChat])
+  // Project search belongs to the layout, not to any chat or its widget column.
+  const [projectSearchProjectId, setProjectSearchProjectId] = useState<string | null>(null)
+  const projectSearchProject = useSidebarStore((store) => projectSearchProjectId
+    ? store.data.projectGroups.find((group) => group.groupKey === projectSearchProjectId)
+    : undefined)
+  const handleOpenProjectSearch = useCallback((projectId: string) => {
+    setProjectSearchProjectId(projectId)
+  }, [])
+  const handleCloseProjectSearch = useCallback(() => setProjectSearchProjectId(null), [])
+  const handleSearchProject = useCallback((
+    query: string, includeArchived: boolean, includeToolEntries: boolean, cursor?: string,
+  ) => {
+    if (!projectSearchProjectId) return Promise.reject(new Error("No project selected"))
+    return state.socket.command<ProjectChatSearchCommandResult>({
+      type: "project.search", projectId: projectSearchProjectId,
+      query, includeArchived, includeToolEntries, limit: 50,
+      ...(cursor ? { cursor } : {}),
+    })
+  }, [projectSearchProjectId, state.socket])
+  const handleSelectProjectSearchResult = useCallback(async (result: ProjectChatSearchEntryResult) => {
+    const destination = getProjectSearchResultNavigation(result)
+    navigate(destination.pathname, { state: destination.state })
+  }, [navigate])
   const handleSidebarCopyPath = useCallback((localPath: string) => {
     void state.handleCopyPath(localPath)
   }, [state.handleCopyPath])
@@ -350,6 +376,7 @@ function KannaLayout() {
       onOpenArchivedChat={handleOpenArchivedChat}
       onRestoreChat={handleRestoreChat}
       onDeleteChat={handleSidebarDeleteChat}
+      onOpenProjectSearch={handleOpenProjectSearch}
       onCopyPath={handleSidebarCopyPath}
       onOpenExternalPath={handleSidebarOpenExternalPath}
       onSetupGit={handleSidebarSetupGit}
@@ -451,9 +478,20 @@ function KannaLayout() {
   }, [navigate, resolveChatNotificationMessage])
 
   return (
-    <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden">
+    <div className="relative flex h-[100dvh] min-h-[100dvh] overflow-hidden">
       {sidebarElement}
       <Outlet context={state} />
+      {projectSearchProject ? (
+        <ProjectChatSearchPopover
+          key={projectSearchProject.groupKey}
+          open
+          projectTitle={projectSearchProject.title}
+          disabled={state.connectionStatus !== "connected"}
+          onClose={handleCloseProjectSearch}
+          onSearch={handleSearchProject}
+          onSelectResult={handleSelectProjectSearchResult}
+        />
+      ) : null}
       <SetupWizard />
       <CommandPalette state={state} />
       <StandaloneShareDialog

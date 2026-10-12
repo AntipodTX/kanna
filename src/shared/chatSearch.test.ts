@@ -272,6 +272,21 @@ describe("searchTranscriptEntries", () => {
       entry({ kind: "user_prompt", content: "anything" }),
     ], "   ", DEFAULT_SEARCH_OPTIONS)).toEqual([])
   })
+
+  test("skips and limits matching entries for paged project search", () => {
+    const entries = [
+      entry({ _id: "match-1", kind: "assistant_text", text: "needle one" }),
+      entry({ _id: "match-2", kind: "assistant_text", text: "needle two" }),
+      entry({ _id: "match-3", kind: "assistant_text", text: "needle three" }),
+      entry({ _id: "match-4", kind: "assistant_text", text: "needle four" }),
+    ]
+
+    expect(searchTranscriptEntries(entries, "needle", {
+      ...DEFAULT_SEARCH_OPTIONS,
+      skipMatches: 1,
+      limit: 2,
+    }).map((result) => result.entryId)).toEqual(["match-2", "match-3"])
+  })
 })
 
 describe("tool payload preparation", () => {
