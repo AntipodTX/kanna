@@ -600,7 +600,7 @@ describe("EventStore", () => {
     }
   })
 
-  test("continues replay when backing up a corrupt log fails", async () => {
+  test("stops startup and preserves a corrupt log when its recovery backup fails", async () => {
     const dataDir = await createTempDataDir()
     const projectsLogPath = join(dataDir, "projects.jsonl")
 
@@ -625,16 +625,17 @@ describe("EventStore", () => {
       "",
     ].join("\n"), "utf8")
     await writeFile(join(dataDir, "recovery"), "not-a-directory", "utf8")
+    const originalLog = await readFile(projectsLogPath, "utf8")
 
     const originalWarn = console.warn
     console.warn = () => {}
     try {
       const store = new EventStore(dataDir)
-      await store.initialize()
+      await expect(store.initialize()).rejects.toThrow("Cannot back up recovery source")
 
       const incidents = store.getStartupRecoveryIncidents()
-      expect(store.getProject("project-1")?.title).toBe("Project")
-      expect(store.getProject("project-2")?.title).toBe("Project 2")
+      expect(await readFile(projectsLogPath, "utf8")).toBe(originalLog)
+      expect(existsSync(join(dataDir, "snapshot.json"))).toBe(false)
       expect(incidents).toHaveLength(1)
       expect(incidents[0]).toMatchObject({
         kind: "log",
@@ -643,8 +644,58 @@ describe("EventStore", () => {
         line: 2,
       })
       expect(incidents[0]!.reason).toContain("backup failed:")
+      // Once backup storage is repaired, ordinary recovery can safely proceed.
+      await rm(join(dataDir, "recovery"))
+      const restarted = new EventStore(dataDir)
+      await restarted.initialize()
+      expect(restarted.getProject("project-1")?.title).toBe("Project")
+      expect(restarted.getProject("project-2")?.title).toBe("Project 2")
+      const recoveredIncident = restarted.getStartupRecoveryIncidents()[0]!
+      expect(await readFile(recoveredIncident.backupPath!, "utf8")).toBe(originalLog)
     } finally {
       console.warn = originalWarn
+    }
+  })
+
+  for (const corruption of ["invalid JSON", "incompatible version"] as const) {
+    test(`stops startup without overwriting a snapshot with ${corruption} when backup fails`, async () => {
+      const dataDir = await createTempDataDir()
+      const snapshotPath = join(dataDir, "snapshot.json")
+      const originalSnapshot = corruption === "invalid JSON"
+        ? "{not-json"
+        : JSON.stringify({ v: 1, projects: [], chats: [] })
+      await writeFile(snapshotPath, originalSnapshot, "utf8")
+      const journals = ["projects.jsonl", "chats.jsonl", "messages.jsonl", "queued-messages.jsonl", "turns.jsonl"]
+      for (const journal of journals) await writeFile(join(dataDir, journal), "\n", "utf8")
+      await writeFile(join(dataDir, "recovery"), "not-a-directory", "utf8")
+      const warn = spyOn(console, "warn").mockImplementation(() => {})
+      try {
+        const store = new EventStore(dataDir)
+        await expect(store.initialize()).rejects.toThrow(snapshotPath)
+        expect(await readFile(snapshotPath, "utf8")).toBe(originalSnapshot)
+        for (const journal of journals) expect(await readFile(join(dataDir, journal), "utf8")).toBe("\n")
+        expect(store.getStartupRecoveryIncidents()).toHaveLength(1)
+      } finally {
+        warn.mockRestore()
+      }
+    })
+  }
+
+  test("does not swallow failed backup of an incompatible final log event as a truncated trailing line", async () => {
+    const dataDir = await createTempDataDir()
+    const logPath = join(dataDir, "projects.jsonl")
+    const originalLog = `${JSON.stringify({ v: 1, type: "project_opened", timestamp: 1 })}\n`
+    await writeFile(logPath, originalLog, "utf8")
+    await writeFile(join(dataDir, "recovery"), "not-a-directory", "utf8")
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      const store = new EventStore(dataDir)
+      await expect(store.initialize()).rejects.toThrow(logPath)
+      expect(await readFile(logPath, "utf8")).toBe(originalLog)
+      expect(existsSync(join(dataDir, "snapshot.json"))).toBe(false)
+      expect(store.getStartupRecoveryIncidents()).toHaveLength(1)
+    } finally {
+      warn.mockRestore()
     }
   })
 
