@@ -27,9 +27,6 @@ import type { HarnessEvent, HarnessTurn } from "./harness-types"
 import { AsyncQueue } from "./async-queue"
 import { KANNA_TOOL_NAMES, type KannaToolHost } from "./kanna-tools"
 import { createPiKannaTools } from "./kanna-tool-adapters"
-import { buildKannaAgentCorrection, buildKannaAgentId } from "./attribution"
-import { buildKannaSystemInstructions } from "./harness-instructions"
-import { appendSystemMessageBlock } from "./harness-skills"
 import { OPENROUTER_BASE_URL, readLlmProviderSnapshot } from "./llm-provider"
 import { timestamped } from "./transcript"
 
@@ -279,13 +276,6 @@ interface PiChatSession {
   resourceLoader: DefaultResourceLoader
   cwd: string
   model: string
-  /**
-   * The agent id baked into this session's appendSystemPrompt. Frozen at
-   * session creation — unlike `model`, which setModel() updates in place — so a
-   * mismatch against the turn's model is the drift the per-turn correction in
-   * startTurn covers.
-   */
-  promptAgentId: string
   effort: PiReasoningEffort
   connectionProvider: LlmProviderKind
   connectionBaseUrl: string
@@ -447,7 +437,6 @@ export class PiAgentManager {
       settingsManager,
       noExtensions: true,
       noThemes: true,
-      appendSystemPrompt: [buildKannaSystemInstructions(buildKannaAgentId("pi", args.model))],
     })
     await resourceLoader.reload()
 
@@ -478,7 +467,6 @@ export class PiAgentManager {
       resourceLoader,
       cwd: args.cwd,
       model: args.model,
-      promptAgentId: buildKannaAgentId("pi", args.model),
       effort: args.effort,
       connectionProvider: args.connection.provider,
       connectionBaseUrl: args.connection.baseUrl,
@@ -626,15 +614,8 @@ export class PiAgentManager {
     })
     pushSessionToken()
 
-    // setModel() swaps the model on the live session without recreating its
-    // resource loader, so the agent id in the system prompt can be stale.
-    // Re-state it on the turn text from the drift onward.
-    const piAgentId = buildKannaAgentId("pi", args.model)
-    const piContent = chatSession.promptAgentId === piAgentId
-      ? args.content
-      : appendSystemMessageBlock(args.content, buildKannaAgentCorrection(piAgentId))
-
-    void session.prompt(piContent)
+    const content = args.content
+    void session.prompt(content)
       .then(() => {
         if (aborted) {
           finalize({ isError: false, message: "", cancelled: true })
