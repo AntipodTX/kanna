@@ -10,6 +10,7 @@ import {
   type Query,
   type SDKUserMessage,
   type SlashCommand,
+  type StopHookInput,
 } from "@anthropic-ai/claude-agent-sdk"
 import { homedir } from "node:os"
 import type {
@@ -77,7 +78,7 @@ import {
   normalizeServerModel,
   serviceTierFromModelOptions,
 } from "./provider-catalog"
-import { resolveClaudeApiModelId } from "../shared/types"
+import { CODEX_SLASH_COMMANDS, resolveClaudeApiModelId } from "../shared/types"
 import { fallbackTitleFromMessage } from "./generate-title"
 import { asNumber, asRecord } from "../shared/json"
 import { buildHandoffContext, buildHandoffMessageContent } from "./handoff"
@@ -138,6 +139,42 @@ const CLAUDE_BASE_TOOLSET = [
  */
 export function claudeToolset(autoPlan: boolean): string[] {
   return autoPlan ? [...CLAUDE_BASE_TOOLSET, "EnterPlanMode"] : [...CLAUDE_BASE_TOOLSET]
+}
+
+export type ClaudeBackgroundWorkState = "unknown" | "active" | "inactive"
+
+export function classifyClaudeBackgroundWorkState(
+  input: Pick<StopHookInput, "background_tasks" | "session_crons">
+): ClaudeBackgroundWorkState {
+  if (!Array.isArray(input.background_tasks) || !Array.isArray(input.session_crons)) {
+    return "unknown"
+  }
+
+  return input.background_tasks.length > 0 || input.session_crons.length > 0
+    ? "active"
+    : "inactive"
+}
+
+export function createClaudeStopHook(
+  onStateChange: (state: ClaudeBackgroundWorkState) => void
+): HookCallback {
+  return async (input) => {
+    try {
+      onStateChange(
+        input.hook_event_name === "Stop"
+          ? classifyClaudeBackgroundWorkState(input)
+          : "unknown"
+      )
+    } catch {
+      try {
+        onStateChange("unknown")
+      } catch {
+        // Observing background work must never interfere with Claude's Stop lifecycle.
+      }
+    }
+
+    return {}
+  }
 }
 
 interface PendingToolRequest {
@@ -225,6 +262,7 @@ interface ClaudeSessionState {
   id: string
   chatId: string
   session: ClaudeSessionHandle
+  backgroundWorkState: ClaudeBackgroundWorkState
   localPath: string
   model: string
   /**
@@ -300,6 +338,7 @@ interface AgentCoordinatorArgs {
     onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
     onRateLimitEvent?: (info: ClaudeRateLimitInfoRaw) => void
     onSubagentActivity?: (update: SubagentActivityUpdate) => void
+    onBackgroundWorkStateChange: (state: ClaudeBackgroundWorkState) => void
   }) => Promise<ClaudeSessionHandle>
   /**
    * Probe whether a provider's native session artifact still exists on disk.
@@ -349,6 +388,13 @@ export const RESUME_AFTER_RESTART_MESSAGE = `<system-message>
 Kanna restarted while you were working on this, so your process was stopped mid-task and is now back up. Continue the task you were on from where it left off.
 Whatever you were doing last may not have completed — re-check the state of any file you were editing and any command you had running before assuming it finished.
 </system-message>`
+
+function parseCodexSlashCommand(content: string): typeof CODEX_SLASH_COMMANDS[number] | null {
+  const command = content.trim()
+  return CODEX_SLASH_COMMANDS.includes(command as typeof CODEX_SLASH_COMMANDS[number])
+    ? command as typeof CODEX_SLASH_COMMANDS[number]
+    : null
+}
 
 interface SendMessageOptions {
   provider?: AgentProvider
@@ -989,7 +1035,7 @@ export async function startClaudeSession(args: {
    * Delegated work starting, progressing, finishing, or — on Stop — the
    * authoritative list of what is still in flight. Driven by the task stream
    * (background-tasks.ts) and SDK hooks (`subagentHooks`).
-   */
+  */
   onSubagentActivity?: (update: SubagentActivityUpdate) => void
 }, deps = { query, resolveExecutable: resolveClaudeExecutable }): Promise<ClaudeSessionHandle> {
   const canUseTool: CanUseTool = async (toolName, input, options) => {
@@ -1068,7 +1114,7 @@ export async function startClaudeSession(args: {
         mcpServers: { kanna: createClaudeKannaTools(args.customTools) },
       } : {}),
       tools: claudeToolset(args.autoPlan),
-      ...(args.onSubagentActivity ? { hooks: subagentHooks(args.onSubagentActivity) } : {}),
+      hooks: claudeSessionHooks(args),
       // By default the SDK forwards only a subagent's tool calls. Its text
       // (what it is doing, and its final report) completes the nested view
       // under the Agent row; the normalizer stamps it with parent_tool_use_id
@@ -1193,11 +1239,11 @@ export class AgentCoordinator {
   private cursorModelCatalogApplied = false
   private grokModelCatalogApplied = false
   private codexModelCatalogRefresh: Promise<void> | null = null
+  private readonly startingClaudeTurns = new Map<string, symbol>()
+  private readonly claudeReadinessCommits = new Map<string, Promise<void>>()
   readonly activeTurns = new Map<string, ActiveTurn>()
   private readonly codexHistoryChecks = new Map<string, symbol>()
   private readonly cancelledCodexHistoryChecks = new Set<symbol>()
-  private readonly startingClaudeTurns = new Map<string, symbol>()
-  private readonly claudeReadinessCommits = new Map<string, Promise<void>>()
   private readonly historyOperations = new Map<string, {
     cancelled: boolean; snapshot: string; sessionToken: string | null
     turnCount: number | undefined
@@ -1235,6 +1281,10 @@ export class AgentCoordinator {
     sessionToken: string
     transcriptPrefix: TranscriptEntry[]
   }>()
+  private readonly idleSessionTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private readonly pendingCodexSteers = new Map<string, Set<string>>()
+  private readonly activeCodexCommands = new Map<string, symbol>()
+  private idleSessionTimeoutMs: number | null = null
 
   constructor(args: AgentCoordinatorArgs) {
     this.store = args.store
@@ -1294,6 +1344,7 @@ export class AgentCoordinator {
         sessionToken: null,
         forkSession: false,
         onToolRequest: async () => ({}),
+        onBackgroundWorkStateChange: () => {},
       })
       return (await probe.getUsage?.()) ?? null
     } catch {
@@ -1340,6 +1391,7 @@ export class AgentCoordinator {
   }
 
   dispose() {
+    this.activeCodexCommands.clear()
     for (const reservation of this.codexHistoryChecks.values()) this.cancelledCodexHistoryChecks.add(reservation)
     for (const operation of this.historyOperations.values()) operation.cancelled = true
     this.startingClaudeTurns.clear()
@@ -1357,9 +1409,32 @@ export class AgentCoordinator {
     }
     this.claudeSessions.clear()
     for (const stream of this.drainingStreams.values()) stream.turn.close()
+    this.claudeSessions.clear()
+    for (const chatId of [...this.idleSessionTimers.keys()]) {
+      this.clearIdleSessionTimer(chatId)
+    }
     this.drainingStreams.clear()
     this.codexManager.stopAll()
     this.piManager.dispose()
+  }
+
+  setIdleSessionTimeoutMs(timeoutMs: number | null) {
+    this.idleSessionTimeoutMs = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : null
+
+    for (const chatId of [...this.idleSessionTimers.keys()]) {
+      this.clearIdleSessionTimer(chatId)
+    }
+
+    if (this.idleSessionTimeoutMs === null) return
+
+    for (const chatId of new Set([
+      ...this.claudeSessions.keys(),
+      ...this.codexManager.getSessionChatIds(),
+    ])) {
+      this.scheduleIdleSessionClose(chatId)
+    }
   }
 
   getActiveStatuses() {
@@ -1661,6 +1736,8 @@ export class AgentCoordinator {
       startup.customTools?.abort()
       this.activeTurns.delete(chatId)
     }
+    this.clearIdleSessionTimer(chatId)
+    this.activeCodexCommands.delete(chatId)
     await this.stopDraining(chatId)
     const claudeSession = this.claudeSessions.get(chatId)
     if (claudeSession) {
@@ -1672,6 +1749,51 @@ export class AgentCoordinator {
     this.piManager.closeChat(chatId)
     this.codexManager.stopSession(chatId)
     this.emitStateChange(chatId)
+  }
+
+  private clearIdleSessionTimer(chatId: string) {
+    const timer = this.idleSessionTimers.get(chatId)
+    if (!timer) return
+    clearTimeout(timer)
+    this.idleSessionTimers.delete(chatId)
+  }
+
+  private isIdleSessionCloseEligible(chatId: string) {
+    if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId)
+      || this.claudeReadinessCommits.has(chatId) || this.activeCodexCommands.has(chatId)
+      || this.drainingStreams.has(chatId)) return false
+
+    const claudeSession = this.claudeSessions.get(chatId)
+    if (claudeSession) {
+      return claudeSession.backgroundWorkState === "inactive"
+    }
+
+    return this.codexManager.hasSession(chatId)
+  }
+
+  private updateClaudeBackgroundWorkState(
+    chatId: string,
+    sessionInstanceId: string,
+    state: ClaudeBackgroundWorkState
+  ) {
+    const session = this.claudeSessions.get(chatId)
+    if (!session || session.id !== sessionInstanceId) return
+
+    session.backgroundWorkState = state
+    this.scheduleIdleSessionClose(chatId)
+  }
+
+  private scheduleIdleSessionClose(chatId: string) {
+    this.clearIdleSessionTimer(chatId)
+    if (this.idleSessionTimeoutMs === null) return
+    if (!this.isIdleSessionCloseEligible(chatId)) return
+
+    const timer = setTimeout(() => {
+      this.idleSessionTimers.delete(chatId)
+      if (!this.isIdleSessionCloseEligible(chatId)) return
+      void this.closeChat(chatId)
+    }, this.idleSessionTimeoutMs)
+    this.idleSessionTimers.set(chatId, timer)
   }
 
   /**
@@ -1792,6 +1914,11 @@ export class AgentCoordinator {
     return queued
   }
 
+  private hasPendingCodexSteer(chatId: string, queuedMessageId?: string) {
+    const pending = this.pendingCodexSteers.get(chatId)
+    return queuedMessageId ? Boolean(pending?.has(queuedMessageId)) : Boolean(pending?.size)
+  }
+
   private async dequeueAndStartQueuedMessage(chatId: string, queuedMessage: QueuedChatMessage, options?: { steered?: boolean }) {
     const chat = this.store.requireChat(chatId)
     const provider = this.resolveProvider(queuedMessage, chat.provider)
@@ -1816,7 +1943,7 @@ export class AgentCoordinator {
   }
 
   private async maybeStartNextQueuedMessage(chatId: string) {
-    if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId)) return false
+    if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId) || this.activeCodexCommands.has(chatId)) return false
     const nextQueuedMessage = typeof this.store.getQueuedMessages === "function"
       ? this.store.getQueuedMessages(chatId)[0]
       : undefined
@@ -1963,6 +2090,7 @@ export class AgentCoordinator {
     startupReservation?: symbol
     expectedCodexSessionToken?: string
   }) {
+    if (this.activeCodexCommands.has(args.chatId)) throw new Error("A Codex command is already running")
     if (args.startupReservation) {
       if (this.startingClaudeTurns.get(args.chatId) !== args.startupReservation) throw new Error("Chat startup reservation was replaced")
       return await this.startReservedTurnForChat(args)
@@ -2502,12 +2630,14 @@ export class AgentCoordinator {
     ) {
       if (session) {
         session.forceClosed = true
+        session.session.close()
         this.claudeSessions.delete(args.chatId)
         session.releasePublication()
         session.session.close()
       }
 
       const sessionInstanceId = crypto.randomUUID()
+      let reportedBackgroundWorkState: ClaudeBackgroundWorkState = "unknown"
       const started = await this.startClaudeSessionFn({
         localPath: args.localPath,
         model: args.model,
@@ -2535,6 +2665,10 @@ export class AgentCoordinator {
         } : undefined,
         onRateLimitEvent: (info) => this.onClaudeRateLimit?.(info),
         onSubagentActivity: (update) => this.applySubagentActivity(args.chatId, update),
+        onBackgroundWorkStateChange: (state) => {
+          reportedBackgroundWorkState = state
+          this.updateClaudeBackgroundWorkState(args.chatId, sessionInstanceId, state)
+        },
       })
       if (args.isCurrentTurn && !args.isCurrentTurn()) { started.close(); return null }
       try {
@@ -2558,6 +2692,7 @@ export class AgentCoordinator {
         id: sessionInstanceId,
         chatId: args.chatId,
         session: started,
+        backgroundWorkState: reportedBackgroundWorkState,
         localPath: args.localPath,
         model: args.model,
         promptAgentId: buildKannaAgentId("claude", args.model),
@@ -2641,6 +2776,12 @@ export class AgentCoordinator {
     let chatId = command.chatId
     if (chatId && (this.historyOperations.has(chatId) || this.codexHistoryChecks.has(chatId))) throw new Error("Chat history is being prepared; retry after it finishes")
 
+    const requestedNewChatCommand = command.provider === "codex"
+      ? parseCodexSlashCommand(command.content)
+      : null
+    if (!chatId && requestedNewChatCommand) {
+      throw new Error(`${requestedNewChatCommand} requires an existing Codex chat`)
+    }
 
     if (!chatId) {
       if (!command.projectId) {
@@ -2651,11 +2792,43 @@ export class AgentCoordinator {
       this.analytics.track("chat_created")
     }
 
+    if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
     const chat = this.store.requireChat(chatId)
     // Sending a message to an archived chat resurrects it (viewing alone
     // never unarchives).
     if (chat.archivedAt) {
       await this.store.unarchiveChat(chatId)
+    }
+    const provider = this.resolveProvider(command, chat.provider)
+    const slashCommand = provider === "codex" ? parseCodexSlashCommand(command.content) : null
+    if (slashCommand) {
+      if (command.attachments?.length) throw new Error(`${slashCommand} cannot be used with attachments`)
+      if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId) || this.hasPendingCodexSteer(chatId)) throw new Error(`${slashCommand} cannot run while a turn is active`)
+      if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
+      if (!chat.sessionToken) throw new Error(`${slashCommand} requires an existing Codex thread`)
+      const project = this.store.getProject(chat.projectId)
+      if (!project) throw new Error("Project not found")
+      const operation = Symbol(slashCommand)
+      this.activeCodexCommands.set(chatId, operation)
+      this.clearIdleSessionTimer(chatId)
+      try {
+        await this.codexManager.runSlashCommand({
+          chatId,
+          cwd: project.localPath,
+          threadId: chat.sessionToken,
+          command: slashCommand,
+        })
+        if (this.activeCodexCommands.get(chatId) !== operation) return { chatId }
+        await this.store.appendMessage(chatId, timestamped({ kind: "compact_boundary" }))
+        if (this.activeCodexCommands.get(chatId) !== operation) return { chatId }
+        this.emitStateChange(chatId)
+      } finally {
+        if (this.activeCodexCommands.get(chatId) === operation) {
+          this.activeCodexCommands.delete(chatId)
+          this.scheduleIdleSessionClose(chatId)
+        }
+      }
+      return { chatId }
     }
     if (this.activeTurns.has(chatId) || (this.startingClaudeTurns.has(chatId) && this.startingClaudeTurns.get(chatId) !== startupReservation)) {
       this.analytics.track("message_sent")
@@ -2670,7 +2843,6 @@ export class AgentCoordinator {
       return { chatId, queuedMessageId: queuedMessage.id, queued: true as const }
     }
 
-    const provider = this.resolveProvider(command, chat.provider)
     const settings = this.getProviderSettings(provider, command, chat)
     const sendIdle = async (startupReservation?: symbol) => {
       const isCurrentReservation = () => !startupReservation || this.startingClaudeTurns.get(chatId) === startupReservation
@@ -3439,6 +3611,11 @@ export class AgentCoordinator {
         return { provider: "claude", skills: scanClaudeSkills({ cwd }), origin: "filesystem" }
       }
       case "codex": {
+        const commands: HarnessSkill[] = CODEX_SLASH_COMMANDS.map((slashCommand) => ({
+          name: slashCommand.slice(1),
+          description: "Compact the current Codex thread",
+          source: "command",
+        }))
         const live = command.chatId
           ? await this.codexManager.listSkills({ chatId: command.chatId, cwd })
           : null
@@ -3449,9 +3626,9 @@ export class AgentCoordinator {
             source: "skill" as const,
             path: skill.path,
           }))
-          return { provider: "codex", skills, origin: "live" }
+          return { provider: "codex", skills: [...commands, ...skills], origin: "live" }
         }
-        return { provider: "codex", skills: scanCodexSkills({ cwd }), origin: "filesystem" }
+        return { provider: "codex", skills: [...commands, ...scanCodexSkills({ cwd })], origin: "filesystem" }
       }
       case "cursor":
         // Cursor has no enumeration protocol; the scan mirrors the CLI's own
@@ -3494,7 +3671,8 @@ export class AgentCoordinator {
    */
   private async resolvePromptSkills(provider: AgentProvider, chatId: string, content: string): Promise<SkillReference[]> {
     const expandsLeading = provider === "claude" || provider === "grok" || provider === "pi"
-    const mentions = findSkillMentions(content).filter((mention) => !(expandsLeading && mention.leading))
+    const mentions = findSkillMentions(content, provider === "codex" ? "$" : "/")
+      .filter((mention) => !(expandsLeading && mention.leading))
     if (mentions.length === 0) return []
     const { skills } = await this.listSkills({ type: "chat.listSkills", provider, chatId })
     return resolveSkillMentions(mentions, skills)
@@ -3587,6 +3765,7 @@ export class AgentCoordinator {
 
     const chatId = command.chatId
     if (this.codexHistoryChecks.has(chatId)) throw new Error("A Codex history check is running; retry after it finishes")
+    if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
     const chat = this.store.requireChat(chatId)
     if (!chat.provider) {
       throw new Error("Chat must have a provider before forking")
@@ -3969,11 +4148,13 @@ export class AgentCoordinator {
           }
           active.customTools?.abort()
           this.activeTurns.delete(session.chatId)
+          this.scheduleIdleSessionClose(session.chatId)
           if (!active.cancelRequested) {
             await this.maybeStartNextQueuedMessage(session.chatId)
           }
         }
 
+        this.scheduleIdleSessionClose(session.chatId)
         this.emitStateChange(session.chatId)
       }
     } catch (error) {
@@ -4007,6 +4188,7 @@ export class AgentCoordinator {
       // lands afterwards. Deleting by chatId alone would drop the new session.
       if (this.claudeSessions.get(session.chatId) === session) {
         this.claudeSessions.delete(session.chatId)
+        this.clearIdleSessionTimer(session.chatId)
         const active = this.activeTurns.get(session.chatId)
         if (active?.provider === "claude") {
           active.customTools?.abort()
@@ -4137,6 +4319,7 @@ export class AgentCoordinator {
       }
       // Stream has fully ended — no longer draining.
       if (this.drainingStreams.get(active.chatId)?.turn === active.turn) this.drainingStreams.delete(active.chatId)
+      this.scheduleIdleSessionClose(active.chatId)
       this.emitStateChange(active.chatId)
 
       if (active.postToolFollowUp && !active.cancelRequested) {
@@ -4397,4 +4580,18 @@ export class AgentCoordinator {
 
     this.emitStateChange(command.chatId)
   }
+}
+
+function claudeSessionHooks(args: {
+  onSubagentActivity?: (update: SubagentActivityUpdate) => void
+  onBackgroundWorkStateChange?: (state: ClaudeBackgroundWorkState) => void
+}): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+  const hooks = args.onSubagentActivity ? subagentHooks(args.onSubagentActivity) : {}
+  if (args.onBackgroundWorkStateChange) {
+    hooks.Stop = [
+      ...(hooks.Stop ?? []),
+      { hooks: [createClaudeStopHook(args.onBackgroundWorkStateChange)] },
+    ]
+  }
+  return hooks
 }

@@ -148,6 +148,13 @@ export interface TurnInterruptParams {
   turnId: string
 }
 
+/** Start native context compaction for an existing Codex thread. */
+export interface ThreadCompactStartParams {
+  threadId: string
+}
+
+export type ThreadCompactStartResponse = Record<string, never>
+
 /** `skills/list` (codex >= 0.73). Older servers answer with "method not found". */
 export interface SkillsListParams {
   cwds: string[]
@@ -552,6 +559,11 @@ export interface ErrorItem {
   message: string
 }
 
+export interface ContextCompactionItem {
+  type: "contextCompaction"
+  id: string
+}
+
 export type ThreadItem =
   | UserMessageItem
   | ReasoningItem
@@ -564,6 +576,7 @@ export type ThreadItem =
   | WebSearchItem
   | FileChangeItem
   | ErrorItem
+  | ContextCompactionItem
 
 export interface ItemStartedNotification {
   item: ThreadItem

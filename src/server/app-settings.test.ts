@@ -34,6 +34,7 @@ function expectedSettingsSnapshot(filePath: string, overrides: Partial<AppSettin
     chatBrowserNotificationPreference: "never",
     submitWhileRunning: "queue",
     paneVisibility: { widgets: "chat", terminal: "chat" },
+    idleSessionTimeout: "1h",
     terminal: {
       scrollbackLines: 1_000,
       minColumnWidth: 450,
@@ -106,6 +107,20 @@ describe("readAppSettingsSnapshot", () => {
     const snapshot = await readAppSettingsSnapshot(filePath)
 
     expect(snapshot).toEqual(expectedSettingsSnapshot(filePath))
+  })
+
+  test("normalizes the idle session timeout setting", async () => {
+    const filePath = await createTempFilePath()
+    await writeFile(filePath, JSON.stringify({ idleSessionTimeout: "15m" }), "utf8")
+
+    await expect(readAppSettingsSnapshot(filePath)).resolves.toMatchObject({
+      idleSessionTimeout: "15m",
+    })
+
+    await writeFile(filePath, JSON.stringify({ idleSessionTimeout: "bogus" }), "utf8")
+    await expect(readAppSettingsSnapshot(filePath)).resolves.toMatchObject({
+      idleSessionTimeout: "1h",
+    })
   })
 
   test("devbox extra is server-computed: in every snapshot, never persisted", async () => {
@@ -249,6 +264,21 @@ describe("AppSettingsManager", () => {
       setupDismissed: true,
     })
     reopened.dispose()
+  })
+
+  test("writes idle session timeout patches", async () => {
+    const filePath = await createTempFilePath()
+    const manager = new AppSettingsManager(filePath)
+
+    await manager.initialize()
+    const snapshot = await manager.writePatch({ idleSessionTimeout: "never" })
+
+    expect(snapshot.idleSessionTimeout).toBe("never")
+    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
+      idleSessionTimeout: "never",
+    })
+
+    manager.dispose()
   })
 
   test("patches expanded settings without replacing the stored user id", async () => {
