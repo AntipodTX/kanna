@@ -1126,9 +1126,19 @@ export class CodexAppServerManager {
     this.sessions.set(args.chatId, context)
     this.attachListeners(context)
 
+    const assertCurrent = () => {
+      if (context.closed || this.sessions.get(args.chatId) !== context || (args.isCurrentTurn && !args.isCurrentTurn())) {
+        throw new Error("Codex startup was cancelled or replaced")
+      }
+    }
+    const onStartupAbort = () => {
+      if (this.sessions.get(args.chatId) === context) this.stopSession(args.chatId)
+    }
+    args.signal?.addEventListener("abort", onStartupAbort, { once: true })
+    if (args.signal?.aborted) onStartupAbort()
     const sessionStart = (async () => {
       try {
-        await this.sendRequest(context, "initialize", {
+      await this.sendRequest(context, "initialize", {
         clientInfo: {
           name: "kanna_desktop",
           title: "Kanna",
@@ -1139,9 +1149,10 @@ export class CodexAppServerManager {
           requestAttestation: false,
         },
       } satisfies InitializeParams)
-        this.writeMessage(context, {
-          method: "initialized",
-        })
+      assertCurrent()
+      this.writeMessage(context, {
+        method: "initialized",
+      })
 
       // Resume and fork accept MCP config, but this CLI only accepts dynamic tools on thread/start.
       const toolConfig = customTools ? {
@@ -1215,11 +1226,6 @@ persistExtendedHistory: true,
         throw error
       }
     })()
-    const assertCurrent = () => {
-      if (context.closed || this.sessions.get(args.chatId) !== context || (args.isCurrentTurn && !args.isCurrentTurn())) {
-        throw new Error("Codex startup was cancelled or replaced")
-      }
-    }
     this.sessionStarts.set(args.chatId, sessionStart)
     try { return await sessionStart } finally {
       args.signal?.removeEventListener("abort", onStartupAbort)
