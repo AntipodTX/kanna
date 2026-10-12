@@ -178,6 +178,8 @@ interface ActiveTurn {
   provider: AgentProvider
   turn: HarnessTurn | null
   claudePromptSeq?: number
+  /** Only background wakeups can finish without a submitted prompt sequence. */
+  claudeBackgroundTurn?: boolean
   model: string
   effort?: string
   serviceTier?: "fast"
@@ -2578,6 +2580,7 @@ export class AgentCoordinator {
     const active: ActiveTurn = {
       chatId: session.chatId,
       provider: "claude",
+      claudeBackgroundTurn: true,
       turn: {
         provider: "claude",
         stream: {
@@ -2697,7 +2700,7 @@ export class AgentCoordinator {
         // A turn resumed by background activity has no prompt, so any result
         // that answers none of ours ends it.
         const completesActive = active?.claudePromptSeq == null
-          ? completedPromptSeqs.length === 0
+          ? active?.claudeBackgroundTurn === true && completedPromptSeqs.length === 0
           : completedPromptSeqs.includes(active.claudePromptSeq)
         if (event.entry.kind === "result" && active?.provider === "claude" && completesActive) {
           active.hasFinalResult = true
