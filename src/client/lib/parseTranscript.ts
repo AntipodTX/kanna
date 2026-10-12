@@ -191,7 +191,8 @@ function applyToolResult(
   if (!entry.trimmed) {
     const rawResult = (
       normalized.toolKind === "ask_user_question" ||
-      normalized.toolKind === "exit_plan_mode"
+      normalized.toolKind === "exit_plan_mode" ||
+      normalized.toolKind === "codex_approval"
     )
       ? getStructuredToolResult(entry) ?? entry.content
       : entry.content

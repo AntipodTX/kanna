@@ -1267,6 +1267,7 @@ export function ChatPage() {
           platform={state.localProjects?.machine.platform}
           onAskUserQuestionSubmit={state.handleAskUserQuestion}
           onExitPlanModeConfirm={state.handleExitPlanMode}
+          onCodexApprovalDecision={state.handleCodexApproval}
           showScrollButton={showScrollToBottom && state.messages.length > 0}
           onIsAtEndChange={onIsAtEndChange}
           readAnchorState={state.readAnchorState}
