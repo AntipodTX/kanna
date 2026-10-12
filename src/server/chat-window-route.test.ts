@@ -34,7 +34,11 @@ function createDeps(entries: Array<Record<string, unknown>>) {
     getSidebarProjectOrder: () => [],
     pruneStaleEmptyChats: async () => [],
   }
-  const agent = { getActiveStatuses: () => new Map(), getDrainingChatIds: () => new Set<string>() }
+  const agent = {
+    getActiveStatuses: () => new Map(),
+    getDrainingChatIds: () => new Set<string>(),
+    getPendingCodexSteerIds: () => new Set<string>(),
+  }
   const appSettings = {
     // Only the transcript window is read by the route or by the router's
     // chat push, so the rest of the settings snapshot stays blank.
