@@ -54,6 +54,23 @@ async function collectStream(stream: AsyncIterable<any>) {
   return items
 }
 
+function compactionProcess(onCompact?: (message: any, child: FakeCodexProcess) => void) {
+  return new FakeCodexProcess((message, child) => {
+    if (message.method === "initialize") {
+      child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+    } else if (message.method === "thread/start" || message.method === "thread/resume") {
+      child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" } })
+    } else if (message.method === "thread/compact/start") {
+      if (onCompact) onCompact(message, child)
+      else child.writeServerMessage({ id: message.id, result: {} })
+    }
+  })
+}
+
+function compactionStarted(process: FakeCodexProcess) {
+  process.writeServerMessage({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "compact-1", status: "inProgress" } } })
+}
+
 describe("CodexAppServerManager", () => {
   test("initializes app-server and starts a fresh thread", async () => {
     const process = new FakeCodexProcess((message, child) => {
@@ -398,6 +415,169 @@ describe("CodexAppServerManager", () => {
 
     expect(await manager.listSkills({ chatId: "chat-1", cwd: "/tmp/project" })).toBeNull()
     expect(await manager.listSkills({ chatId: "chat-unknown", cwd: "/tmp/project" })).toBeNull()
+  })
+
+  test.each(["live", "probe"])("waits for actual compaction completion on a %s app-server", async (mode) => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start" || message.method === "thread/resume") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "thread/compact/start") {
+        child.writeServerMessage({ id: message.id, result: {} })
+      }
+    })
+
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    if (mode === "live") {
+      await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    }
+
+    let finished = false
+    const compact = manager.runSlashCommand({
+      chatId: mode === "live" ? "chat-1" : undefined,
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+      command: "/compact",
+    }).then(() => { finished = true })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    const request = process.messages.find((message: any) => message.method === "thread/compact/start") as any
+    expect(request.params).toEqual({ threadId: "thread-1" })
+    expect(finished).toBe(false)
+    expect(process.killed).toBe(false)
+    process.writeServerMessage({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "compact-1", status: "inProgress" } } })
+    process.writeServerMessage({ method: "item/completed", params: { threadId: "thread-1", turnId: "compact-1",
+      item: { id: "compact-item", type: "contextCompaction" } } })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(finished).toBe(false)
+    process.writeServerMessage({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "compact-1", status: "completed" } } })
+    await compact
+    expect(finished).toBe(true)
+    expect(process.killed).toBe(mode === "probe")
+  })
+
+  test("correlates compaction events and waits for an ACK even when lifecycle notifications arrive first", async () => {
+    let compactRequest: any
+    const process = compactionProcess((message) => { compactRequest = message })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    let finished = false
+    const compact = manager.runSlashCommand({ chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", command: "/compact" })
+      .then(() => { finished = true })
+    compactionStarted(process)
+    process.writeServerMessage({ method: "error", params: { threadId: "thread-1", turnId: "compact-1", willRetry: true, error: { message: "Reconnecting" } } })
+    process.writeServerMessage({ method: "thread/compacted", params: { threadId: "different", turnId: "compact-1" } })
+    process.writeServerMessage({ method: "thread/compacted", params: { threadId: "thread-1", turnId: "different" } })
+    process.writeServerMessage({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "different", status: "completed" } } })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(finished).toBe(false)
+    await expect(manager.runSlashCommand({ chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", command: "/compact" }))
+      .rejects.toThrow("already running")
+    await expect(manager.startTurn({ chatId: "chat-1", model: "gpt-5.4", content: "follow up", planMode: false, onToolRequest: async () => ({}) }))
+      .rejects.toThrow("already running")
+    process.writeServerMessage({ method: "thread/compacted", params: { threadId: "thread-1", turnId: "compact-1" } })
+    process.writeServerMessage({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "compact-1", status: "completed" } } })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(finished).toBe(false)
+    process.writeServerMessage({ id: compactRequest.id, result: {} })
+    await compact
+    expect(finished).toBe(true)
+  })
+
+  test.each(["failed", "interrupted", "missing-result"])("rejects unsuccessful compaction (%s)", async (outcome) => {
+    const process = compactionProcess()
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    const compact = manager.runSlashCommand({ chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", command: "/compact" })
+    const result = compact.catch((error: Error) => error)
+    compactionStarted(process)
+    process.writeServerMessage({ method: "turn/completed", params: { threadId: "thread-1",
+      turn: { id: "compact-1", status: outcome === "missing-result" ? "completed" : outcome } } })
+    expect(await result).toMatchObject({ message: expect.stringContaining(outcome === "missing-result" ? "without a compaction result" : outcome) })
+    expect(manager.getResourceCounts().codexPendingRequests).toBe(0)
+    manager.stopSession("chat-1")
+  })
+
+  test("clears a compaction request when its turn fails before the ACK", async () => {
+    const process = compactionProcess((_message, child) => {
+      compactionStarted(child)
+      child.writeServerMessage({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "compact-1", status: "failed" } } })
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    await expect(manager.runSlashCommand({ chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", command: "/compact" })).rejects.toThrow("failed")
+    expect(manager.getResourceCounts().codexPendingRequests).toBe(0)
+    manager.stopSession("chat-1")
+  })
+
+  test.each(["exit", "error", "stop"])("rejects compaction when the process is lost (%s)", async (outcome) => {
+    const process = compactionProcess()
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    const compact = manager.runSlashCommand({ chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", command: "/compact" })
+    const result = compact.catch((error: Error) => error)
+    if (outcome === "exit") process.closeWithCode(1)
+    else if (outcome === "stop") manager.stopSession("chat-1")
+    else process.writeServerMessage({ method: "error", params: { threadId: "thread-1", willRetry: false, error: { message: "compact failed" } } })
+    expect(await result).toMatchObject({ message: expect.stringContaining(outcome === "exit" ? "exited" : outcome === "error" ? "compact failed" : "session closed") })
+    expect(manager.getResourceCounts().codexSessions).toBe(0)
+    expect(manager.getResourceCounts().codexPendingRequests).toBe(0)
+  })
+
+  test.each(["live", "probe"])("times out compaction without an ACK or completion on a %s process", async (mode) => {
+    const process = compactionProcess(() => {})
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never, compactionTimeoutMs: 30 })
+    if (mode === "live") await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    await expect(manager.runSlashCommand({ chatId: mode === "live" ? "chat-1" : undefined,
+      cwd: "/tmp/project", threadId: "thread-1", command: "/compact" })).rejects.toThrow("timed out")
+    expect(process.killed).toBe(true)
+    expect(manager.getResourceCounts().codexSessions).toBe(0)
+    expect(manager.getResourceCounts().codexPendingRequests).toBe(0)
+  })
+
+  test.each(["live", "probe"])("times out compaction after its ACK when completion never arrives on a %s process", async (mode) => {
+    let acknowledged = false
+    const process = compactionProcess((message, child) => {
+      acknowledged = true
+      child.writeServerMessage({ id: message.id, result: {} })
+      compactionStarted(child)
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never, compactionTimeoutMs: 60 })
+    if (mode === "live") await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    const result = manager.runSlashCommand({ chatId: mode === "live" ? "chat-1" : undefined,
+      cwd: "/tmp/project", threadId: "thread-1", command: "/compact" }).catch((error: Error) => error)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(acknowledged).toBe(true)
+    expect(process.killed).toBe(false)
+    expect(manager.getResourceCounts().codexPendingRequests).toBe(0)
+    expect(await result).toMatchObject({ message: expect.stringContaining("timed out") })
+    expect(process.killed).toBe(true)
+    expect(manager.getResourceCounts().codexSessions).toBe(0)
+    expect(manager.getResourceCounts().codexPendingRequests).toBe(0)
+  })
+
+  test("clears a rejected compaction start before a later command", async () => {
+    let attempts = 0
+    const process = compactionProcess((message, child) => {
+      if (attempts++ === 0) child.writeServerMessage({ id: message.id, error: { code: -32601, message: "method not found" } })
+      else {
+        child.writeServerMessage({ id: message.id, result: {} })
+        compactionStarted(child)
+        child.writeServerMessage({ method: "item/completed", params: { threadId: "thread-1", turnId: "compact-1", item: { id: "item-1", type: "contextCompaction" } } })
+        child.writeServerMessage({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "compact-1", status: "completed" } } })
+      }
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    const command = { chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", command: "/compact" }
+    await expect(manager.runSlashCommand(command)).rejects.toThrow("method not found")
+    await manager.runSlashCommand(command)
+    expect(attempts).toBe(2)
+    expect(manager.getResourceCounts().codexPendingRequests).toBe(0)
   })
 
   test("listModels probes a throwaway app-server, pages model/list and drops hidden rows", async () => {
