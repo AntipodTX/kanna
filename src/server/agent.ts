@@ -176,7 +176,7 @@ interface ActiveTurn {
   customTools?: KannaToolRuntime
   chatId: string
   provider: AgentProvider
-  turn: HarnessTurn
+  turn: HarnessTurn | null
   claudePromptSeq?: number
   model: string
   effort?: string
@@ -1749,6 +1749,19 @@ export class AgentCoordinator {
     return restore
   }
 
+  private async interruptAndCloseTurn(turn: HarnessTurn | null) {
+    if (!turn) return
+    try {
+      await Promise.race([
+        turn.interrupt(),
+        new Promise((resolve) => setTimeout(resolve, 5_000)),
+      ])
+    } catch {
+      // interrupt() failed; close below is the best-effort cleanup path.
+    }
+    turn.close()
+  }
+
   private async startTurnForChat(args: {
     chatId: string
     provider: AgentProvider
@@ -1912,21 +1925,58 @@ export class AgentCoordinator {
       wireContent = buildHandoffMessageContent(contextBlock.text, wireContent)
     }
 
+    const createActiveTurn = (turn: HarnessTurn | null, status: KannaStatus): ActiveTurn => ({
+      chatId: args.chatId,
+      provider: args.provider,
+      turn,
+      model: args.model,
+      effort: args.effort,
+      serviceTier: args.serviceTier,
+      planMode: args.planMode,
+      autoPlan: args.autoPlan,
+      status,
+      pendingTool: null,
+      postToolFollowUp: null,
+      hasFinalResult: false,
+      cancelRequested: false,
+      cancelRecorded: false,
+    })
+    const registerActiveTurn = (activeTurn: ActiveTurn) => {
+      this.activeTurns.set(args.chatId, activeTurn)
+      this.emitStateChange(args.chatId, { immediate: activeTurn.status === "starting" })
+    }
+
     let turn: HarnessTurn
+    let active: ActiveTurn | undefined
     if (args.provider === "claude") {
-      turn = await this.startClaudeTurn({
-        chatId: args.chatId,
-        localPath: project.localPath,
-        model: args.model,
-        effort: args.effort,
-        serviceTier: args.serviceTier,
-        planMode: args.planMode,
-        autoPlan: args.autoPlan,
-        sessionToken: chat.pendingForkSessionToken ?? chat.sessionToken,
-        forkSession: Boolean(chat.pendingForkSessionToken),
-        onToolRequest,
-        customTools,
-      })
+      active = createActiveTurn(null, "starting")
+      registerActiveTurn(active)
+      try {
+        turn = await this.startClaudeTurn({
+          chatId: args.chatId,
+          localPath: project.localPath,
+          model: args.model,
+          effort: args.effort,
+          serviceTier: args.serviceTier,
+          planMode: args.planMode,
+          autoPlan: args.autoPlan,
+          sessionToken: chat.pendingForkSessionToken ?? chat.sessionToken,
+          forkSession: Boolean(chat.pendingForkSessionToken),
+          onToolRequest,
+          customTools,
+        })
+      } catch (error) {
+        if (this.activeTurns.get(args.chatId) === active) {
+          this.activeTurns.delete(args.chatId)
+          this.emitStateChange(args.chatId)
+        }
+        throw error
+      }
+      active.turn = turn
+      if (active.cancelRequested || this.activeTurns.get(args.chatId) !== active) {
+        await this.interruptAndCloseTurn(turn)
+        return
+      }
     } else if (args.provider === "cursor") {
       // Refresh the model catalog off the turn's critical path if a previous
       // fetch never succeeded (e.g. the user just logged in to cursor-agent).
@@ -2005,25 +2055,14 @@ export class AgentCoordinator {
       })
     }
 
-    const active: ActiveTurn = {
-      chatId: args.chatId,
-      provider: args.provider,
-      turn,
-      model: args.model,
-      effort: args.effort,
-      serviceTier: args.serviceTier,
-      planMode: args.planMode,
-      autoPlan: args.autoPlan,
-      status: args.provider === "claude" ? "running" : "starting",
-      pendingTool: null,
-      postToolFollowUp: null,
-      hasFinalResult: false,
-      cancelRequested: false,
-      cancelRecorded: false,
+    if (args.provider !== "claude") {
+      active = createActiveTurn(turn, "starting")
+      registerActiveTurn(active)
     }
-    this.activeTurns.set(args.chatId, active)
+    if (!active) {
+      throw new Error(`Failed to initialize ${args.provider} active turn`)
+    }
     markToolsReady()
-    this.emitStateChange(args.chatId, { immediate: active.status === "starting" })
 
     if (turn.getAccountInfo) {
       void turn.getAccountInfo()
@@ -2049,12 +2088,18 @@ export class AgentCoordinator {
       if (!session) {
         throw new Error("Claude session was not initialized")
       }
+      if (active.cancelRequested || this.activeTurns.get(args.chatId) !== active) {
+        await this.interruptAndCloseTurn(turn)
+        return
+      }
       session.suppressResume = false
       const promptSeq = session.nextPromptSeq + 1
       const promptId = crypto.randomUUID()
       session.nextPromptSeq = promptSeq
       session.pendingPrompts.push({ seq: promptSeq, id: promptId })
       active.claudePromptSeq = promptSeq
+      active.status = "running"
+      this.emitStateChange(args.chatId)
       logClaudeSteer("claude_prompt_sent", {
         chatId: args.chatId,
         sessionId: session.id,
@@ -2078,7 +2123,7 @@ export class AgentCoordinator {
       return
     }
 
-    void this.runTurn(active)
+    void this.runTurn(active as ActiveTurn & { turn: HarnessTurn })
   }
 
   private async startClaudeTurn(args: {
@@ -2528,6 +2573,8 @@ export class AgentCoordinator {
    * normal completion path in runClaudeSession.
    */
   private async resumeBackgroundTurn(session: ClaudeSessionState) {
+    if (this.claudeSessions.get(session.chatId) !== session
+      || this.activeTurns.has(session.chatId)) return
     const active: ActiveTurn = {
       chatId: session.chatId,
       provider: "claude",
@@ -2558,11 +2605,15 @@ export class AgentCoordinator {
 
   private async runClaudeSession(session: ClaudeSessionState) {
     const customToolEvents = new KannaToolEventFilter()
+    const isCurrentClaudeSession = () => this.claudeSessions.get(session.chatId) === session
+      && (!this.activeTurns.has(session.chatId) || this.activeTurns.get(session.chatId)?.provider === "claude")
     try {
       for await (const event of session.session.stream) {
+        if (!isCurrentClaudeSession()) continue
         if (event.type === "session_token" && event.sessionToken) {
           session.sessionToken = event.sessionToken
           await this.store.setSessionToken(session.chatId, event.sessionToken)
+          if (!isCurrentClaudeSession()) continue
           this.emitStateChange(session.chatId)
           continue
         }
@@ -2589,6 +2640,8 @@ export class AgentCoordinator {
           await this.store.appendMessage(session.chatId, event.entry)
         }
 
+        if (!isCurrentClaudeSession()) continue
+
         // Background wakeups (Monitor, Cron*, ScheduleWakeup, RemoteTrigger)
         // emit new activity after the previous turn completed. Re-register an
         // active turn so the chat reads as in-progress instead of idle.
@@ -2609,7 +2662,7 @@ export class AgentCoordinator {
         }
 
         const active = this.activeTurns.get(session.chatId)
-        if (event.entry.kind === "system_init" && active) {
+        if (event.entry.kind === "system_init" && active?.provider === "claude") {
           active.status = "running"
           const chat = this.store.getChat(session.chatId)
           if (
@@ -2646,7 +2699,7 @@ export class AgentCoordinator {
         const completesActive = active?.claudePromptSeq == null
           ? completedPromptSeqs.length === 0
           : completedPromptSeqs.includes(active.claudePromptSeq)
-        if (event.entry.kind === "result" && active && completesActive) {
+        if (event.entry.kind === "result" && active?.provider === "claude" && completesActive) {
           active.hasFinalResult = true
           if (event.entry.isError) {
             await this.store.recordTurnFailed(session.chatId, event.entry.result || "Turn failed")
@@ -2654,17 +2707,18 @@ export class AgentCoordinator {
             await this.store.recordTurnFinished(session.chatId)
           }
           active.customTools?.abort()
-          this.activeTurns.delete(session.chatId)
-          if (!active.cancelRequested) {
-            await this.maybeStartNextQueuedMessage(session.chatId)
+          if (this.activeTurns.get(session.chatId) === active && isCurrentClaudeSession()) {
+            this.activeTurns.delete(session.chatId)
+            if (!active.cancelRequested) await this.maybeStartNextQueuedMessage(session.chatId)
           }
         }
 
         this.emitStateChange(session.chatId)
       }
     } catch (error) {
-      const active = this.activeTurns.get(session.chatId)
-      if (active && !active.cancelRequested) {
+      const active = this.claudeSessions.get(session.chatId) === session
+        ? this.activeTurns.get(session.chatId) : undefined
+      if (active?.provider === "claude" && !active.cancelRequested) {
         const message = error instanceof Error ? error.message : String(error)
         await this.store.appendMessage(
           session.chatId,
@@ -2676,23 +2730,26 @@ export class AgentCoordinator {
             result: message,
           })
         )
-        await this.store.recordTurnFailed(session.chatId, message)
+        if (this.activeTurns.get(session.chatId) === active && isCurrentClaudeSession() && !active.cancelRequested) {
+          await this.store.recordTurnFailed(session.chatId, message)
+        }
       }
     } finally {
       // Only evict if this session is still the chat's current one — a restart
       // (localPath/effort/autoPlan change, or a fork) closes the old session
       // and immediately registers a replacement, and the old stream's cleanup
       // lands afterwards. Deleting by chatId alone would drop the new session.
-      if (this.claudeSessions.get(session.chatId) === session) {
+      const isCurrentSession = this.claudeSessions.get(session.chatId) === session
+      if (isCurrentSession) {
         this.claudeSessions.delete(session.chatId)
-      }
-      const active = this.activeTurns.get(session.chatId)
-      if (active?.provider === "claude") {
-        active.customTools?.abort()
-        if (active.cancelRequested && !active.cancelRecorded) {
-          await this.store.recordTurnCancelled(session.chatId)
+        const active = this.activeTurns.get(session.chatId)
+        if (active?.provider === "claude") {
+          active.customTools?.abort()
+          if (active.cancelRequested && !active.cancelRecorded) {
+            await this.store.recordTurnCancelled(session.chatId)
+          }
+          this.activeTurns.delete(session.chatId)
         }
-        this.activeTurns.delete(session.chatId)
       }
       // The session is gone, so nothing it spawned can report back. Only when
       // it is still the chat's session: a restart's replacement owns them now.
@@ -2729,7 +2786,7 @@ export class AgentCoordinator {
     }
   }
 
-  private async runTurn(active: ActiveTurn) {
+  private async runTurn(active: ActiveTurn & { turn: HarnessTurn }) {
     const customToolEvents = new KannaToolEventFilter()
     try {
       for await (const event of active.turn.stream) {
@@ -2936,15 +2993,7 @@ export class AgentCoordinator {
     // Now attempt to interrupt/close the underlying stream in the background.
     // This is best-effort — the turn is already removed from active state above,
     // and runTurn()'s finally block will also call close().
-    try {
-      await Promise.race([
-        active.turn.interrupt(),
-        new Promise((resolve) => setTimeout(resolve, 5_000)),
-      ])
-    } catch {
-      // interrupt() failed — force close
-    }
-    active.turn.close()
+    await this.interruptAndCloseTurn(active.turn)
   }
 
   private async requestToolInput(chatId: string, request: HarnessToolRequest, signal?: AbortSignal): Promise<unknown> {
