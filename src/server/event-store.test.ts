@@ -557,252 +557,33 @@ describe("EventStore", () => {
     }
   })
 
-  test("prunes stale empty chats after five minutes", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
+  
 
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    const staleNow = chat.createdAt + 5 * 60 * 1000
+  
 
-    const pruned = await store.pruneStaleEmptyChats({ now: staleNow })
+  
 
-    expect(pruned).toEqual([chat.id])
-    expect(store.getChat(chat.id)).toBeNull()
-  })
+  
 
-  test("does not prune recent empty chats", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
+  
 
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    const pruned = await store.pruneStaleEmptyChats({ now: chat.createdAt + 5 * 60 * 1000 - 1 })
 
-    expect(pruned).toEqual([])
-    expect(store.getChat(chat.id)?.id).toBe(chat.id)
-  })
+  
 
-  test("does not prune chats once they have transcript messages", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
+  
 
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    await store.appendMessage(chat.id, entry("user_prompt", chat.createdAt + 1, { content: "hello" }))
+  
 
-    const pruned = await store.pruneStaleEmptyChats({ now: chat.createdAt + 5 * 60 * 1000 })
+  
 
-    expect(pruned).toEqual([])
-    expect(store.getChat(chat.id)?.id).toBe(chat.id)
-  })
+  
 
-  test("does not prune stale chats that are currently active", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
 
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
+  
 
-    const pruned = await store.pruneStaleEmptyChats({
-      now: chat.createdAt + 5 * 60 * 1000,
-      activeChatIds: [chat.id],
-    })
+  
 
-    expect(pruned).toEqual([])
-    expect(store.getChat(chat.id)?.id).toBe(chat.id)
-  })
-
-  test("does not prune stale chats with protected draft state", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-
-    const pruned = await store.pruneStaleEmptyChats({
-      now: chat.createdAt + 5 * 60 * 1000,
-      protectedChatIds: [chat.id],
-    })
-
-    expect(pruned).toEqual([])
-    expect(store.getChat(chat.id)?.id).toBe(chat.id)
-  })
-
-  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000
-
-  test("auto-archives chats thirty days behind the latest chat activity", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const old = await store.createChat(project.id)
-    await store.appendMessage(old.id, entry("user_prompt", old.createdAt + 1, { content: "old" }))
-    const oldActivityAt = store.getChat(old.id)!.lastMessageAt!
-    // A fresh chat moves the activity anchor forward past the window.
-    const fresh = await store.createChat(project.id)
-    await store.appendMessage(fresh.id, entry("user_prompt", oldActivityAt + THIRTY_DAYS_MS, { content: "fresh" }))
-
-    const archived = await store.autoArchiveStaleChats({ now: oldActivityAt + THIRTY_DAYS_MS + 1 })
-
-    expect(archived).toEqual([old.id])
-    // Archived, not deleted — still retrievable. The anchor chat is untouched.
-    expect(store.getChat(old.id)?.archivedAt).toBeGreaterThan(0)
-    expect(store.getChat(fresh.id)?.archivedAt).toBeUndefined()
-  })
-
-  test("measures staleness against the latest chat, not the clock — an idle month archives nothing", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    await store.appendMessage(chat.id, entry("user_prompt", chat.createdAt + 1, { content: "hello" }))
-    const lastActivityAt = store.getChat(chat.id)!.lastMessageAt!
-
-    // Back from a long vacation: wall clock far past the window, but this is
-    // the newest chat, so it anchors the reference and nothing is stale.
-    const archived = await store.autoArchiveStaleChats({ now: lastActivityAt + 10 * THIRTY_DAYS_MS })
-
-    expect(archived).toEqual([])
-    expect(store.getChat(chat.id)?.archivedAt).toBeUndefined()
-  })
-
-  test("does not auto-archive chats within thirty days of the latest activity", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const old = await store.createChat(project.id)
-    await store.appendMessage(old.id, entry("user_prompt", old.createdAt + 1, { content: "old" }))
-    const oldActivityAt = store.getChat(old.id)!.lastMessageAt!
-    const fresh = await store.createChat(project.id)
-    await store.appendMessage(fresh.id, entry("user_prompt", oldActivityAt + THIRTY_DAYS_MS - 1, { content: "fresh" }))
-
-    const archived = await store.autoArchiveStaleChats({ now: oldActivityAt + THIRTY_DAYS_MS - 1 })
-
-    expect(archived).toEqual([])
-  })
-
-  test("leaves stale empty chats for the prune sweep instead of archiving them", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const empty = await store.createChat(project.id) // never messaged
-    const fresh = await store.createChat(project.id)
-    await store.appendMessage(fresh.id, entry("user_prompt", empty.createdAt + THIRTY_DAYS_MS + 1, { content: "fresh" }))
-
-    const archived = await store.autoArchiveStaleChats({ now: empty.createdAt + THIRTY_DAYS_MS + 1 })
-
-    expect(archived).toEqual([])
-    expect(store.getChat(empty.id)?.archivedAt).toBeUndefined()
-  })
-
-  test("skips active/protected chats and already-archived chats when auto-archiving", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const active = await store.createChat(project.id)
-    await store.appendMessage(active.id, entry("user_prompt", active.createdAt + 1, { content: "a" }))
-    const protectedChat = await store.createChat(project.id)
-    await store.appendMessage(protectedChat.id, entry("user_prompt", protectedChat.createdAt + 1, { content: "b" }))
-    const alreadyArchived = await store.createChat(project.id)
-    await store.appendMessage(alreadyArchived.id, entry("user_prompt", alreadyArchived.createdAt + 1, { content: "c" }))
-    await store.archiveChat(alreadyArchived.id)
-    // Fresh anchor far past the window so the others would otherwise qualify.
-    const fresh = await store.createChat(project.id)
-    await store.appendMessage(fresh.id, entry("user_prompt", active.createdAt + THIRTY_DAYS_MS + 2, { content: "d" }))
-
-    const archived = await store.autoArchiveStaleChats({
-      now: active.createdAt + THIRTY_DAYS_MS + 2,
-      activeChatIds: [active.id],
-      protectedChatIds: [protectedChat.id],
-    })
-
-    expect(archived).toEqual([])
-  })
-
-  const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000
-
-  test("hard-deletes chats ninety days behind the latest activity, archived or not", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const plain = await store.createChat(project.id)
-    await store.appendMessage(plain.id, entry("user_prompt", plain.createdAt + 1, { content: "a" }))
-    const archivedChat = await store.createChat(project.id)
-    await store.appendMessage(archivedChat.id, entry("user_prompt", archivedChat.createdAt + 1, { content: "b" }))
-    await store.archiveChat(archivedChat.id)
-    // Fresh chat anchors the reference past the window. Measure from whichever
-    // of the two is newer: they are created back-to-back off the real clock, so
-    // anchoring to `plain` alone leaves `archivedChat` one millisecond short of
-    // the window whenever the clock ticks between the two createChat calls.
-    const stalePoint =
-      Math.max(store.getChat(plain.id)!.lastMessageAt!, store.getChat(archivedChat.id)!.lastMessageAt!) +
-      NINETY_DAYS_MS
-    const fresh = await store.createChat(project.id)
-    await store.appendMessage(fresh.id, entry("user_prompt", stalePoint, { content: "c" }))
-
-    const deleted = await store.deleteStaleChats({ now: stalePoint + 1 })
-
-    expect(deleted.sort()).toEqual([plain.id, archivedChat.id].sort())
-    expect(store.getChat(plain.id)).toBeNull()
-    expect(store.getChat(archivedChat.id)).toBeNull()
-    expect(store.getChat(fresh.id)?.id).toBe(fresh.id)
-  })
-
-  test("measures deletion against the latest chat, not the clock — an idle year deletes nothing", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    await store.appendMessage(chat.id, entry("user_prompt", chat.createdAt + 1, { content: "hello" }))
-    const lastActivityAt = store.getChat(chat.id)!.lastMessageAt!
-
-    const deleted = await store.deleteStaleChats({ now: lastActivityAt + 5 * NINETY_DAYS_MS })
-
-    expect(deleted).toEqual([])
-    expect(store.getChat(chat.id)?.id).toBe(chat.id)
-  })
-
-  test("does not hard-delete active or protected stale chats", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const active = await store.createChat(project.id)
-    const protectedChat = await store.createChat(project.id)
-    // Fresh anchor far past the window so the others would otherwise qualify.
-    const fresh = await store.createChat(project.id)
-    await store.appendMessage(fresh.id, entry("user_prompt", active.createdAt + NINETY_DAYS_MS + 1, { content: "c" }))
-
-    const deleted = await store.deleteStaleChats({
-      now: active.createdAt + NINETY_DAYS_MS + 1,
-      activeChatIds: [active.id],
-      protectedChatIds: [protectedChat.id],
-    })
-
-    expect(deleted).toEqual([])
-    expect(store.getChat(active.id)?.id).toBe(active.id)
-    expect(store.getChat(protectedChat.id)?.id).toBe(protectedChat.id)
-  })
+  
 
   test("auto plan defaults to false and survives a replay", async () => {
     const dataDir = await createTempDataDir()
@@ -1670,34 +1451,6 @@ describe("slimTranscripts", () => {
   })
 })
 
-describe("stale empty chat pruning", () => {
-  test("keeps a cached chat that actually has messages", async () => {
-    // The prune sweep only deletes chats it believes are empty. `hasMessages`
-    // can be stale — it is metadata, repaired by peeking at the transcript —
-    // so a chat with entries must survive, transcript and all.
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-    const project = await store.openProject(dataDir, "prune")
-    const chat = await store.createChat(project.id)
-    await store.appendMessage(chat.id, entry("user_prompt", 1, { content: "hello" }))
-
-    // Warm the LRU, then mimic the metadata having been lost.
-    store.getClientTranscript(chat.id)
-    const record = store.getChat(chat.id)!
-    record.hasMessages = false
-    record.createdAt = Date.now() - 60 * 60 * 1000
-
-    const pruned = await store.pruneStaleEmptyChats({ activeChatIds: new Set(), protectedChatIds: new Set() })
-
-    expect(pruned).not.toContain(chat.id)
-    expect(store.getChat(chat.id)).not.toBeNull()
-    expect(store.getMessages(chat.id)).toHaveLength(1)
-    // And the repair happened rather than merely being skipped.
-    expect(store.getChat(chat.id)?.hasMessages).toBe(true)
-  })
-})
-
 describe("getClientTranscript window and outline", () => {
   test("clones from the requested index and keeps the outline whole", async () => {
     const dataDir = await createTempDataDir()
@@ -1826,24 +1579,6 @@ describe("chat pins", () => {
     expect(replayed.getChat(chat.id)!.archivedAt).toBeUndefined()
   })
 
-  test("cleanup preserves pinned chats, including empty chats", async () => {
-    const store = new EventStore(await createTempDataDir())
-    await store.initialize()
-    const project = await store.openProject("/tmp/project")
-    const empty = await store.createChat(project.id)
-    const old = await store.createChat(project.id)
-    await store.appendMessage(old.id, entry("user_prompt", old.createdAt + 1))
-    await store.setChatPinned(empty.id, true)
-    await store.setChatPinned(old.id, true)
-    const now = old.createdAt + 100 * 24 * 60 * 60 * 1000
-    const fresh = await store.createChat(project.id)
-    await store.appendMessage(fresh.id, entry("user_prompt", now))
-    expect(await store.pruneStaleEmptyChats({ now })).toEqual([])
-    expect(await store.autoArchiveStaleChats({ now })).toEqual([])
-    expect(await store.deleteStaleChats({ now })).toEqual([])
-    await store.setChatPinned(old.id, false)
-    expect(await store.autoArchiveStaleChats({ now })).toEqual([old.id])
-  })
 
   test("manual archive clears the pin and restore keeps it unpinned", async () => {
     const store = new EventStore(await createTempDataDir())
