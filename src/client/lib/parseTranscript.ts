@@ -1,3 +1,4 @@
+import { recoverClaudeExitPlans } from "../../shared/claude-plan-recovery"
 import { hydrateToolResult } from "../../shared/tools"
 import type { HydratedToolCall, HydratedTranscriptMessage, NormalizedToolCall, TranscriptEntry } from "../../shared/types"
 
@@ -36,16 +37,32 @@ function hydrateToolCall(entry: Extract<TranscriptEntry, { kind: "tool_call" }>)
  * fallback covers entries served by an older server that still shipped the raw
  * payload inline.
  */
-function getStructuredToolResult(entry: Extract<TranscriptEntry, { kind: "tool_result" }>): unknown {
-  if (entry.structuredResult !== undefined) return entry.structuredResult
-  if (!entry.debugRaw) return undefined
+const CLAUDE_PLAN_ADJUSTMENT_PREFIX = "User wants to suggest edits to the plan:"
 
-  try {
-    const parsed = JSON.parse(entry.debugRaw) as { tool_use_result?: unknown }
-    return parsed.tool_use_result
-  } catch {
-    return undefined
+function getStructuredToolResult(
+  entry: Extract<TranscriptEntry, { kind: "tool_result" }>,
+  toolKind: NormalizedToolCall["toolKind"],
+): unknown {
+  let result = entry.structuredResult
+  if (result === undefined && entry.debugRaw) {
+    try {
+      const parsed = JSON.parse(entry.debugRaw) as { tool_use_result?: unknown }
+      result = parsed.tool_use_result
+    } catch {
+      return undefined
+    }
   }
+
+  if (toolKind === "exit_plan_mode" && typeof result === "string") {
+    const message = result.replace(/^Error:\s*/, "")
+    if (message.startsWith(CLAUDE_PLAN_ADJUSTMENT_PREFIX)) {
+      return {
+        confirmed: false,
+        message: message.slice(CLAUDE_PLAN_ADJUSTMENT_PREFIX.length).trim(),
+      }
+    }
+  }
+  return result
 }
 
 /**
@@ -193,7 +210,7 @@ function applyToolResult(
       normalized.toolKind === "ask_user_question" ||
       normalized.toolKind === "exit_plan_mode"
     )
-      ? getStructuredToolResult(entry) ?? entry.content
+      ? getStructuredToolResult(entry, normalized.toolKind) ?? entry.content
       : entry.content
 
     hydrated.result = hydrateToolResult(normalized, rawResult) as never
@@ -251,6 +268,7 @@ export function processTranscriptMessages(
   const agentCallIndexes = new Map<string, number>(resume?.state.agentCallIndexes)
   const messages: HydratedTranscriptMessage[] = resume ? resume.messages.slice() : []
   const startIndex = resume ? resume.state.entries.length : 0
+  let recoveredExitPlans: Map<string, string> | undefined
 
   // Replace `messages[index]` with a copy whose child at `childIndex` is
   // `child` (or, with no `childIndex`, with `child` appended). Copies the
@@ -284,6 +302,13 @@ export function processTranscriptMessages(
     }
 
     const message = hydrateEntry(entry)
+    if (entry.kind === "tool_call" && message.kind === "tool" && message.toolKind === "exit_plan_mode" && !message.input.plan) {
+      recoveredExitPlans ??= recoverClaudeExitPlans(entries)
+      const recoveredPlan = recoveredExitPlans.get(message.toolId)
+      if (recoveredPlan !== undefined) {
+        message.input = { ...message.input, plan: recoveredPlan }
+      }
+    }
 
     // A subagent's entry goes under the Agent call that spawned it. One
     // whose parent is not in the window (an older server did not stamp
