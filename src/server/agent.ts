@@ -3,12 +3,14 @@ import {
   query,
   type BackgroundTaskSummary,
   type CanUseTool,
+  type EffortLevel,
   type HookCallback,
   type HookCallbackMatcher,
   type HookEvent,
   type PermissionResult,
   type Query,
   type SDKUserMessage,
+  type Settings,
   type SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk"
 import { homedir } from "node:os"
@@ -17,6 +19,7 @@ import type {
   AskUserQuestionItem,
   ChatAttachment,
   ChatSkillsSnapshot,
+  ClaudeReasoningEffort,
   CodexReasoningEffort,
   ContextWindowUsageSnapshot,
   HarnessSkill,
@@ -70,6 +73,7 @@ import {
   cursorModelIdForOptions,
   getServerProviderCatalog,
   normalizeClaudeModelOptions,
+  getServerClaudeRuntimeEffort,
   normalizeCodexModelOptions,
   normalizeCursorModelOptions,
   normalizeGrokModelOptions,
@@ -77,7 +81,7 @@ import {
   normalizeServerModel,
   serviceTierFromModelOptions,
 } from "./provider-catalog"
-import { resolveClaudeApiModelId } from "../shared/types"
+import { CLAUDE_REASONING_OPTIONS, resolveClaudeApiModelId } from "../shared/types"
 import { fallbackTitleFromMessage } from "./generate-title"
 import { asNumber, asRecord } from "../shared/json"
 import { buildHandoffContext, buildHandoffMessageContent } from "./handoff"
@@ -95,6 +99,28 @@ import {
 } from "./background-tasks"
 
 export type { SubagentActivityUpdate } from "./background-tasks"
+
+export function resolveClaudeRuntimeOptions(effort?: string): {
+  effort?: EffortLevel
+  settings?: Settings
+} {
+  if (effort === "ultracode") {
+    return {
+      effort: "xhigh",
+      settings: { ultracode: true },
+    }
+  }
+
+  const sdkEffort = CLAUDE_REASONING_OPTIONS
+    .map((option) => option.id)
+    .find((candidate): candidate is Exclude<ClaudeReasoningEffort, "ultracode"> => (
+      candidate === effort && candidate !== "ultracode"
+    ))
+  return {
+    effort: sdkEffort,
+    settings: undefined,
+  }
+}
 
 /**
  * Tools every Claude session gets. `EnterPlanMode` is deliberately absent — it
@@ -1052,13 +1078,14 @@ export async function startClaudeSession(args: {
   if (!claudeExecutable.ok) throw new Error(claudeExecutable.message)
   const promptQueue = new AsyncQueue<SDKUserMessage>()
   let promptQueueClosed = false
+  const runtimeOptions = resolveClaudeRuntimeOptions(args.effort)
 
   const q = deps.query({
     prompt: promptQueue,
     options: {
       cwd: args.localPath,
       model: args.model,
-      effort: args.effort as "low" | "medium" | "high" | "max" | undefined,
+      effort: getServerClaudeRuntimeEffort(args.model, args.effort),
       resume: args.sessionToken ?? undefined,
       resumeSessionAt: args.resumeSessionAt,
       forkSession: args.forkSession,
@@ -1086,7 +1113,11 @@ export async function startClaudeSession(args: {
       // fast mode in Agent SDK sessions when flagSettings.fastMode is true,
       // and an explicit false keeps a user-level settings.json from silently
       // enabling it while the UI shows "Standard".
-      settings: { enableWorkflows: true, fastMode: args.serviceTier === "fast" },
+      settings: {
+        enableWorkflows: true,
+        fastMode: args.serviceTier === "fast",
+        ...runtimeOptions.settings,
+      },
       pathToClaudeCodeExecutable: claudeExecutable.path,
       env: (() => { const { CLAUDECODE: _, ...env } = process.env; return env })(),
     },

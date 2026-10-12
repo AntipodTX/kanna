@@ -1,5 +1,6 @@
 import type {
   AgentProvider,
+  ClaudeReasoningEffort,
   ClaudeModelOptions,
   CodexModelOptions,
   CursorModelOptions,
@@ -13,6 +14,7 @@ import type {
   ServiceTier,
 } from "../shared/types"
 import {
+  CLAUDE_REASONING_OPTIONS,
   CLAUDE_CONTEXT_WINDOW_OPTIONS,
   DEFAULT_CLAUDE_MODEL_OPTIONS,
   DEFAULT_CODEX_MODEL_OPTIONS,
@@ -28,6 +30,7 @@ import {
   normalizePiReasoningEffort,
   normalizeProviderModelId,
   isClaudeReasoningEffort,
+  isClaudeReasoningEffortSupported,
   isCodexReasoningEffort,
   isGrokReasoningEffort,
   isPiReasoningEffort,
@@ -45,6 +48,20 @@ export interface ClaudeSdkModelInfo {
   supportedEffortLevels?: readonly string[]
   supportsAdaptiveThinking?: boolean
   supportsFastMode?: boolean
+}
+
+function normalizeClaudeSdkEffortLevel(level: string): readonly ClaudeReasoningEffort[] {
+  if (level === "xhigh") return ["xhigh", "ultracode"]
+  return isClaudeReasoningEffort(level) ? [level] : []
+}
+
+function normalizeClaudeSdkEffortLevels(
+  levels?: readonly string[],
+): readonly ClaudeReasoningEffort[] | undefined {
+  if (!levels) return undefined
+
+  const normalized = new Set(levels.flatMap(normalizeClaudeSdkEffortLevel))
+  return CLAUDE_REASONING_OPTIONS.map((option) => option.id).filter((effort) => normalized.has(effort))
 }
 
 function createServerProviders(): ProviderCatalogEntry[] {
@@ -101,13 +118,17 @@ export function applyClaudeSdkModels(models: readonly ClaudeSdkModelInfo[]) {
     const contextWindowOptions = group.has1m
       ? [...CLAUDE_CONTEXT_WINDOW_OPTIONS]
       : staticOption?.contextWindowOptions
+    const supportedEffortLevels = normalizeClaudeSdkEffortLevels(
+      row.supportedEffortLevels
+        ?? group.rows.find((candidate) => candidate.supportedEffortLevels !== undefined)?.supportedEffortLevels,
+    ) ?? staticOption?.supportedEffortLevels
     return {
       id: family,
       label: deriveModelLabel(row.resolvedModel ?? row.value),
       supportsEffort: row.supportsEffort ?? staticOption?.supportsEffort ?? true,
       ...(contextWindowOptions ? { contextWindowOptions: [...contextWindowOptions] } : {}),
       ...(staticOption?.contextWindowTokens ? { contextWindowTokens: staticOption.contextWindowTokens } : {}),
-      ...(staticOption?.supportsMaxReasoningEffort ? { supportsMaxReasoningEffort: true } : {}),
+      ...(supportedEffortLevels ? { supportedEffortLevels: [...supportedEffortLevels] } : {}),
       ...((row.supportsFastMode ?? staticOption?.supportsFastMode) !== undefined
         ? { supportsFastMode: row.supportsFastMode ?? staticOption?.supportsFastMode }
         : {}),
@@ -351,6 +372,37 @@ export function normalizeServerModel(provider: AgentProvider, model?: string): s
   return normalizeProviderModelId(provider, model, catalog.defaultModel)
 }
 
+export function getServerProviderModelOption(
+  provider: AgentProvider,
+  modelId: string,
+): ProviderModelOption | undefined {
+  const normalizedModelId = normalizeServerModel(provider, modelId)
+  return getServerProviderCatalog(provider).models.find((candidate) => candidate.id === normalizedModelId)
+}
+
+/** Undefined means that the SDK must receive no effort override for this model. */
+function resolveServerClaudeReasoningEffort(modelId: string, effort?: unknown): ClaudeReasoningEffort | undefined {
+  const model = getServerProviderModelOption("claude", modelId)
+  if (model && !model.supportsEffort) return undefined
+  const normalizedEffort = isClaudeReasoningEffort(effort)
+    ? effort
+    : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
+  return isClaudeReasoningEffortSupported(model, normalizedEffort)
+    ? normalizedEffort
+    : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
+}
+
+export function getServerClaudeRuntimeEffort(modelId: string, effort?: unknown): Exclude<ClaudeReasoningEffort, "ultracode"> | undefined {
+  const resolved = resolveServerClaudeReasoningEffort(modelId, effort)
+  return resolved === "ultracode" ? "xhigh" : resolved
+}
+
+export function normalizeServerClaudeReasoningEffort(modelId: string, effort?: unknown): ClaudeReasoningEffort {
+  // Stored preferences keep their required field even when the SDK supports no
+  // effort control. The runtime boundary omits that override in this case.
+  return resolveServerClaudeReasoningEffort(modelId, effort) ?? DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
+}
+
 export function normalizeClaudeModelOptions(
   model: string,
   modelOptions?: ModelOptions,
@@ -359,14 +411,15 @@ export function normalizeClaudeModelOptions(
 ): ClaudeModelOptions {
   const reasoningEffort = modelOptions?.claude?.reasoningEffort
   const fallbackReasoningEffort = fallbackModelOptions?.claude?.reasoningEffort
+  const normalizedEffort = isClaudeReasoningEffort(reasoningEffort)
+    ? reasoningEffort
+    : isClaudeReasoningEffort(legacyEffort)
+      ? legacyEffort
+      : isClaudeReasoningEffort(fallbackReasoningEffort)
+        ? fallbackReasoningEffort
+        : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
   return {
-    reasoningEffort: isClaudeReasoningEffort(reasoningEffort)
-      ? reasoningEffort
-      : isClaudeReasoningEffort(legacyEffort)
-        ? legacyEffort
-        : isClaudeReasoningEffort(fallbackReasoningEffort)
-          ? fallbackReasoningEffort
-          : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort,
+    reasoningEffort: normalizeServerClaudeReasoningEffort(model, normalizedEffort),
     contextWindow: normalizeClaudeContextWindow(
       model,
       (modelOptions?.claude?.contextWindow ?? fallbackModelOptions?.claude?.contextWindow) as ClaudeContextWindow | undefined,

@@ -13,6 +13,7 @@ import {
   type ProviderPreference,
   type ProviderModelOptionsByProvider,
   type ProviderCatalogEntry,
+  normalizeClaudeReasoningEffort,
 } from "../../shared/types"
 import {
   createDefaultProviderDefaults,
@@ -27,6 +28,14 @@ import {
   type ProviderPreferenceInput,
 } from "../../shared/provider-preferences"
 import { findSidebarChat } from "./sidebarStore"
+import { useAppSettingsStore } from "./appSettingsStore"
+
+function clientNormalizationOptions(providerConfig?: ProviderCatalogEntry) {
+  const models = (providerConfig?.id === "claude" ? providerConfig : undefined)?.models
+    ?? useAppSettingsStore.getState().settings?.availableProviders?.find((provider) => provider.id === "claude")?.models
+  return { normalizeClaudeReasoningEffort: (modelId: string, effort?: unknown) =>
+    normalizeClaudeReasoningEffort(modelId, effort, models) }
+}
 
 export type { ChatProviderPreferences, DefaultProviderPreference, ProviderPreference }
 // The normalizers live in shared/provider-preferences (also used by the server's
@@ -58,10 +67,10 @@ export function normalizeDefaultProvider(value?: string): DefaultProviderPrefere
   return "last_used"
 }
 
-export function composerStateForProvider(provider: AgentProvider, value?: ProviderPreferenceInput, _providerConfig?: ProviderCatalogEntry): ComposerState {
+export function composerStateForProvider(provider: AgentProvider, value?: ProviderPreferenceInput, providerConfig?: ProviderCatalogEntry): ComposerState {
   // The normalizer record is keyed by provider, so the provider tag always matches
   // its normalized modelOptions shape; TS can't prove that across the union.
-  return { provider, ...normalizeProviderPreference(provider, value) } as ComposerState
+  return { provider, ...normalizeProviderPreference(provider, value, clientNormalizationOptions(providerConfig)) } as ComposerState
 }
 
 export function composerStateFromModelSettings(settings?: {
@@ -278,10 +287,11 @@ interface ChatPreferencesState {
   legacyComposerState: ComposerState | null
   setDefaultProvider: (provider: DefaultProviderPreference) => void
   syncProviderDefaults: (defaultProvider: DefaultProviderPreference, providerDefaults: ChatProviderPreferences) => void
-  setProviderDefaultModel: (provider: AgentProvider, model: string) => void
+  setProviderDefaultModel: (provider: AgentProvider, model: string, providerConfig?: ProviderCatalogEntry) => void
   setProviderDefaultModelOptions: <TProvider extends AgentProvider>(
     provider: TProvider,
-    modelOptions: Partial<ProviderModelOptionsByProvider[TProvider]>
+    modelOptions: Partial<ProviderModelOptionsByProvider[TProvider]>,
+    providerConfig?: ProviderCatalogEntry,
   ) => void
   setProviderDefaultMode: (provider: AgentProvider, mode: ChatMode) => void
   /** `seed` is the chat's own record (see ComposerSeed); used only when nothing is stored for it. */
@@ -368,14 +378,14 @@ export const useChatPreferencesStore = create<ChatPreferencesState>()(
           chatStates,
         }
       }),
-      setProviderDefaultModel: (provider, model) =>
+      setProviderDefaultModel: (provider, model, providerConfig) =>
         set((state) => ({
           providerDefaults: {
             ...state.providerDefaults,
-            [provider]: normalizeProviderPreference(provider, { ...state.providerDefaults[provider], model }),
+            [provider]: normalizeProviderPreference(provider, { ...state.providerDefaults[provider], model }, clientNormalizationOptions(providerConfig)),
           },
         })),
-      setProviderDefaultModelOptions: (provider, modelOptions) =>
+      setProviderDefaultModelOptions: (provider, modelOptions, providerConfig) =>
         set((state) => ({
           providerDefaults: {
             ...state.providerDefaults,
@@ -385,7 +395,7 @@ export const useChatPreferencesStore = create<ChatPreferencesState>()(
                 ...state.providerDefaults[provider].modelOptions,
                 ...modelOptions,
               } as ProviderModelOptionsInput,
-            }),
+            }, clientNormalizationOptions(providerConfig)),
           },
         })),
       setProviderDefaultMode: (provider, mode) =>

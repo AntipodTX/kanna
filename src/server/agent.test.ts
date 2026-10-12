@@ -4,22 +4,7 @@ import { afterAll, describe, expect, test } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import {
-  AgentCoordinator,
-  startClaudeSession,
-  buildAttachmentHintText,
-  buildConcurrentAgentsNotice,
-  buildClaudeSdkUserMessage,
-  buildPromptText,
-  buildSteeredMessageContent,
-  claudeToolset,
-  formatQuestionAnswersFollowUp,
-  maxClaudeContextWindowFromModelUsage,
-  normalizeClaudeContextUsage,
-  normalizeClaudeStreamMessage,
-  normalizeClaudeUsageSnapshot,
-  RESUME_AFTER_RESTART_MESSAGE,
-} from "./agent"
+import { AgentCoordinator, startClaudeSession, buildAttachmentHintText, buildConcurrentAgentsNotice, buildClaudeSdkUserMessage, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, resolveClaudeRuntimeOptions } from "./agent"
 import type { HarnessTurn } from "./harness-types"
 import type { ContextRestoration } from "./events"
 import type { SubagentActivityUpdate } from "./background-tasks"
@@ -6967,5 +6952,26 @@ describe("main integration review of early preparation ownership", () => {
       await expect(nativeCallback({})).resolves.toEqual({ answer: "current turn" })
       expect(requests).toBe(1)
     } finally { events.close(); coordinator.dispose() }
+  })
+})
+
+
+describe("resolveClaudeRuntimeOptions", () => {
+  test("forwards SDK effort levels without extra settings", () => {
+    expect(resolveClaudeRuntimeOptions("xhigh")).toEqual({
+      effort: "xhigh",
+      settings: undefined,
+    })
+    expect(resolveClaudeRuntimeOptions("max")).toEqual({
+      effort: "max",
+      settings: undefined,
+    })
+  })
+
+  test("maps Ultracode to xhigh plus the session setting", () => {
+    expect(resolveClaudeRuntimeOptions("ultracode")).toEqual({
+      effort: "xhigh",
+      settings: { ultracode: true },
+    })
   })
 })

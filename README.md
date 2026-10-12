@@ -5,6 +5,7 @@
 ### Features
 
 - Edit earlier Claude and Codex prompts or fork a chat from any user message while preserving session context and model preferences.
+- Claude XHigh and Ultracode effort options driven by current SDK metadata.
 
 ### Fixes
 
