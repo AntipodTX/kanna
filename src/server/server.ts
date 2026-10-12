@@ -3,7 +3,7 @@ import { PerformanceLog } from "./performance-log"
 import path from "node:path"
 import { stat } from "node:fs/promises"
 import { APP_NAME, getDataDir, getRuntimeProfile, LOG_PREFIX } from "../shared/branding"
-import type { ChatAttachment } from "../shared/types"
+import type { ChatAttachment, IdleSessionTimeoutPreference } from "../shared/types"
 import type { ShareMode } from "../shared/share"
 import {
   CLOUD_BROWSER_PATH_PREFIX,
@@ -65,6 +65,21 @@ async function withOriginAgentCluster(response: Response | Promise<Response> | u
   // chance that a busy preview shares Kanna's renderer.
   resolved?.headers.set("Origin-Agent-Cluster", "?1")
   return resolved
+}
+
+function idleSessionTimeoutMs(value: IdleSessionTimeoutPreference): number | null {
+  switch (value) {
+    case "15m":
+      return 15 * 60 * 1000
+    case "30m":
+      return 30 * 60 * 1000
+    case "1h":
+      return 60 * 60 * 1000
+    case "never":
+      return null
+  }
+  const exhaustive: never = value
+  return exhaustive
 }
 
 export async function persistUploadedFiles(args: {
@@ -273,6 +288,11 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
       router.scheduleBroadcast()
     },
   })
+  agent.setIdleSessionTimeoutMs(idleSessionTimeoutMs(appSettings.getSnapshot().idleSessionTimeout))
+  const disposeAgentIdleSettings = appSettings.onChange((snapshot) => {
+    agent.setIdleSessionTimeoutMs(idleSessionTimeoutMs(snapshot.idleSessionTimeout))
+  })
+
   const usageLimits = new UsageLimitsManager(path.join(store.dataDir, "usage-limits.json"), {
     fetchClaudeUsage: () => agent.fetchClaudeUsage(),
     fetchCodexRateLimits: () => agent.fetchCodexRateLimits(),
@@ -790,6 +810,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     // restarts the work instead of leaving it interrupted (see resume-turns.ts).
     try { await agent.interruptForShutdown() } finally { agent.dispose() }
     router.dispose()
+    disposeAgentIdleSettings()
     providerAuth.dispose()
     usageLimits.dispose()
     appSettings.dispose()
