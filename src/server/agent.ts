@@ -140,7 +140,7 @@ export function claudeToolset(autoPlan: boolean): string[] {
 
 interface PendingToolRequest {
   toolUseId: string
-  tool: NormalizedToolCall & { toolKind: "ask_user_question" | "exit_plan_mode" }
+  tool: NormalizedToolCall & { toolKind: "ask_user_question" | "exit_plan_mode" | "codex_approval" }
   resolve: (result: unknown) => void
   resultOwner?: "tool"
   validateResult?: (result: unknown) => void
@@ -167,6 +167,25 @@ function getToolRequestPreview(tool: PendingToolRequest["tool"]) {
     if (summary) return summary
     const plan = normalizePreviewText(tool.input.plan ?? "")
     if (plan) return plan
+  }
+
+  if (tool.toolKind === "codex_approval") {
+    if (tool.input.approvalKind === "mcp_tool_call") {
+      const message = normalizePreviewText(tool.input.message)
+      if (message) return message
+    } else {
+      const reason = normalizePreviewText(tool.input.reason ?? "")
+      if (reason) return reason
+      const rawDetail = tool.input.approvalKind === "command_execution"
+        ? tool.input.command ?? ""
+        : tool.input.approvalKind === "file_change"
+          ? tool.input.grantRoot ?? ""
+          : tool.input.cwd ?? ""
+      const detail = normalizePreviewText(
+        rawDetail,
+      )
+      if (detail) return detail
+    }
   }
 
   return "Waiting for your response."
@@ -432,12 +451,19 @@ export function formatQuestionAnswersFollowUp(questions: AskUserQuestionItem[], 
 }
 
 function discardedToolResult(
-  tool: NormalizedToolCall & { toolKind: "ask_user_question" | "exit_plan_mode" }
+  tool: NormalizedToolCall & { toolKind: "ask_user_question" | "exit_plan_mode" | "codex_approval" }
 ) {
   if (tool.toolKind === "ask_user_question") {
     return {
       discarded: true,
       answers: {},
+    }
+  }
+
+  if (tool.toolKind === "codex_approval") {
+    return {
+      decision: "decline",
+      discarded: true,
     }
   }
 

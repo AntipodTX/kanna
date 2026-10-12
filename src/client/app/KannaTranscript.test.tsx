@@ -17,7 +17,7 @@ const ROW_WRAPPER_CLASS = "mx-auto max-w-[800px] pb-5"
 function TestTranscript({ messages }: { messages: HydratedTranscriptMessage[] }) {
   const rows = buildResolvedTranscriptRows(messages, {
     isLoading: false,
-    latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null },
+    latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null },
   })
 
   return (
@@ -33,6 +33,7 @@ function TestTranscript({ messages }: { messages: HydratedTranscriptMessage[] })
             onToolGroupExpandedChange={() => undefined}
             onAskUserQuestionSubmit={() => undefined}
             onExitPlanModeConfirm={() => undefined}
+            onCodexApprovalDecision={() => undefined}
           />
         </div>
       ))}
@@ -171,6 +172,29 @@ Please check the latest error first.`,
     expect(html).not.toContain("The user would like you to know the following.")
     expect(html).toContain("Please check the latest error first.")
     expect(html).toContain('aria-label="Sent mid-turn"')
+  })
+
+  test("renders Codex approval prompts outside collapsed tool groups", () => {
+    const html = renderTranscript([
+      {
+        id: "approval-1",
+        kind: "tool",
+        toolKind: "codex_approval",
+        toolName: "CodexApproval",
+        toolId: "approval-tool-1",
+        input: {
+          approvalKind: "command_execution",
+          command: "/home/ap24/.bun/bin/bun test",
+          cwd: "/mnt/kanna",
+          reason: "Command needs confirmation.",
+        },
+        timestamp: new Date().toISOString(),
+      },
+    ])
+
+    expect(html).toContain("Approve command")
+    expect(html).toContain("/home/ap24/.bun/bin/bun test")
+    expect(html).toContain("Approval pending")
   })
 
   test("does not render wrappers for context window updates", () => {
