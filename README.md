@@ -7,6 +7,7 @@
 
 ### Fixes
 
+- Support reliable native Codex same-turn steering across the chat lifecycle.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
