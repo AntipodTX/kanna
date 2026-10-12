@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import { buildDefaultOpenCommand, buildEditorCommand, buildPreviewCommand, buildTerminalCommand, tokenizeCommandTemplate } from "./external-open"
+import * as processUtils from "./process-utils"
 
 describe("tokenizeCommandTemplate", () => {
   test("keeps quoted arguments together", () => {
@@ -155,7 +156,13 @@ describe("buildTerminalCommand", () => {
 
   test("defaults to Terminal.app on macOS when no emulator is named", () => {
     // The behaviour the menu had before terminals were detected at all.
-    expect(buildTerminalCommand({ localPath: "/repo", platform: "darwin" }))
-      .toEqual({ command: "open", args: ["-a", "Terminal", "/repo"] })
+    const appDetection = spyOn(processUtils, "canOpenMacApp").mockReturnValue(true)
+    try {
+      expect(buildTerminalCommand({ localPath: "/repo", platform: "darwin" }))
+        .toEqual({ command: "open", args: ["-a", "Terminal", "/repo"] })
+      expect(appDetection).toHaveBeenCalledWith("Terminal")
+    } finally {
+      appDetection.mockRestore()
+    }
   })
 })
