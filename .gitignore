@@ -9,6 +9,7 @@ dist/
 .env
 .env.*
 !.env.example
+postcss.local.config.js
 
 # editor / OS
 .DS_Store
