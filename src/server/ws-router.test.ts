@@ -607,6 +607,33 @@ describe("ws-router", () => {
     }])
   })
 
+  test.each([
+    { type: "settings.readAppSettings" },
+    { type: "settings.writeAppSettings", analyticsEnabled: false },
+    { type: "settings.writeAppSettingsPatch", patch: { theme: "dark" } },
+  ] as const)("includes live models in $type replies", async (command) => {
+    const router = createTestRouter()
+    const ws = new FakeWebSocket()
+    try {
+      applyCodexModels([{ model: "gpt-6-astra", displayName: "GPT-6-Astra" }])
+      await router.handleMessage(ws as never, JSON.stringify({
+        v: PROTOCOL_VERSION,
+        type: "command",
+        id: "settings-live-models",
+        command,
+      }))
+      const reply = ws.sent.find((message) => (message as { type: string }).type === "ack") as {
+        result: AppSettingsSnapshot
+      }
+      expect(reply.result.availableProviders).toEqual(SERVER_PROVIDERS)
+      expect(reply.result.availableProviders?.find((provider) => provider.id === "codex")?.models)
+        .toEqual(expect.arrayContaining([expect.objectContaining({ id: "gpt-6-astra" })]))
+    } finally {
+      router.dispose()
+      resetServerProvidersForTests()
+    }
+  })
+
   test("reads and writes app settings via commands", async () => {
     const writes: Array<{ analyticsEnabled: boolean }> = []
     let analyticsEnabled = DEFAULT_APP_SETTINGS_SNAPSHOT.analyticsEnabled
@@ -657,7 +684,7 @@ describe("ws-router", () => {
         v: PROTOCOL_VERSION,
         type: "ack",
         id: "settings-read-1",
-        result: DEFAULT_APP_SETTINGS_SNAPSHOT,
+        result: { ...DEFAULT_APP_SETTINGS_SNAPSHOT, availableProviders: SERVER_PROVIDERS },
       },
       {
         v: PROTOCOL_VERSION,
@@ -665,6 +692,7 @@ describe("ws-router", () => {
         id: "settings-write-1",
         result: {
           ...DEFAULT_APP_SETTINGS_SNAPSHOT,
+          availableProviders: SERVER_PROVIDERS,
           analyticsEnabled: false,
         },
       },
@@ -770,6 +798,7 @@ describe("ws-router", () => {
         id: "settings-patch-1",
         result: {
           ...DEFAULT_APP_SETTINGS_SNAPSHOT,
+          availableProviders: SERVER_PROVIDERS,
           theme: "dark",
           terminal: {
             ...DEFAULT_APP_SETTINGS_SNAPSHOT.terminal,
