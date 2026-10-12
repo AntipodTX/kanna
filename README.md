@@ -4,6 +4,7 @@
 
 ### Features
 
+- Automatic cleanup of idle agent sessions without interrupting background work.
 
 ### Fixes
 
