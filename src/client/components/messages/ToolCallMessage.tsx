@@ -14,6 +14,9 @@ interface Props {
   message: ProcessedToolCall
   isLoading?: boolean
   localPath?: string | null
+  forceExpanded?: boolean
+  revealEntryId?: string | null
+  flashEntryId?: string | null
 }
 
 /** A tool call as the transcript names it: the tool and the thing it acts on. */
@@ -72,7 +75,14 @@ export function formatToolCallTitle(message: ToolTitleSource, localPath?: string
   return message.toolName
 }
 
-export function ToolCallMessage({ message, isLoading = false, localPath }: Props) {
+export function ToolCallMessage({
+  message,
+  isLoading = false,
+  localPath,
+  forceExpanded = false,
+  revealEntryId,
+  flashEntryId,
+}: Props) {
   // Presence is the *existence* of a result entry, not its payload: a result
   // may arrive with its body left on the server, to be fetched only if the row
   // is opened.
@@ -101,7 +111,18 @@ export function ToolCallMessage({ message, isLoading = false, localPath }: Props
     <MetaRow className="w-full" onPointerEnter={prefetchOwnPayloads}>
       {/* Creating the element is free; `ExpandableRow` only mounts it — and so
           only runs the work inside it — once the row is opened. */}
-      <ExpandableRow expandedContent={<ToolCallExpandedContent message={message} isLoading={isLoading} localPath={localPath} />}>
+      <ExpandableRow
+        forceExpanded={forceExpanded}
+        expandedContent={(
+          <ToolCallExpandedContent
+            message={message}
+            isLoading={isLoading}
+            localPath={localPath}
+            revealEntryId={revealEntryId}
+            flashEntryId={flashEntryId}
+          />
+        )}
+      >
         <div className="w-5 h-5 relative flex items-center justify-center">
           {(() => {
             if (message.isError) {

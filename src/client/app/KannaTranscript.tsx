@@ -19,6 +19,7 @@ import { StatusMessage } from "../components/messages/StatusMessage"
 import { CollapsedToolGroup } from "../components/messages/CollapsedToolGroup"
 import { CHAT_SELECTION_ZONE_ATTRIBUTE } from "./chatFocusPolicy"
 import { SPECIAL_TOOL_NAMES } from "./derived"
+import { cn } from "../lib/utils"
 
 const SPECIAL_TOOL_NAME_SET = new Set<string>(SPECIAL_TOOL_NAMES)
 
@@ -514,6 +515,8 @@ interface TranscriptSingleRowProps {
   ) => void
   onExitPlanModeConfirm: (toolUseId: string, confirmed: boolean, clearContext?: boolean, message?: string) => void
   onCodexApprovalDecision: (toolUseId: string, decision: CodexApprovalDecision) => void
+  revealEntryId?: string | null
+  flashEntryId?: string | null
 }
 
 const TranscriptSingleRow = memo(function TranscriptSingleRow({
@@ -537,6 +540,8 @@ const TranscriptSingleRow = memo(function TranscriptSingleRow({
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
   onCodexApprovalDecision,
+  revealEntryId,
+  flashEntryId,
 }: TranscriptSingleRowProps) {
   let rendered: React.ReactNode = null
 
@@ -605,7 +610,17 @@ const TranscriptSingleRow = memo(function TranscriptSingleRow({
           rendered = isLatestTodoWrite ? <TodoWriteMessage key={message.id} message={message} /> : null
           break
         }
-        rendered = <ToolCallMessage key={message.id} message={message} isLoading={isLoading} localPath={localPath} />
+        rendered = (
+          <ToolCallMessage
+            key={message.id}
+            message={message}
+            isLoading={isLoading}
+            localPath={localPath}
+            forceExpanded={Boolean(revealEntryId)}
+            revealEntryId={revealEntryId}
+            flashEntryId={flashEntryId}
+          />
+        )
         break
       case "result":
         rendered = hideResult ? null : <ResultMessage key={message.id} message={message} nextPromptTimestamp={nextPromptTimestamp} />
@@ -635,7 +650,7 @@ const TranscriptSingleRow = memo(function TranscriptSingleRow({
   return (
     <div
       id={`msg-${message.id}`}
-      className="group relative"
+      className={cn("group relative", (message.id === revealEntryId || message.id === flashEntryId) && "kanna-jump-flash")}
       data-index={index}
       {...{ [CHAT_SELECTION_ZONE_ATTRIBUTE]: "" }}
     >
@@ -664,6 +679,8 @@ const TranscriptSingleRow = memo(function TranscriptSingleRow({
   && prev.onAskUserQuestionSubmit === next.onAskUserQuestionSubmit
   && prev.onExitPlanModeConfirm === next.onExitPlanModeConfirm
   && prev.onCodexApprovalDecision === next.onCodexApprovalDecision
+  && prev.revealEntryId === next.revealEntryId
+  && prev.flashEntryId === next.flashEntryId
   && sameMessage(prev.message, next.message)
 ))
 
@@ -674,6 +691,8 @@ interface TranscriptToolGroupProps {
   isLoading: boolean
   localPath?: string
   expanded: boolean
+  revealEntryId?: string | null
+  flashEntryId?: string | null
   onExpandedChange: (groupId: string, next: boolean) => void
 }
 
@@ -684,6 +703,8 @@ const TranscriptToolGroup = memo(function TranscriptToolGroup({
   isLoading,
   localPath,
   expanded,
+  revealEntryId,
+  flashEntryId,
   onExpandedChange,
 }: TranscriptToolGroupProps) {
   return (
@@ -696,6 +717,8 @@ const TranscriptToolGroup = memo(function TranscriptToolGroup({
         isLoading={isLoading}
         localPath={localPath}
         expanded={expanded}
+        revealEntryId={revealEntryId}
+        flashEntryId={flashEntryId}
         onExpandedChange={(next) => onExpandedChange(id, next)}
       />
     </div>
@@ -705,6 +728,8 @@ const TranscriptToolGroup = memo(function TranscriptToolGroup({
   && prev.isLoading === next.isLoading
   && prev.localPath === next.localPath
   && prev.expanded === next.expanded
+  && prev.revealEntryId === next.revealEntryId
+  && prev.flashEntryId === next.flashEntryId
   && prev.onExpandedChange === next.onExpandedChange
   && prev.messages.length === next.messages.length
   && prev.messages.every((message, index) => sameMessage(message, next.messages[index]!))
@@ -790,6 +815,8 @@ interface KannaTranscriptRowProps {
   ) => void
   onExitPlanModeConfirm: (toolUseId: string, confirmed: boolean, clearContext?: boolean, message?: string) => void
   onCodexApprovalDecision: (toolUseId: string, decision: CodexApprovalDecision) => void
+  revealEntryId?: string | null
+  flashEntryId?: string | null
 }
 
 export const KannaTranscriptRow = memo(function KannaTranscriptRow({
@@ -800,6 +827,8 @@ export const KannaTranscriptRow = memo(function KannaTranscriptRow({
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
   onCodexApprovalDecision,
+  revealEntryId,
+  flashEntryId,
 }: KannaTranscriptRowProps) {
   if (row.kind === "tool-group") {
     return (
@@ -810,6 +839,8 @@ export const KannaTranscriptRow = memo(function KannaTranscriptRow({
         isLoading={row.isLoading}
         localPath={row.localPath}
         expanded={toolGroupExpanded ?? false}
+        revealEntryId={revealEntryId}
+        flashEntryId={flashEntryId}
         onExpandedChange={onToolGroupExpandedChange}
       />
     )
@@ -837,6 +868,8 @@ export const KannaTranscriptRow = memo(function KannaTranscriptRow({
       onAskUserQuestionSubmit={onAskUserQuestionSubmit}
       onExitPlanModeConfirm={onExitPlanModeConfirm}
       onCodexApprovalDecision={onCodexApprovalDecision}
+      revealEntryId={revealEntryId}
+      flashEntryId={flashEntryId}
     />
   )
 }, (prev, next) => {
@@ -848,6 +881,8 @@ export const KannaTranscriptRow = memo(function KannaTranscriptRow({
   if (prev.onAskUserQuestionSubmit !== next.onAskUserQuestionSubmit) return false
   if (prev.onExitPlanModeConfirm !== next.onExitPlanModeConfirm) return false
   if (prev.onCodexApprovalDecision !== next.onCodexApprovalDecision) return false
+  if (prev.revealEntryId !== next.revealEntryId) return false
+  if (prev.flashEntryId !== next.flashEntryId) return false
   if (prev.row.kind !== next.row.kind) return false
   if (prev.row.id !== next.row.id) return false
 

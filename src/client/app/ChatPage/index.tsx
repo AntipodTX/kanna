@@ -44,6 +44,7 @@ import { useTerminalToggleAnimation } from "../useTerminalToggleAnimation"
 import type { AgentProvider, ChatPreview, ChatSkillsSnapshot, ChatTouchedFilesResult, SubagentActivity, TranscriptEntry } from "../../../shared/types"
 import type { KannaState } from "../useKannaState"
 import { getNextMeasuredInputHeight, getTranscriptPaddingBottom } from "../useKannaState"
+import { getActiveChatSnapshot } from "../kannaStateHelpers"
 import { ChatInputDock } from "./ChatInputDock"
 import { DefaultModelsDialog } from "../../components/DefaultModelsDialog"
 import { ChatTranscriptViewport, type TranscriptScrollHandle } from "./ChatTranscriptViewport"
@@ -860,6 +861,16 @@ export function ChatPage() {
     if (isMobileViewport && projectId) hideWidgets(projectId, widgetsChatKey)
   }, [activeChatId, hideWidgets, isMobileViewport, navigate, projectId, widgetsChatKey])
 
+  const handleJumpToEntry = useCallback((entryId: string, revealEntryId?: string) => {
+    if (!activeChatId) return
+    // Search lives in the widget column. Keep that column open on phones so
+    // the reader can move through several results without reopening it.
+    navigate(`/chat/${activeChatId}`, {
+      state: buildChatJumpLocationState({ entryId, revealEntryId }),
+    })
+  }, [activeChatId, navigate])
+
+
   // On a phone the widget column is a sheet over the chat, and the viewer
   // opens over the chat: close the sheet so what you opened is what you see.
   useEffect(() => {
@@ -1466,6 +1477,7 @@ export function ChatPage() {
     state.chatDiffSnapshot,
     state.editorLabel,
   ])
+  const widgetsSnapshot = getActiveChatSnapshot(state.chatSnapshot, state.activeChatId)
   const rightPanelContent = projectId ? (
     // The chat's payload store: an Agents card fetches a prompt the
     // transcript left in the sidecar, as the chat's own rows do.
@@ -1477,10 +1489,15 @@ export function ChatPage() {
       availableProviders={state.availableProviders}
       socket={state.socket}
       active={showRightSidebar || widgetsPeeking}
-      entries={state.chatSnapshot?.messages ?? EMPTY_TRANSCRIPT_ENTRIES}
+      entries={widgetsSnapshot?.messages ?? EMPTY_TRANSCRIPT_ENTRIES}
+      localPath={state.runtime?.localPath}
+      searchReady={widgetsSnapshot !== null}
+      hasOlderMessages={state.hasOlderMessages}
+      onLoadOlderMessages={state.loadOlderMessages}
       subagents={state.runtime?.subagents ?? EMPTY_SUBAGENTS}
       onRunQuickAction={handleRunQuickAction}
       onJumpToToolCall={handleJumpToToolCall}
+      onJumpToEntry={handleJumpToEntry}
       gitWidgets={gitWidgetsProps ? <GitWidgetsContent {...gitWidgetsProps} /> : null}
       isNewChat={showEmptyState}
     />

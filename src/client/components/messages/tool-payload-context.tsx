@@ -47,3 +47,12 @@ export function useToolPayloadPrefetch() {
     store?.prefetch(entryIds)
   }, [store])
 }
+
+/** Load payload-bearing entries for consumers that need to inspect their text. */
+export function useToolPayloadLoader() {
+  const store = useContext(ToolPayloadContext)
+  return useCallback(async (entryIds: ReadonlyArray<string>) => {
+    if (!store || entryIds.length === 0) return []
+    return await store.load(entryIds)
+  }, [store])
+}
