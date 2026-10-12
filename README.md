@@ -7,6 +7,7 @@
 
 ### Fixes
 
+- Suppress stale Claude terminal results after steering.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
