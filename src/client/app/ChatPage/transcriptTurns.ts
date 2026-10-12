@@ -1,4 +1,5 @@
 import type { ResolvedTranscriptRow } from "../KannaTranscript"
+import { getUserMessageDisplayText } from "../../../shared/user-message-content"
 
 /**
  * Pure helpers backing the transcript overview minimap. Kept out of the
@@ -110,7 +111,7 @@ export function buildTranscriptTurns(rows: ResolvedTranscriptRow[]): TranscriptT
         rowIndex: index,
         endRowIndex: index,
         replyRowId: null,
-        prompt: asText(row.message.content),
+        prompt: getUserMessageDisplayText(row.message.content).trim(),
         response: null,
         agentMessageCount: 0,
         error: null,

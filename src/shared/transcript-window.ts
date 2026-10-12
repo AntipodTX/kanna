@@ -1,4 +1,5 @@
 import { toMessagePreview } from "./message-preview"
+import { getUserMessageDisplayText } from "./user-message-content"
 import type { TranscriptEntry, TranscriptOutlineEntry } from "./types"
 
 /**
@@ -137,7 +138,7 @@ export function buildTranscriptOutline(entries: readonly TranscriptEntry[]): Tra
   for (let index = 0; index < entries.length; index += 1) {
     const entry = entries[index]!
     if (entry.kind !== "user_prompt" || entry.hidden) continue
-    const preview = toMessagePreview(entry.content)
+    const preview = toMessagePreview(getUserMessageDisplayText(entry.content))
     outline.push({
       id: entry._id,
       index,
