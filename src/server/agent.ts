@@ -2427,8 +2427,8 @@ export class AgentCoordinator {
    * nobody typed. Resuming leans on the harness session having survived: it
    * holds the original prompt and everything the turn did before it died, so
    * "carry on" is all that has to be said. When the session is gone,
-   * `startTurnForChat`'s own recovery notices and rebuilds the context from our
-   * transcript first (`prepareSessionRestore`), which is exactly what's wanted.
+   * `startTurnForChat`'s actual startup classifier rebuilds from the
+   * admissible local transcript before sending this hidden continuation.
    *
    * Returns whether a turn was actually started.
    */
@@ -2558,8 +2558,11 @@ export class AgentCoordinator {
 
   private async runClaudeSession(session: ClaudeSessionState) {
     const customToolEvents = new KannaToolEventFilter()
+    const isCurrentClaudeSession = () => this.claudeSessions.get(session.chatId) === session
+      && (!this.activeTurns.has(session.chatId) || this.activeTurns.get(session.chatId)?.provider === "claude")
     try {
       for await (const event of session.session.stream) {
+        if (!isCurrentClaudeSession()) continue
         if (event.type === "session_token" && event.sessionToken) {
           session.sessionToken = event.sessionToken
           await this.store.setSessionToken(session.chatId, event.sessionToken)
@@ -2569,25 +2572,47 @@ export class AgentCoordinator {
 
         if (!event.entry || customToolEvents.skip(event.entry)) continue
 
-        const completedPromptSeqs = event.entry.kind === "result" || event.entry.kind === "interrupted"
-          ? this.takeAnsweredClaudePrompts(session, event.promptIds, event.entry.kind === "interrupted" || event.entry.isError)
+        const terminalOwner = this.activeTurns.get(session.chatId)
+        const isTerminalEntry = event.entry.kind === "result" || event.entry.kind === "interrupted"
+        const completedPromptSeqs = isTerminalEntry
+          ? this.takeAnsweredClaudePrompts(session, event.promptIds, event.entry.kind === "interrupted" || (event.entry.kind === "result" && event.entry.isError))
           : []
-
-        // After an escape/cancel or steer, the SDK ends the cancelled turn
-        // with a result of subtype error_during_execution (is_error, usually
-        // no text). The cancel already appended an "interrupted" entry, so
-        // persisting this would render a spurious "An unknown error
-        // occurred." in the UI. Attribute the result to the prompts it
-        // answers rather than relying on suppressResume, which a steered
-        // follow-up prompt clears before the interrupt error lands.
-        const isCancelledPromptErrorResult =
-          event.entry.kind === "result"
-          && event.entry.isError
-          && completedPromptSeqs.length > 0
+        // UUIDs may answer several prompts, including an interrupted prompt
+        // and the steered follow-up. Keep that result when it answers the
+        // current turn; drop terminals that only belong to cancelled/stale turns.
+        const onlyCancelledPrompts = completedPromptSeqs.length > 0
           && completedPromptSeqs.every((seq) => session.cancelledPromptSeqs.has(seq))
-        if (!isCancelledPromptErrorResult) {
+        const isCancelSettlingErrorResult =
+          session.suppressResume && event.entry.kind === "result" && event.entry.isError
+        const shouldAppendEntry = !isTerminalEntry
+          || (
+            !isCancelSettlingErrorResult
+            && !onlyCancelledPrompts
+            && (
+              completedPromptSeqs.length === 0
+              || (
+                terminalOwner !== undefined
+                && terminalOwner.claudePromptSeq !== undefined
+                && completedPromptSeqs.includes(terminalOwner.claudePromptSeq)
+                && !terminalOwner.cancelRequested
+              )
+            )
+          )
+        if (shouldAppendEntry) {
           await this.store.appendMessage(session.chatId, event.entry)
+        } else {
+          logClaudeSteer("claude_stale_terminal_event_suppressed", {
+            chatId: session.chatId,
+            sessionId: session.id,
+            entryKind: event.entry.kind,
+            activePromptSeq: terminalOwner?.claudePromptSeq ?? null,
+            activeCancelRequested: terminalOwner?.cancelRequested ?? null,
+            completedPromptSeqs,
+            pendingPromptSeqs: session.pendingPrompts.map((prompt) => prompt.seq),
+          })
         }
+
+        if (!isCurrentClaudeSession()) continue
 
         // Background wakeups (Monitor, Cron*, ScheduleWakeup, RemoteTrigger)
         // emit new activity after the previous turn completed. Re-register an
@@ -2648,15 +2673,19 @@ export class AgentCoordinator {
           : completedPromptSeqs.includes(active.claudePromptSeq)
         if (event.entry.kind === "result" && active && completesActive) {
           active.hasFinalResult = true
-          if (event.entry.isError) {
-            await this.store.recordTurnFailed(session.chatId, event.entry.result || "Turn failed")
-          } else if (!active.cancelRequested) {
-            await this.store.recordTurnFinished(session.chatId)
-          }
           active.customTools?.abort()
-          this.activeTurns.delete(session.chatId)
           if (!active.cancelRequested) {
-            await this.maybeStartNextQueuedMessage(session.chatId)
+            if (event.entry.isError) {
+              await this.store.recordTurnFailed(session.chatId, event.entry.result || "Turn failed")
+            } else {
+              await this.store.recordTurnFinished(session.chatId)
+            }
+            if (this.activeTurns.get(session.chatId) === active) {
+              this.activeTurns.delete(session.chatId)
+              await this.maybeStartNextQueuedMessage(session.chatId)
+            }
+          } else if (this.activeTurns.get(session.chatId) === active) {
+            this.activeTurns.delete(session.chatId)
           }
         }
 
@@ -2664,7 +2693,7 @@ export class AgentCoordinator {
       }
     } catch (error) {
       const active = this.activeTurns.get(session.chatId)
-      if (active && !active.cancelRequested) {
+      if (this.claudeSessions.get(session.chatId) === session && active && !active.cancelRequested) {
         const message = error instanceof Error ? error.message : String(error)
         await this.store.appendMessage(
           session.chatId,
@@ -2685,14 +2714,14 @@ export class AgentCoordinator {
       // lands afterwards. Deleting by chatId alone would drop the new session.
       if (this.claudeSessions.get(session.chatId) === session) {
         this.claudeSessions.delete(session.chatId)
-      }
-      const active = this.activeTurns.get(session.chatId)
-      if (active?.provider === "claude") {
-        active.customTools?.abort()
-        if (active.cancelRequested && !active.cancelRecorded) {
-          await this.store.recordTurnCancelled(session.chatId)
+        const active = this.activeTurns.get(session.chatId)
+        if (active?.provider === "claude") {
+          active.customTools?.abort()
+          if (active.cancelRequested && !active.cancelRecorded) {
+            await this.store.recordTurnCancelled(session.chatId)
+          }
+          this.activeTurns.delete(session.chatId)
         }
-        this.activeTurns.delete(session.chatId)
       }
       // The session is gone, so nothing it spawned can report back. Only when
       // it is still the chat's session: a restart's replacement owns them now.
