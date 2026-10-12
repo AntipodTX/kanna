@@ -1598,6 +1598,8 @@ export function createWsRouter({
           return
         }
         case "chat.archive": {
+          await agent.cancel(command.chatId)
+          await agent.closeChat(command.chatId)
           // Archiving a chat that never got a message is a hard delete — an
           // empty chat has nothing worth keeping in the Archived list.
           const chat = store.getChat(command.chatId)
