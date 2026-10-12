@@ -212,7 +212,7 @@ describe("CodexAppServerManager", () => {
       model: "gpt-5.4",
       sessionToken: null,
     })
-    expect(replacementSession).toEqual({ sessionToken: "thread-2", resumeFellBack: false })
+    expect(replacementSession).toEqual({ sessionToken: "thread-2", resumeFellBack: false, startupOutcome: { kind: "fresh" } })
   })
 
   test("falls back to thread/start when thread/resume is recoverably missing", async () => {
@@ -243,7 +243,7 @@ describe("CodexAppServerManager", () => {
       sessionToken: "missing-thread",
     })
 
-    expect(started).toEqual({ sessionToken: "thread-2", resumeFellBack: true })
+    expect(started).toEqual({ sessionToken: "thread-2", resumeFellBack: true, startupOutcome: { kind: "fresh" } })
     expect(process.messages.map((message: any) => message.method)).toEqual([
       "initialize",
       "initialized",
@@ -252,6 +252,9 @@ describe("CodexAppServerManager", () => {
     ])
     expect((process.messages[2] as any).params.persistExtendedHistory).toBe(true)
     expect((process.messages[3] as any).params.persistExtendedHistory).toBe(true)
+    const reused = await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: "thread-2" })
+    expect(reused).toEqual({ sessionToken: "thread-2", resumeFellBack: false, startupOutcome: { kind: "reused" } })
+    expect(process.messages.filter((message: any) => message.method === "thread/start")).toHaveLength(1)
   })
 
   // Regression coverage for the real-world "thread/resume failed: thread X
