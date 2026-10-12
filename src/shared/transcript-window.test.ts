@@ -69,6 +69,66 @@ describe("findTranscriptWindowStart", () => {
 })
 
 describe("snapToRowStart", () => {
+  function countedHeaders(entries: TranscriptEntry[]) {
+    let reads = 0
+    const headers = new Proxy(entries, {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key)) reads += 1
+        return Reflect.get(target, key, receiver)
+      },
+    })
+    return { headers, reads: () => reads }
+  }
+
+  const parentCall = (id: string, parentToolUseId?: string) => entry("tool_call", {
+    tool: { kind: "tool", toolKind: "subagent_task", toolName: "Agent", toolId: id, input: {} },
+    ...(parentToolUseId ? { parentToolUseId } : {}),
+  })
+
+  test("bounds header reads linearly for varied missing-parent runs", () => {
+    for (const size of [128, 512, 2048]) {
+      const entries = [text(), text(), ...Array.from({ length: size }, (_, index) =>
+        entry("assistant_text", { text: "orphan", parentToolUseId: `missing-${index % 17}` }))]
+      const counted = countedHeaders(entries)
+      // The fallback stops on the same main-thread row as the old walk.
+      expect(snapToRowStart(counted.headers, entries.length - 1)).toBe(1)
+      expect(counted.reads()).toBeLessThanOrEqual(4 * entries.length)
+    }
+  })
+
+  test("bounds header reads linearly through orphan runs and nested valid parents", () => {
+    for (const size of [128, 512, 2048]) {
+      const entries = [text(), text(), parentCall("root"), text(), parentCall("nested", "root"), text(),
+        entry("assistant_text", { text: "child", parentToolUseId: "nested" }),
+        ...Array.from({ length: size }, (_, index) => entry("assistant_text", {
+          text: "orphan", parentToolUseId: `unavailable-${index}`,
+        }))]
+      const counted = countedHeaders(entries)
+      expect(snapToRowStart(counted.headers, entries.length - 1)).toBe(2)
+      expect(counted.reads()).toBeLessThanOrEqual(4 * entries.length)
+    }
+  })
+
+  test("uses the nearest preceding duplicate parent and excludes current or future calls", () => {
+    const entries = [text(), parentCall("duplicate"), text(), parentCall("duplicate"), text(),
+      parentCall("nested", "duplicate"), text(),
+      entry("assistant_text", { text: "child", parentToolUseId: "nested" }), parentCall("nested")]
+    expect(snapToRowStart(entries, 7)).toBe(3)
+    // After the nested jump, the duplicate at the current cut must be
+    // discarded so its own parent resolves to the earlier duplicate.
+    entries[3] = parentCall("duplicate", "duplicate")
+    expect(snapToRowStart(entries, 7)).toBe(1)
+    const unavailable = [text(), text(), parentCall("self", "self"), parentCall("self")]
+    expect(snapToRowStart(unavailable, 2)).toBe(1)
+  })
+
+  test("does not scan ordinary headers without a parent lookup", () => {
+    const entries = Array.from({ length: 2048 }, () => text())
+    const counted = countedHeaders(entries)
+    expect(snapToRowStart(counted.headers, 1024)).toBe(1024)
+    expect(counted.reads()).toBe(2)
+  })
+
   test("moves back over a tool run and a preceding prompt, and no further", () => {
     const entries = [text(), prompt(), text(), call(), result(), call(), result()]
     expect(snapToRowStart(entries, 6)).toBe(3)
@@ -80,11 +140,25 @@ describe("snapToRowStart", () => {
 
   test("never opens a window on a subagent's entries without their Agent row", () => {
     const agent = () => entry("tool_call", { tool: { kind: "tool", toolKind: "subagent_task", toolName: "Agent", toolId: "a", input: {} } })
-    const child = (kind: string) => entry(kind, { parentToolUseId: "a", text: "", toolId: "t", content: "" })
+    const child = (kind: string) => entry(kind, {
+      parentToolUseId: "a", text: "", toolId: "t", content: "",
+      ...(kind === "tool_call" ? { tool: { kind: "tool", toolKind: "bash", toolName: "Bash", toolId: "t", input: {} } } : {}),
+    })
     // text, agent, [child text, child call, child result, child text], text
     const entries = [text(), agent(), child("assistant_text"), child("tool_call"), child("tool_result"), child("assistant_text"), text()]
     expect(snapToRowStart(entries, 5)).toBe(1)
     expect(snapToRowStart(entries, 2)).toBe(1)
+    expect(snapToRowStart(entries, 6)).toBe(6)
+  })
+
+  test("follows nested Agent ancestry across interleaved main-thread rows", () => {
+    const agent = (id: string, parentToolUseId?: string) => entry("tool_call", {
+      tool: { kind: "tool", toolKind: "subagent_task", toolName: "Agent", toolId: id, input: {} },
+      ...(parentToolUseId ? { parentToolUseId } : {}),
+    })
+    const entries = [text(), agent("root"), text(), agent("nested", "root"), text(), entry("assistant_text", { text: "child", parentToolUseId: "nested" }), text()]
+    expect(snapToRowStart(entries, 5)).toBe(1)
+    expect(snapToRowStart(entries, 3)).toBe(1)
     expect(snapToRowStart(entries, 6)).toBe(6)
   })
 })
