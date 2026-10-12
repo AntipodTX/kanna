@@ -10,6 +10,7 @@ import {
   type Query,
   type SDKUserMessage,
   type SlashCommand,
+  type StopHookInput,
 } from "@anthropic-ai/claude-agent-sdk"
 import { homedir } from "node:os"
 import type {
@@ -140,6 +141,42 @@ export function claudeToolset(autoPlan: boolean): string[] {
   return autoPlan ? [...CLAUDE_BASE_TOOLSET, "EnterPlanMode"] : [...CLAUDE_BASE_TOOLSET]
 }
 
+export type ClaudeBackgroundWorkState = "unknown" | "active" | "inactive"
+
+export function classifyClaudeBackgroundWorkState(
+  input: Pick<StopHookInput, "background_tasks" | "session_crons">
+): ClaudeBackgroundWorkState {
+  if (!Array.isArray(input.background_tasks) || !Array.isArray(input.session_crons)) {
+    return "unknown"
+  }
+
+  return input.background_tasks.length > 0 || input.session_crons.length > 0
+    ? "active"
+    : "inactive"
+}
+
+export function createClaudeStopHook(
+  onStateChange: (state: ClaudeBackgroundWorkState) => void
+): HookCallback {
+  return async (input) => {
+    try {
+      onStateChange(
+        input.hook_event_name === "Stop"
+          ? classifyClaudeBackgroundWorkState(input)
+          : "unknown"
+      )
+    } catch {
+      try {
+        onStateChange("unknown")
+      } catch {
+        // Observing background work must never interfere with Claude's Stop lifecycle.
+      }
+    }
+
+    return {}
+  }
+}
+
 interface PendingToolRequest {
   toolUseId: string
   tool: NormalizedToolCall & { toolKind: "ask_user_question" | "exit_plan_mode" }
@@ -225,6 +262,7 @@ interface ClaudeSessionState {
   id: string
   chatId: string
   session: ClaudeSessionHandle
+  backgroundWorkState: ClaudeBackgroundWorkState
   localPath: string
   model: string
   /**
@@ -300,6 +338,7 @@ interface AgentCoordinatorArgs {
     onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
     onRateLimitEvent?: (info: ClaudeRateLimitInfoRaw) => void
     onSubagentActivity?: (update: SubagentActivityUpdate) => void
+    onBackgroundWorkStateChange: (state: ClaudeBackgroundWorkState) => void
   }) => Promise<ClaudeSessionHandle>
   /**
    * Probe whether a provider's native session artifact still exists on disk.
@@ -989,7 +1028,7 @@ export async function startClaudeSession(args: {
    * Delegated work starting, progressing, finishing, or — on Stop — the
    * authoritative list of what is still in flight. Driven by the task stream
    * (background-tasks.ts) and SDK hooks (`subagentHooks`).
-   */
+  */
   onSubagentActivity?: (update: SubagentActivityUpdate) => void
 }, deps = { query, resolveExecutable: resolveClaudeExecutable }): Promise<ClaudeSessionHandle> {
   const canUseTool: CanUseTool = async (toolName, input, options) => {
@@ -1068,7 +1107,7 @@ export async function startClaudeSession(args: {
         mcpServers: { kanna: createClaudeKannaTools(args.customTools) },
       } : {}),
       tools: claudeToolset(args.autoPlan),
-      ...(args.onSubagentActivity ? { hooks: subagentHooks(args.onSubagentActivity) } : {}),
+      hooks: claudeSessionHooks(args),
       // By default the SDK forwards only a subagent's tool calls. Its text
       // (what it is doing, and its final report) completes the nested view
       // under the Agent row; the normalizer stamps it with parent_tool_use_id
@@ -1193,11 +1232,11 @@ export class AgentCoordinator {
   private cursorModelCatalogApplied = false
   private grokModelCatalogApplied = false
   private codexModelCatalogRefresh: Promise<void> | null = null
+  private readonly startingClaudeTurns = new Map<string, symbol>()
+  private readonly claudeReadinessCommits = new Map<string, Promise<void>>()
   readonly activeTurns = new Map<string, ActiveTurn>()
   private readonly codexHistoryChecks = new Map<string, symbol>()
   private readonly cancelledCodexHistoryChecks = new Set<symbol>()
-  private readonly startingClaudeTurns = new Map<string, symbol>()
-  private readonly claudeReadinessCommits = new Map<string, Promise<void>>()
   private readonly historyOperations = new Map<string, {
     cancelled: boolean; snapshot: string; sessionToken: string | null
     turnCount: number | undefined
@@ -1235,6 +1274,8 @@ export class AgentCoordinator {
     sessionToken: string
     transcriptPrefix: TranscriptEntry[]
   }>()
+  private readonly idleSessionTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private idleSessionTimeoutMs: number | null = null
 
   constructor(args: AgentCoordinatorArgs) {
     this.store = args.store
@@ -1294,6 +1335,7 @@ export class AgentCoordinator {
         sessionToken: null,
         forkSession: false,
         onToolRequest: async () => ({}),
+        onBackgroundWorkStateChange: () => {},
       })
       return (await probe.getUsage?.()) ?? null
     } catch {
@@ -1357,9 +1399,32 @@ export class AgentCoordinator {
     }
     this.claudeSessions.clear()
     for (const stream of this.drainingStreams.values()) stream.turn.close()
+    this.claudeSessions.clear()
+    for (const chatId of [...this.idleSessionTimers.keys()]) {
+      this.clearIdleSessionTimer(chatId)
+    }
     this.drainingStreams.clear()
     this.codexManager.stopAll()
     this.piManager.dispose()
+  }
+
+  setIdleSessionTimeoutMs(timeoutMs: number | null) {
+    this.idleSessionTimeoutMs = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : null
+
+    for (const chatId of [...this.idleSessionTimers.keys()]) {
+      this.clearIdleSessionTimer(chatId)
+    }
+
+    if (this.idleSessionTimeoutMs === null) return
+
+    for (const chatId of new Set([
+      ...this.claudeSessions.keys(),
+      ...this.codexManager.getSessionChatIds(),
+    ])) {
+      this.scheduleIdleSessionClose(chatId)
+    }
   }
 
   getActiveStatuses() {
@@ -1649,6 +1714,7 @@ export class AgentCoordinator {
   }
 
   async closeChat(chatId: string) {
+    this.clearIdleSessionTimer(chatId)
     const checking = this.codexHistoryChecks.get(chatId)
     if (checking) this.cancelledCodexHistoryChecks.add(checking)
     const historyOperation = this.historyOperations.get(chatId)
@@ -1672,6 +1738,50 @@ export class AgentCoordinator {
     this.piManager.closeChat(chatId)
     this.codexManager.stopSession(chatId)
     this.emitStateChange(chatId)
+  }
+
+  private clearIdleSessionTimer(chatId: string) {
+    const timer = this.idleSessionTimers.get(chatId)
+    if (!timer) return
+    clearTimeout(timer)
+    this.idleSessionTimers.delete(chatId)
+  }
+
+  private isIdleSessionCloseEligible(chatId: string) {
+    if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId)
+      || this.claudeReadinessCommits.has(chatId) || this.drainingStreams.has(chatId)) return false
+
+    const claudeSession = this.claudeSessions.get(chatId)
+    if (claudeSession) {
+      return claudeSession.backgroundWorkState === "inactive"
+    }
+
+    return this.codexManager.hasSession(chatId)
+  }
+
+  private updateClaudeBackgroundWorkState(
+    chatId: string,
+    sessionInstanceId: string,
+    state: ClaudeBackgroundWorkState
+  ) {
+    const session = this.claudeSessions.get(chatId)
+    if (!session || session.id !== sessionInstanceId) return
+
+    session.backgroundWorkState = state
+    this.scheduleIdleSessionClose(chatId)
+  }
+
+  private scheduleIdleSessionClose(chatId: string) {
+    this.clearIdleSessionTimer(chatId)
+    if (this.idleSessionTimeoutMs === null) return
+    if (!this.isIdleSessionCloseEligible(chatId)) return
+
+    const timer = setTimeout(() => {
+      this.idleSessionTimers.delete(chatId)
+      if (!this.isIdleSessionCloseEligible(chatId)) return
+      void this.closeChat(chatId)
+    }, this.idleSessionTimeoutMs)
+    this.idleSessionTimers.set(chatId, timer)
   }
 
   /**
@@ -1972,6 +2082,7 @@ export class AgentCoordinator {
   }
 
   private async startReservedTurnForChat(args: Parameters<AgentCoordinator["startTurnForChat"]>[0]) {
+    this.clearIdleSessionTimer(args.chatId)
     const pendingCommit = this.claudeReadinessCommits.get(args.chatId)
     if (pendingCommit) await pendingCommit
     if (args.startupReservation && this.startingClaudeTurns.get(args.chatId) !== args.startupReservation) return
@@ -2502,12 +2613,14 @@ export class AgentCoordinator {
     ) {
       if (session) {
         session.forceClosed = true
+        session.session.close()
         this.claudeSessions.delete(args.chatId)
         session.releasePublication()
         session.session.close()
       }
 
       const sessionInstanceId = crypto.randomUUID()
+      let reportedBackgroundWorkState: ClaudeBackgroundWorkState = "unknown"
       const started = await this.startClaudeSessionFn({
         localPath: args.localPath,
         model: args.model,
@@ -2535,6 +2648,10 @@ export class AgentCoordinator {
         } : undefined,
         onRateLimitEvent: (info) => this.onClaudeRateLimit?.(info),
         onSubagentActivity: (update) => this.applySubagentActivity(args.chatId, update),
+        onBackgroundWorkStateChange: (state) => {
+          reportedBackgroundWorkState = state
+          this.updateClaudeBackgroundWorkState(args.chatId, sessionInstanceId, state)
+        },
       })
       if (args.isCurrentTurn && !args.isCurrentTurn()) { started.close(); return null }
       try {
@@ -2558,6 +2675,7 @@ export class AgentCoordinator {
         id: sessionInstanceId,
         chatId: args.chatId,
         session: started,
+        backgroundWorkState: reportedBackgroundWorkState,
         localPath: args.localPath,
         model: args.model,
         promptAgentId: buildKannaAgentId("claude", args.model),
@@ -3969,11 +4087,13 @@ export class AgentCoordinator {
           }
           active.customTools?.abort()
           this.activeTurns.delete(session.chatId)
+          this.scheduleIdleSessionClose(session.chatId)
           if (!active.cancelRequested) {
             await this.maybeStartNextQueuedMessage(session.chatId)
           }
         }
 
+        this.scheduleIdleSessionClose(session.chatId)
         this.emitStateChange(session.chatId)
       }
     } catch (error) {
@@ -4007,6 +4127,7 @@ export class AgentCoordinator {
       // lands afterwards. Deleting by chatId alone would drop the new session.
       if (this.claudeSessions.get(session.chatId) === session) {
         this.claudeSessions.delete(session.chatId)
+        this.clearIdleSessionTimer(session.chatId)
         const active = this.activeTurns.get(session.chatId)
         if (active?.provider === "claude") {
           active.customTools?.abort()
@@ -4137,6 +4258,7 @@ export class AgentCoordinator {
       }
       // Stream has fully ended — no longer draining.
       if (this.drainingStreams.get(active.chatId)?.turn === active.turn) this.drainingStreams.delete(active.chatId)
+      this.scheduleIdleSessionClose(active.chatId)
       this.emitStateChange(active.chatId)
 
       if (active.postToolFollowUp && !active.cancelRequested) {
@@ -4397,4 +4519,18 @@ export class AgentCoordinator {
 
     this.emitStateChange(command.chatId)
   }
+}
+
+function claudeSessionHooks(args: {
+  onSubagentActivity?: (update: SubagentActivityUpdate) => void
+  onBackgroundWorkStateChange?: (state: ClaudeBackgroundWorkState) => void
+}): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+  const hooks = args.onSubagentActivity ? subagentHooks(args.onSubagentActivity) : {}
+  if (args.onBackgroundWorkStateChange) {
+    hooks.Stop = [
+      ...(hooks.Stop ?? []),
+      { hooks: [createClaudeStopHook(args.onBackgroundWorkStateChange)] },
+    ]
+  }
+  return hooks
 }
