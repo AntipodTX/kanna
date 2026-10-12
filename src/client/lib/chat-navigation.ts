@@ -26,14 +26,17 @@ import { generateUUID } from "./utils"
 export type ChatJumpRole = "prompt" | "reply"
 
 /**
- * Where to land: an end of the last exchange, or a named tool call (the
- * Agents widget's rows, which know the call that spawned each agent).
+ * Where to land: an end of the last exchange, a named tool call (the Agents
+ * widget's rows know the call that spawned each agent), or a concrete
+ * transcript entry selected by search.
  */
-export type ChatJumpTarget = ChatJumpRole | { toolId: string }
+export type ChatJumpTarget = ChatJumpRole | { toolId: string } | { entryId: string; revealEntryId?: string }
 
 export interface ChatJumpLocationState {
   jumpToRole?: ChatJumpRole
   jumpToToolId?: string
+  jumpToEntryId?: string
+  jumpToRevealEntryId?: string
   jumpRequestId: string
 }
 
@@ -42,15 +45,32 @@ export function buildChatJumpLocationState(target: ChatJumpTarget): ChatJumpLoca
   // is undefined over plain http on a LAN/Tailscale hostname.
   return typeof target === "string"
     ? { jumpToRole: target, jumpRequestId: generateUUID() }
-    : { jumpToToolId: target.toolId, jumpRequestId: generateUUID() }
+    : "toolId" in target
+      ? { jumpToToolId: target.toolId, jumpRequestId: generateUUID() }
+      : {
+        jumpToEntryId: target.entryId,
+        ...(target.revealEntryId ? { jumpToRevealEntryId: target.revealEntryId } : {}),
+        jumpRequestId: generateUUID(),
+      }
 }
 
 /** Reads the jump out of an opaque `useLocation().state`, or null if absent. */
 export function readChatJumpLocationState(state: unknown): { target: ChatJumpTarget; requestId: string } | null {
   if (!state || typeof state !== "object") return null
-  const { jumpToRole, jumpToToolId, jumpRequestId } = state as Partial<ChatJumpLocationState>
+  const { jumpToRole, jumpToToolId, jumpToEntryId, jumpToRevealEntryId, jumpRequestId } = state as Partial<ChatJumpLocationState>
   if (typeof jumpRequestId !== "string" || !jumpRequestId) return null
   if (jumpToRole === "prompt" || jumpToRole === "reply") return { target: jumpToRole, requestId: jumpRequestId }
   if (typeof jumpToToolId === "string" && jumpToToolId) return { target: { toolId: jumpToToolId }, requestId: jumpRequestId }
+  if (typeof jumpToEntryId === "string" && jumpToEntryId) {
+    return {
+      target: {
+        entryId: jumpToEntryId,
+        ...(typeof jumpToRevealEntryId === "string" && jumpToRevealEntryId
+          ? { revealEntryId: jumpToRevealEntryId }
+          : {}),
+      },
+      requestId: jumpRequestId,
+    }
+  }
   return null
 }

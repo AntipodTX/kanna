@@ -6,6 +6,8 @@ import { MetaRow, MetaLabel } from "./shared"
 import { AnimatedShinyText } from "../ui/animated-shiny-text"
 import type { ProcessedToolCall } from "./types"
 import type { HydratedTranscriptMessage } from "../../../shared/types"
+import { cn } from "../../lib/utils"
+import { containsTranscriptEntry } from "./transcript-tree"
 
 interface ToolCategory {
   key: string
@@ -62,10 +64,12 @@ interface Props {
   isLoading: boolean
   localPath?: string | null
   expanded: boolean
+  revealEntryId?: string | null
+  flashEntryId?: string | null
   onExpandedChange: (next: boolean) => void
 }
 
-export function CollapsedToolGroup({ messages, isLoading, localPath, expanded, onExpandedChange }: Props) {
+export function CollapsedToolGroup({ messages, isLoading, localPath, expanded, revealEntryId, flashEntryId, onExpandedChange }: Props) {
   const label = useMemo(() => getToolGroupLabel(messages), [messages])
 
   // In progress = no result entry has arrived yet. Deliberately not "has no
@@ -111,12 +115,20 @@ export function CollapsedToolGroup({ messages, isLoading, localPath, expanded, o
         {expanded && (
           <div className="my-4 flex flex-col gap-3">
             {messages.map(msg => (
-              <ToolCallMessage
+              <div
                 key={msg.id}
-                message={msg as ProcessedToolCall}
-                isLoading={isLoading}
-                localPath={localPath}
-              />
+                id={`msg-${msg.id}`}
+                className={cn("w-full", (msg.id === revealEntryId || msg.id === flashEntryId) && "kanna-jump-flash")}
+              >
+                <ToolCallMessage
+                  message={msg as ProcessedToolCall}
+                  isLoading={isLoading}
+                  localPath={localPath}
+                  forceExpanded={containsTranscriptEntry(msg, revealEntryId)}
+                  revealEntryId={revealEntryId}
+                  flashEntryId={flashEntryId}
+                />
+              </div>
             ))}
             {messages.length > 5 && (
               <button

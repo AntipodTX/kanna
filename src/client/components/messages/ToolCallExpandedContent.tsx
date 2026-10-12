@@ -201,9 +201,17 @@ interface Props {
   /** Whether the chat is still streaming; a subagent's open calls shimmer on it. */
   isLoading?: boolean
   localPath?: string | null
+  revealEntryId?: string | null
+  flashEntryId?: string | null
 }
 
-export function ToolCallExpandedContent({ message: row, isLoading = false, localPath }: Props) {
+export function ToolCallExpandedContent({
+  message: row,
+  isLoading = false,
+  localPath,
+  revealEntryId,
+  flashEntryId,
+}: Props) {
   // Mounting this component is the signal that the payloads are wanted; these
   // request them if the transcript arrived without them.
   const fetchedCall = useToolPayload(row.inputTrimmed ? row.id : undefined)
@@ -307,7 +315,13 @@ export function ToolCallExpandedContent({ message: row, isLoading = false, local
           </MetaCodeBlock>
         )}
         {message.toolKind === "subagent_task" && message.children && message.children.length > 0 && (
-          <SubagentTranscript messages={message.children} isLoading={isLoading} localPath={localPath} />
+          <SubagentTranscript
+            messages={message.children}
+            isLoading={isLoading}
+            localPath={localPath}
+            revealEntryId={revealEntryId}
+            flashEntryId={flashEntryId}
+          />
         )}
         {hasResult && isReadTool && !message.isError && (
           readImages.length > 0 ? (

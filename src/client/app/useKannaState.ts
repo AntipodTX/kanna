@@ -176,7 +176,7 @@ export interface KannaState {
   /** Every user prompt in the chat, loaded or not (see shared/transcript-window.ts). */
   transcriptOutline: TranscriptOutlineEntry[]
   /** Widen the window toward the start; the rows arrive on the subscription. */
-  loadOlderMessages: (options?: { untilMessageId?: string; all?: boolean }) => Promise<void>
+  loadOlderMessages: (options?: { untilMessageId?: string; all?: boolean }) => Promise<boolean>
   isLoadingOlderMessages: boolean
   chatDiffSnapshot: ChatDiffSnapshot | null
   keybindings: KeybindingsSnapshot | null
@@ -402,7 +402,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
    * snapshot rather than on this promise for rows.
    */
   const loadOlderMessages = useCallback(async (options?: { untilMessageId?: string; all?: boolean }) => {
-    if (!activeChatId) return
+    if (!activeChatId) return false
     setIsLoadingOlderMessages(true)
     try {
       await socket.command<{ startIndex: number }>({
@@ -411,8 +411,10 @@ export function useKannaState(activeChatId: string | null): KannaState {
         ...(options?.untilMessageId !== undefined ? { untilMessageId: options.untilMessageId } : {}),
         ...(options?.all ? { all: true } : {}),
       })
+      return true
     } catch (error) {
       setCommandError(error instanceof Error ? error.message : String(error))
+      return false
     } finally {
       setIsLoadingOlderMessages(false)
     }

@@ -16,15 +16,22 @@ import type { TranscriptEntry } from "../../../shared/types"
 export interface ToolPayloadStore {
   /** Warm these ids. Safe to call on every hover; duplicates cost nothing. */
   prefetch(entryIds: ReadonlyArray<string | undefined>): void
+  /** Fetch these payloads and return them in request order. */
+  load(entryIds: ReadonlyArray<string>): Promise<TranscriptEntry[]>
   get(entryId: string | undefined): TranscriptEntry | undefined
   subscribe(entryId: string | undefined, onChange: () => void): () => void
 }
 
 export function createToolPayloadStore(
-  fetchEntries: (entryIds: string[]) => Promise<TranscriptEntry[]>
+  fetchEntries: (entryIds: string[]) => Promise<TranscriptEntry[]>,
+  maxBatchSize = 256,
 ): ToolPayloadStore {
   const cache = new Map<string, TranscriptEntry>()
-  const inFlight = new Set<string>()
+  const pending = new Map<string, {
+    promise: Promise<void>
+    resolve: () => void
+    reject: (error: unknown) => void
+  }>()
   const listeners = new Map<string, Set<() => void>>()
   let queued: Set<string> | null = null
 
@@ -35,38 +42,68 @@ export function createToolPayloadStore(
   async function flush(batch: Set<string>) {
     const entryIds = [...batch]
     try {
-      for (const entry of await fetchEntries(entryIds)) {
-        cache.set(entry._id, entry)
+      for (let start = 0; start < entryIds.length; start += maxBatchSize) {
+        const ids = entryIds.slice(start, start + maxBatchSize)
+        for (const entry of await fetchEntries(ids)) cache.set(entry._id, entry)
       }
-    } catch {
-      // Swallowed on purpose: a payload that failed to load is a row that
-      // stays in its loading state, not an error worth interrupting a
-      // transcript for. Clearing in-flight below lets the next open retry.
+      for (const entryId of entryIds) pending.get(entryId)?.resolve()
+    } catch (error) {
+      for (const entryId of entryIds) pending.get(entryId)?.reject(error)
     } finally {
       for (const entryId of entryIds) {
-        inFlight.delete(entryId)
+        pending.delete(entryId)
         notify(entryId)
       }
     }
   }
 
+  function request(entryIds: ReadonlyArray<string | undefined>): Promise<void>[] {
+    const promises: Promise<void>[] = []
+    for (const entryId of entryIds) {
+      if (!entryId || cache.has(entryId)) continue
+      const existing = pending.get(entryId)
+      if (existing) {
+        promises.push(existing.promise)
+        continue
+      }
+
+      let resolve!: () => void
+      let reject!: (error: unknown) => void
+      const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise
+        reject = rejectPromise
+      })
+      pending.set(entryId, { promise, resolve, reject })
+      promises.push(promise)
+
+      if (!queued) {
+        queued = new Set()
+        // One logical batch per tick. Large callers (full-chat search) are
+        // split at the wire limit by flush; ordinary tool groups remain one
+        // request.
+        queueMicrotask(() => {
+          const batch = queued
+          queued = null
+          if (batch) void flush(batch)
+        })
+      }
+      queued.add(entryId)
+    }
+    return promises
+  }
+
   return {
     prefetch(entryIds) {
-      for (const entryId of entryIds) {
-        if (!entryId || cache.has(entryId) || inFlight.has(entryId)) continue
-        inFlight.add(entryId)
-        if (!queued) {
-          queued = new Set()
-          // One batch per tick, so hovering a group of thirty calls is one
-          // request rather than thirty.
-          const batch = queued
-          queueMicrotask(() => {
-            queued = null
-            void flush(batch)
-          })
-        }
-        queued.add(entryId)
-      }
+      // A row that fails to warm simply stays in its loading state. Clearing
+      // pending in flush lets the next hover/open retry.
+      void Promise.all(request(entryIds)).catch(() => {})
+    },
+
+    async load(entryIds) {
+      await Promise.all(request(entryIds))
+      return entryIds
+        .map((entryId) => cache.get(entryId))
+        .filter((entry): entry is TranscriptEntry => entry !== undefined)
     },
 
     get(entryId) {
