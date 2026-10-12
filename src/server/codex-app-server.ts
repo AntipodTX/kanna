@@ -4,12 +4,15 @@ import { createInterface } from "node:readline"
 import type { Readable, Writable } from "node:stream"
 import type {
   AskUserQuestionItem,
+  CodexApprovalToolCall,
   CodexReasoningEffort,
   ContextWindowUsageSnapshot,
+  McpApprovalPersistMode,
   ServiceTier,
   TodoItem,
   TranscriptEntry,
 } from "../shared/types"
+import { CODEX_SLASH_COMMANDS } from "../shared/types"
 import type { HarnessEvent, HarnessToolRequest, HarnessTurn } from "./harness-types"
 import { appendSystemMessageBlock, buildSkillSystemMessage } from "./harness-skills"
 import { buildKannaAgentId } from "./attribution"
@@ -24,12 +27,15 @@ import {
   type CollabAgentToolCallItem,
   type ContextCompactedNotification,
   type CodexError,
+  type CodexApprovalPolicy,
   type CodexModelSummary,
   type CodexRateLimitSnapshot,
   type CodexRequestId,
   type GetAccountRateLimitsResponse,
   type CodexSkillMetadata,
   type CodexUserInput,
+  type ApplyPatchApprovalParams,
+  type ApplyPatchApprovalResponse,
   type CommandExecutionApprovalDecision,
   type CommandExecutionRequestApprovalParams,
   type CommandExecutionRequestApprovalResponse,
@@ -39,12 +45,20 @@ import {
   type FileChangeApprovalDecision,
   type FileChangeRequestApprovalParams,
   type FileChangeRequestApprovalResponse,
+  type GrantedPermissionProfile,
+  type ExecCommandApprovalParams,
+  type ExecCommandApprovalResponse,
   type InitializeParams,
   type ItemCompletedNotification,
   type ItemStartedNotification,
   type JsonRpcResponse,
   type McpToolCallItem,
+  type McpServerElicitationRequestParams,
+  type McpServerElicitationRequestResponse,
+  type PermissionsRequestApprovalParams,
+  type PermissionsRequestApprovalResponse,
   type PlanDeltaNotification,
+  type ReviewDecision,
   type ServerNotification,
   type ServerRequest,
   type ModelListParams,
@@ -56,6 +70,8 @@ import {
   type ThreadResumeResponse,
   type ThreadForkParams,
   type ThreadForkResponse,
+  type ThreadCompactStartParams,
+  type ThreadCompactStartResponse,
   type ThreadStartParams,
   type ThreadStartResponse,
   type ThreadTokenUsageUpdatedNotification,
@@ -72,6 +88,8 @@ import {
   isServerNotification,
   isServerRequest,
 } from "./codex-app-server-protocol"
+
+const CODEX_APPROVAL_POLICY: CodexApprovalPolicy = "on-request"
 
 interface CodexAppServerProcess {
   stdin: Writable
@@ -127,7 +145,20 @@ interface PendingTurn {
           kind: "file_change"
           params: FileChangeRequestApprovalParams
         }
+      | {
+          requestId: CodexRequestId
+          kind: "permissions"
+          params: PermissionsRequestApprovalParams
+        }
   ) => Promise<CommandExecutionApprovalDecision | FileChangeApprovalDecision>
+}
+
+interface PendingCompaction {
+  threadId: string
+  turnId: string | null
+  compacted: boolean
+  resolve: () => void
+  reject: (error: Error) => void
 }
 
 interface SessionContext {
@@ -137,7 +168,9 @@ interface SessionContext {
   child: CodexAppServerProcess
   pendingRequests: Map<CodexRequestId, PendingRequest<unknown>>
   pendingTurn: PendingTurn | null
+  pendingCompaction?: PendingCompaction | null
   sessionToken: string | null
+  syntheticSystemInitEmitted?: boolean
   stderrLines: string[]
   closed: boolean
 }
@@ -187,7 +220,7 @@ function codexSystemInitEntry(model: string): TranscriptEntry {
     model,
     tools: ["Bash", "Write", "Edit", "WebSearch", "TodoWrite", "AskUserQuestion", "ExitPlanMode"],
     agents: ["spawnAgent", "sendInput", "resumeAgent", "wait", "closeAgent"],
-    slashCommands: [],
+    slashCommands: [...CODEX_SLASH_COMMANDS],
     mcpServers: [],
   })
 }
@@ -301,6 +334,170 @@ function toToolRequestUserInputResponse(raw: unknown, questions: ToolRequestUser
   return { answers }
 }
 
+function toCodexApprovalTool(args:
+  | { kind: "command_execution"; params: CommandExecutionRequestApprovalParams }
+  | { kind: "file_change"; params: FileChangeRequestApprovalParams }
+  | { kind: "permissions"; params: PermissionsRequestApprovalParams }
+): CodexApprovalToolCall {
+  const approvalId = args.kind === "command_execution" ? args.params.approvalId : null
+  const toolId = approvalId || `${args.params.itemId}:approval`
+  if (args.kind === "command_execution") {
+    return {
+      kind: "tool",
+      toolKind: "codex_approval",
+      toolName: "CodexApproval",
+      toolId,
+      input: {
+        approvalKind: args.kind,
+        command: args.params.command ?? undefined,
+        cwd: args.params.cwd ?? undefined,
+        reason: args.params.reason ?? undefined,
+        approvalId: args.params.approvalId ?? undefined,
+      },
+      rawInput: { ...args.params, approvalKind: args.kind },
+    }
+  }
+
+  if (args.kind === "permissions") {
+    return {
+      kind: "tool",
+      toolKind: "codex_approval",
+      toolName: "CodexApproval",
+      toolId,
+      input: {
+        approvalKind: args.kind,
+        cwd: args.params.cwd,
+        reason: args.params.reason ?? undefined,
+        permissions: args.params.permissions,
+      },
+      rawInput: { ...args.params, approvalKind: args.kind },
+    }
+  }
+
+  return {
+    kind: "tool",
+    toolKind: "codex_approval",
+    toolName: "CodexApproval",
+    toolId,
+    input: {
+      approvalKind: args.kind,
+      grantRoot: args.params.grantRoot ?? undefined,
+      reason: args.params.reason ?? undefined,
+    },
+    rawInput: { ...args.params, approvalKind: args.kind },
+  }
+}
+
+function toCodexApprovalDecision(raw: unknown, allowCancel: boolean): CommandExecutionApprovalDecision {
+  const decision = asRecord(raw)?.decision
+  if (decision === "accept" || decision === "acceptForSession" || decision === "decline") {
+    return decision
+  }
+  if (allowCancel && decision === "cancel") return decision
+  return "decline"
+}
+
+function mcpApprovalPersistModes(meta: Record<string, unknown>): McpApprovalPersistMode[] {
+  const rawPersist = Array.isArray(meta.persist) ? meta.persist : [meta.persist]
+  const modes: McpApprovalPersistMode[] = []
+  for (const mode of rawPersist) {
+    if ((mode === "session" || mode === "always") && !modes.includes(mode)) {
+      modes.push(mode)
+    }
+  }
+  return modes
+}
+
+type McpCodexApprovalToolCall = Omit<CodexApprovalToolCall, "input"> & {
+  input: Extract<CodexApprovalToolCall["input"], { approvalKind: "mcp_tool_call" }>
+}
+
+function toMcpApprovalTool(
+  requestId: CodexRequestId,
+  params: McpServerElicitationRequestParams,
+): McpCodexApprovalToolCall | null {
+  if (params.mode !== "form") return null
+  const meta = asRecord(params._meta)
+  if (meta?.codex_approval_kind !== "mcp_tool_call") return null
+
+  return {
+    kind: "tool",
+    toolKind: "codex_approval",
+    toolName: "CodexApproval",
+    toolId: `mcp:${params.serverName}:${String(requestId)}:approval`,
+    input: {
+      approvalKind: "mcp_tool_call",
+      serverName: params.serverName,
+      message: params.message,
+      toolName: typeof meta.tool_name === "string" ? meta.tool_name : undefined,
+      toolTitle: typeof meta.tool_title === "string" ? meta.tool_title : undefined,
+      toolDescription: typeof meta.tool_description === "string" ? meta.tool_description : undefined,
+      toolParams: meta.tool_params,
+      persistModes: mcpApprovalPersistModes(meta),
+    },
+    rawInput: { ...params, approvalKind: "mcp_tool_call" },
+  }
+}
+
+function toMcpElicitationResponse(
+  raw: unknown,
+  persistModes: McpApprovalPersistMode[],
+): McpServerElicitationRequestResponse {
+  const decision = asRecord(raw)?.decision
+  if (decision === "accept") return { action: "accept", content: null, _meta: null }
+  if (decision === "acceptForSession" && persistModes.includes("session")) {
+    return { action: "accept", content: null, _meta: { persist: "session" } }
+  }
+  if (decision === "acceptAlways" && persistModes.includes("always")) {
+    return { action: "accept", content: null, _meta: { persist: "always" } }
+  }
+  if (decision === "decline") return { action: "decline", content: null, _meta: null }
+  return { action: "cancel", content: null, _meta: null }
+}
+
+function toReviewDecision(raw: unknown, allowCancel: boolean): ReviewDecision {
+  const decision = toCodexApprovalDecision(raw, allowCancel)
+  if (decision === "accept") return "approved"
+  if (decision === "acceptForSession") return "approved_for_session"
+  if (decision === "cancel") return "abort"
+  return { denied: { rejection: "Denied by user" } }
+}
+
+function toCommandExecutionApprovalParams(
+  params: ExecCommandApprovalParams,
+  turnId: string | null
+): CommandExecutionRequestApprovalParams {
+  return {
+    threadId: params.conversationId,
+    turnId: turnId ?? "",
+    itemId: params.callId,
+    approvalId: params.approvalId,
+    reason: params.reason,
+    command: params.command.join(" "),
+    cwd: params.cwd,
+  }
+}
+
+function toFileChangeApprovalParams(
+  params: ApplyPatchApprovalParams,
+  turnId: string | null
+): FileChangeRequestApprovalParams {
+  return {
+    threadId: params.conversationId,
+    turnId: turnId ?? "",
+    itemId: params.callId,
+    reason: params.reason,
+    grantRoot: params.grantRoot,
+  }
+}
+
+function toGrantedPermissionProfile(params: PermissionsRequestApprovalParams): GrantedPermissionProfile {
+  return {
+    ...(params.permissions.network ? { network: params.permissions.network } : {}),
+    ...(params.permissions.fileSystem ? { fileSystem: params.permissions.fileSystem } : {}),
+  }
+}
+
 function contentFromMcpResult(item: McpToolCallItem): unknown {
   if (item.error?.message) {
     return { error: item.error.message }
@@ -345,23 +542,43 @@ function normalizeCodexTokenUsage(
   }
 }
 
+function normalizePlanStatus(status: unknown): TurnPlanStep["status"] {
+  if (status === "completed") return "completed"
+  if (status === "inProgress" || status === "in_progress") return "inProgress"
+  return "pending"
+}
+
 function todoStatus(status: TurnPlanStep["status"]): TodoItem["status"] {
   if (status === "completed") return "completed"
-  if (status === "inProgress") return "in_progress"
+  if (normalizePlanStatus(status) === "inProgress") return "in_progress"
   return "pending"
 }
 
 function planStepsToTodos(steps: TurnPlanStep[]): TodoItem[] {
   return steps.map((step) => ({
     content: step.step,
-    status: todoStatus(step.status),
+    status: todoStatus(normalizePlanStatus(step.status)),
     activeForm: step.step,
   }))
 }
 
+function completeActivePlanSteps(steps: TurnPlanStep[]): TurnPlanStep[] {
+  return steps.map((step) => {
+    const status = normalizePlanStatus(step.status)
+    return {
+      ...step,
+      status: status === "inProgress" ? "completed" : status,
+    }
+  })
+}
+
+function hasActivePlanStep(steps: TurnPlanStep[]) {
+  return steps.some((step) => normalizePlanStatus(step.status) === "inProgress")
+}
+
 function renderPlanMarkdownFromSteps(steps: TurnPlanStep[]): string {
   return steps.map((step) => {
-    const checkbox = step.status === "completed" ? "[x]" : "[ ]"
+    const checkbox = normalizePlanStatus(step.status) === "completed" ? "[x]" : "[ ]"
     return `- ${checkbox} ${step.step}`
   }).join("\n")
 }
@@ -762,9 +979,11 @@ export class CodexAppServerManager {
     Promise<{ sessionToken: string; resumeFellBack: boolean }>
   >()
   private readonly spawnProcess: SpawnCodexAppServer
+  private readonly compactionTimeoutMs: number
   private onRateLimits: ((snapshot: CodexRateLimitSnapshot) => void) | null = null
 
-  constructor(args: { spawnProcess?: SpawnCodexAppServer } = {}) {
+  constructor(args: { spawnProcess?: SpawnCodexAppServer; compactionTimeoutMs?: number } = {}) {
+    this.compactionTimeoutMs = args.compactionTimeoutMs ?? 300_000
     this.spawnProcess = args.spawnProcess ?? ((cwd) =>
       spawn("codex", ["app-server"], {
         cwd,
@@ -850,7 +1069,9 @@ export class CodexAppServerManager {
       child,
       pendingRequests: new Map(),
       pendingTurn: null,
+      pendingCompaction: null,
       sessionToken: null,
+      syntheticSystemInitEmitted: false,
       stderrLines: [],
       closed: false,
     }
@@ -858,7 +1079,7 @@ export class CodexAppServerManager {
     try {
       await this.sendRequest(context, "initialize", {
         clientInfo: { name: "kanna_desktop", title: "Kanna", version: "0.1.0" },
-        capabilities: { experimentalApi: true },
+        capabilities: { experimentalApi: true, requestAttestation: false },
       } satisfies InitializeParams)
       this.writeMessage(context, { method: "initialized" })
       return await run(context)
@@ -896,7 +1117,9 @@ export class CodexAppServerManager {
       child,
       pendingRequests: new Map(),
       pendingTurn: null,
+      pendingCompaction: null,
       sessionToken: null,
+      syntheticSystemInitEmitted: false,
       stderrLines: [],
       closed: false,
     }
@@ -913,6 +1136,7 @@ export class CodexAppServerManager {
         },
         capabilities: {
           experimentalApi: true,
+          requestAttestation: false,
         },
       } satisfies InitializeParams)
         this.writeMessage(context, {
@@ -933,10 +1157,10 @@ export class CodexAppServerManager {
         model: args.model,
         cwd: args.cwd,
         serviceTier: args.serviceTier,
-        approvalPolicy: "never",
+        approvalPolicy: CODEX_APPROVAL_POLICY,
         sandbox: "danger-full-access",
         experimentalRawEvents: false,
-        persistExtendedHistory: false,
+persistExtendedHistory: true,
         ...toolConfig,
       } satisfies ThreadStartParams
 
@@ -951,9 +1175,9 @@ export class CodexAppServerManager {
           model: args.model,
           cwd: args.cwd,
           serviceTier: args.serviceTier,
-          approvalPolicy: "never",
+          approvalPolicy: CODEX_APPROVAL_POLICY,
           sandbox: "danger-full-access",
-          persistExtendedHistory: false,
+  persistExtendedHistory: true,
           ...toolConfig,
         } satisfies ThreadForkParams)
       } else if (args.sessionToken) {
@@ -963,9 +1187,9 @@ export class CodexAppServerManager {
             model: args.model,
             cwd: args.cwd,
             serviceTier: args.serviceTier,
-            approvalPolicy: "never",
+            approvalPolicy: CODEX_APPROVAL_POLICY,
             sandbox: "danger-full-access",
-            persistExtendedHistory: false,
+            persistExtendedHistory: true,
             ...toolConfig,
           } satisfies ThreadResumeParams)
         } catch (error) {
@@ -999,7 +1223,7 @@ export class CodexAppServerManager {
 
   async startTurn(args: StartCodexTurnArgs): Promise<HarnessTurn> {
     const context = this.requireSession(args.chatId)
-    if (context.pendingTurn) {
+    if (context.pendingTurn || context.pendingCompaction) {
       throw new Error("Codex turn is already running")
     }
 
@@ -1007,7 +1231,10 @@ export class CodexAppServerManager {
     if (context.sessionToken) {
       queue.push({ type: "session_token", sessionToken: context.sessionToken })
     }
-    queue.push({ type: "transcript", entry: codexSystemInitEntry(args.model) })
+    const shouldEmitSystemInit = !context.syntheticSystemInitEmitted
+    if (shouldEmitSystemInit) {
+      queue.push({ type: "transcript", entry: codexSystemInitEntry(args.model) })
+    }
 
     const pendingTurn: PendingTurn = {
       turnId: null,
@@ -1045,7 +1272,7 @@ export class CodexAppServerManager {
       const response = await this.sendRequest<TurnStartResponse>(context, "turn/start", {
         threadId: context.sessionToken ?? "",
         input,
-        approvalPolicy: "never",
+        approvalPolicy: CODEX_APPROVAL_POLICY,
         model: args.model,
         effort: args.effort,
         serviceTier: args.serviceTier,
@@ -1065,6 +1292,9 @@ export class CodexAppServerManager {
         context.pendingTurn.turnId = response.turn.id
       } else {
         pendingTurn.turnId = response.turn.id
+      }
+      if (shouldEmitSystemInit) {
+        context.syntheticSystemInitEmitted = true
       }
     } catch (error) {
       context.pendingTurn = null
@@ -1113,6 +1343,62 @@ export class CodexAppServerManager {
       return skills.filter((skill) => skill.enabled)
     } catch {
       return null
+    }
+  }
+
+  async runSlashCommand(args: { chatId?: string; cwd: string; threadId: string; command: string }): Promise<void> {
+    const activeContext = args.chatId ? this.sessions.get(args.chatId) : undefined
+    if (activeContext && !activeContext.closed && activeContext.cwd === args.cwd && activeContext.sessionToken === args.threadId) {
+      if (activeContext.pendingTurn) throw new Error("Cannot run a Codex slash command while a turn is active")
+      await this.sendCodexSlashCommand(activeContext, args.command, args.threadId)
+      return
+    }
+
+    const completed = await this.withProbe(args.cwd, async (context) => {
+      await this.sendRequest<ThreadResumeResponse>(context, "thread/resume", {
+        threadId: args.threadId,
+        cwd: args.cwd,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+        persistExtendedHistory: false,
+      } satisfies ThreadResumeParams)
+      await this.sendCodexSlashCommand(context, args.command, args.threadId)
+      return true
+    })
+    if (!completed) throw new Error("Codex app-server unavailable")
+  }
+
+  private async sendCodexSlashCommand(context: SessionContext, command: string, threadId: string): Promise<void> {
+    if (command !== "/compact") {
+      throw new Error(`${command} is not supported by the Codex app-server protocol`)
+    }
+    if (context.pendingCompaction) throw new Error("Codex compaction is already running")
+    let operation!: PendingCompaction
+    const completion = new Promise<void>((resolve, reject) => {
+      operation = { threadId, turnId: null, compacted: false, resolve, reject }
+    })
+    // Register before sending: lifecycle notifications may precede the ACK.
+    context.pendingCompaction = operation
+    const requestId = randomUUID()
+    const timeout = setTimeout(() => {
+      this.failContext(context, "Codex compaction timed out before completion")
+      try { context.child.kill("SIGKILL") } catch { /* ignore kill failures */ }
+    }, this.compactionTimeoutMs)
+    try {
+      await Promise.all([
+        this.sendRequest<ThreadCompactStartResponse>(context, "thread/compact/start", {
+          threadId,
+        } satisfies ThreadCompactStartParams, requestId),
+        completion,
+      ])
+    } finally {
+      clearTimeout(timeout)
+      const request = context.pendingRequests.get(requestId)
+      if (request) {
+        context.pendingRequests.delete(requestId)
+        request.reject(new Error("Codex compaction ended before the start acknowledgement"))
+      }
+      if (context.pendingCompaction === operation) context.pendingCompaction = null
     }
   }
 
@@ -1295,15 +1581,9 @@ export class CodexAppServerManager {
           .map((entry) => asRecord(entry))
           .filter((entry): entry is Record<string, unknown> => Boolean(entry))
           .map((entry) => {
-            const status: TurnPlanStep["status"] =
-              entry.status === "completed"
-                ? "completed"
-                : entry.status === "inProgress" || entry.status === "in_progress"
-                  ? "inProgress"
-                  : "pending"
             return {
               step: typeof entry.step === "string" ? entry.step : "",
-              status,
+              status: normalizePlanStatus(entry.status),
             }
           })
           .filter((step) => step.step.length > 0)
@@ -1360,12 +1640,56 @@ export class CodexAppServerManager {
       return
     }
 
+    if (request.method === "execCommandApproval") {
+      const params = toCommandExecutionApprovalParams(request.params, pendingTurn.turnId)
+      const tool = toCodexApprovalTool({ kind: "command_execution", params })
+      const result = pendingTurn.onApprovalRequest
+        ? await pendingTurn.onApprovalRequest({
+            requestId: request.id,
+            kind: "command_execution",
+            params,
+          })
+        : await this.requestCodexApproval(pendingTurn, tool)
+      const decision = toReviewDecision(typeof result === "string" ? { decision: result } : result, true)
+      this.writeMessage(context, {
+        id: request.id,
+        result: {
+          decision,
+        } satisfies ExecCommandApprovalResponse,
+      })
+      return
+    }
+
+    if (request.method === "applyPatchApproval") {
+      const params = toFileChangeApprovalParams(request.params, pendingTurn.turnId)
+      const tool = toCodexApprovalTool({ kind: "file_change", params })
+      const result = pendingTurn.onApprovalRequest
+        ? await pendingTurn.onApprovalRequest({
+            requestId: request.id,
+            kind: "file_change",
+            params,
+          })
+        : await this.requestCodexApproval(pendingTurn, tool)
+      const decision = toReviewDecision(typeof result === "string" ? { decision: result } : result, false)
+      this.writeMessage(context, {
+        id: request.id,
+        result: {
+          decision,
+        } satisfies ApplyPatchApprovalResponse,
+      })
+      return
+    }
+
     if (request.method === "item/commandExecution/requestApproval") {
-      const decision = await pendingTurn.onApprovalRequest?.({
-        requestId: request.id,
-        kind: "command_execution",
-        params: request.params,
-      }) ?? "decline"
+      const tool = toCodexApprovalTool({ kind: "command_execution", params: request.params })
+      const result = pendingTurn.onApprovalRequest
+        ? await pendingTurn.onApprovalRequest({
+            requestId: request.id,
+            kind: "command_execution",
+            params: request.params,
+          })
+        : await this.requestCodexApproval(pendingTurn, tool)
+      const decision = toCodexApprovalDecision(typeof result === "string" ? { decision: result } : result, true)
       this.writeMessage(context, {
         id: request.id,
         result: {
@@ -1375,17 +1699,81 @@ export class CodexAppServerManager {
       return
     }
 
-    const decision = await pendingTurn.onApprovalRequest?.({
-      requestId: request.id,
-      kind: "file_change",
-      params: request.params,
-    }) ?? "decline"
+    if (request.method === "mcpServer/elicitation/request") {
+      const tool = toMcpApprovalTool(request.id, request.params)
+      if (!tool) {
+        this.writeMessage(context, {
+          id: request.id,
+          result: {
+            action: "cancel",
+            content: null,
+            _meta: null,
+          } satisfies McpServerElicitationRequestResponse,
+        })
+        return
+      }
+
+      const result = await this.requestCodexApproval(pendingTurn, tool)
+      this.writeMessage(context, {
+        id: request.id,
+        result: toMcpElicitationResponse(
+          typeof result === "string" ? { decision: result } : result,
+          tool.input.persistModes,
+        ),
+      })
+      return
+    }
+
+    if (request.method === "item/permissions/requestApproval") {
+      const tool = toCodexApprovalTool({ kind: "permissions", params: request.params })
+      const result = pendingTurn.onApprovalRequest
+        ? await pendingTurn.onApprovalRequest({
+            requestId: request.id,
+            kind: "permissions",
+            params: request.params,
+          })
+        : await this.requestCodexApproval(pendingTurn, tool)
+      const decision = toCodexApprovalDecision(typeof result === "string" ? { decision: result } : result, true)
+      this.writeMessage(context, {
+        id: request.id,
+        result: {
+          permissions: decision === "accept" || decision === "acceptForSession"
+            ? toGrantedPermissionProfile(request.params)
+            : {},
+          scope: decision === "acceptForSession" ? "session" : "turn",
+          strictAutoReview: true,
+        } satisfies PermissionsRequestApprovalResponse,
+      })
+      return
+    }
+
+    const tool = toCodexApprovalTool({ kind: "file_change", params: request.params })
+    const result = pendingTurn.onApprovalRequest
+      ? await pendingTurn.onApprovalRequest({
+          requestId: request.id,
+          kind: "file_change",
+          params: request.params,
+        })
+      : await this.requestCodexApproval(pendingTurn, tool)
+    const decision = toCodexApprovalDecision(typeof result === "string" ? { decision: result } : result, false)
+    const fileDecision: FileChangeApprovalDecision = decision === "cancel" ? "decline" : decision
     this.writeMessage(context, {
       id: request.id,
       result: {
-        decision,
+        decision: fileDecision,
       } satisfies FileChangeRequestApprovalResponse,
     })
+  }
+
+  private async requestCodexApproval(pendingTurn: PendingTurn, tool: CodexApprovalToolCall) {
+    pendingTurn.queue.push({
+      type: "transcript",
+      entry: timestamped({
+        kind: "tool_call",
+        tool,
+      }),
+    })
+    return await pendingTurn.onToolRequest({ tool })
   }
 
   private async handleNotification(context: SessionContext, notification: ServerNotification) {
@@ -1407,6 +1795,10 @@ export class CodexAppServerManager {
       return
     }
 
+    if (context.pendingCompaction) {
+      this.handleCompactionNotification(context, notification)
+    }
+
     const pendingTurn = context.pendingTurn
     if (!pendingTurn) return
 
@@ -1421,7 +1813,12 @@ export class CodexAppServerManager {
         this.handleItemStarted(pendingTurn, notification.params)
         return
       case "item/completed":
-        this.handleItemCompleted(pendingTurn, notification.params)
+        this.handleItemCompleted(
+          pendingTurn,
+          notification.params,
+          (!context.sessionToken || notification.params.threadId === context.sessionToken)
+            && (!pendingTurn.turnId || notification.params.turnId === pendingTurn.turnId),
+        )
         return
       case "item/plan/delta":
         this.handlePlanDelta(pendingTurn, notification.params)
@@ -1435,6 +1832,55 @@ export class CodexAppServerManager {
       case "error":
         this.handleErrorNotification(context, notification.params)
         return
+      default:
+        return
+    }
+  }
+
+  private handleCompactionNotification(context: SessionContext, notification: ServerNotification) {
+    const operation = context.pendingCompaction
+    if (!operation) return
+    switch (notification.method) {
+      case "turn/started":
+        if (notification.params.threadId === operation.threadId && !operation.turnId) {
+          operation.turnId = notification.params.turn.id
+        }
+        return
+      case "item/started":
+      case "item/completed": {
+        const { threadId, turnId, item } = notification.params
+        if (threadId !== operation.threadId || item.type !== "contextCompaction") return
+        if (operation.turnId && operation.turnId !== turnId) return
+        operation.turnId = turnId
+        if (notification.method === "item/completed") operation.compacted = true
+        return
+      }
+      case "thread/compacted": {
+        const { threadId, turnId } = notification.params
+        if (threadId !== operation.threadId || (operation.turnId && operation.turnId !== turnId)) return
+        operation.turnId = turnId
+        operation.compacted = true
+        return
+      }
+      case "turn/completed": {
+        const { threadId, turn } = notification.params
+        if (threadId !== operation.threadId || turn.id !== operation.turnId) return
+        if (turn.status !== "completed") {
+          operation.reject(new Error(formatCodexError(turn.error) || `Codex compaction ${turn.status}`))
+        } else if (!operation.compacted) {
+          operation.reject(new Error("Codex turn completed without a compaction result"))
+        } else {
+          operation.resolve()
+        }
+        return
+      }
+      case "error": {
+        const { threadId, turnId, willRetry, error } = notification.params
+        if (threadId && threadId !== operation.threadId) return
+        if (turnId && operation.turnId && turnId !== operation.turnId) return
+        if (!willRetry) this.failContext(context, formatCodexError(error) || "Codex compaction failed")
+        return
+      }
       default:
         return
     }
@@ -1473,8 +1919,28 @@ export class CodexAppServerManager {
     }
   }
 
-  private handleItemCompleted(pendingTurn: PendingTurn, notification: ItemCompletedNotification) {
+  private handleItemCompleted(
+    pendingTurn: PendingTurn,
+    notification: ItemCompletedNotification,
+    isActiveTurn: boolean,
+  ) {
     if (notification.item.type === "agentMessage") {
+      if (
+        isActiveTurn
+        && notification.item.phase === "final_answer"
+        && notification.item.delivery !== "async"
+        && hasActivePlanStep(pendingTurn.latestPlanSteps)
+      ) {
+        pendingTurn.latestPlanSteps = completeActivePlanSteps(pendingTurn.latestPlanSteps)
+        pendingTurn.todoSequence += 1
+        pendingTurn.queue.push({
+          type: "transcript",
+          entry: todoToolCall(
+            `${notification.turnId}:todo-${pendingTurn.todoSequence}`,
+            pendingTurn.latestPlanSteps,
+          ),
+        })
+      }
       pendingTurn.queue.push({
         type: "transcript",
         entry: timestamped({
@@ -1665,6 +2131,8 @@ export class CodexAppServerManager {
 
   private failContext(context: SessionContext, message: string) {
     context.customTools?.close()
+    context.pendingCompaction?.reject(new Error(message))
+    context.pendingCompaction = null
     const pendingTurn = context.pendingTurn
     if (pendingTurn && !pendingTurn.resolved) {
       pendingTurn.queue.push({
@@ -1708,8 +2176,7 @@ export class CodexAppServerManager {
     }
   }
 
-  private async sendRequest<TResult>(context: SessionContext, method: string, params: unknown): Promise<TResult> {
-    const id = randomUUID()
+  private async sendRequest<TResult>(context: SessionContext, method: string, params: unknown, id: CodexRequestId = randomUUID()): Promise<TResult> {
     const promise = new Promise<TResult>((resolve, reject) => {
       context.pendingRequests.set(id, {
         method,

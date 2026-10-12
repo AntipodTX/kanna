@@ -20,7 +20,7 @@ test("display tools render outside collapsed groups with chart and attachment ca
   const messages = processTranscriptMessages(entries)
   const rows = buildResolvedTranscriptRows(messages, { isLoading: false, latestToolIds: getLatestToolIds(messages) })
   expect(rows.every(row => row.kind !== "tool-group")).toBe(true)
-  const html = renderToStaticMarkup(<>{rows.map(row => <KannaTranscriptRow key={row.id} row={row} onToolGroupExpandedChange={() => {}} onAskUserQuestionSubmit={() => {}} onExitPlanModeConfirm={() => {}} />)}</>)
+  const html = renderToStaticMarkup(<>{rows.map(row => <KannaTranscriptRow key={row.id} row={row} onToolGroupExpandedChange={() => {}} onAskUserQuestionSubmit={() => {}} onExitPlanModeConfirm={() => {}} onCodexApprovalDecision={() => {}} />)}</>)
   expect(html).toContain("Sales")
   expect(html).toContain("Download CSV")
   expect(html).toContain("Expand chart")
