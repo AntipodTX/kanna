@@ -1150,6 +1150,7 @@ export class CodexAppServerManager {
         approvalPolicy: CODEX_APPROVAL_POLICY,
         sandbox: "danger-full-access",
         experimentalRawEvents: false,
+persistExtendedHistory: true,
         ...toolConfig,
       } satisfies ThreadStartParams
 
@@ -1166,6 +1167,7 @@ export class CodexAppServerManager {
           serviceTier: args.serviceTier,
           approvalPolicy: CODEX_APPROVAL_POLICY,
           sandbox: "danger-full-access",
+  persistExtendedHistory: true,
           ...toolConfig,
         } satisfies ThreadForkParams)
       } else if (args.sessionToken) {
@@ -1177,6 +1179,7 @@ export class CodexAppServerManager {
             serviceTier: args.serviceTier,
             approvalPolicy: CODEX_APPROVAL_POLICY,
             sandbox: "danger-full-access",
+            persistExtendedHistory: true,
             ...toolConfig,
           } satisfies ThreadResumeParams)
         } catch (error) {
