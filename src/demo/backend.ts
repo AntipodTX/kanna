@@ -891,6 +891,8 @@ export class DemoBackend {
         status: this.chatStatus(chat),
         isDraining: false,
         provider: chat.provider,
+        model: chat.model ?? null,
+        modelOptions: {},
         planMode: false,
         autoPlan: false,
         sessionToken: chat.turnCount > 0 || chat.turn ? `demo-session-${chat.id}` : null,

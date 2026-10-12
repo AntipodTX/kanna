@@ -22,6 +22,7 @@ export interface InitializeParams {
   }
   capabilities: {
     experimentalApi: boolean
+    requestAttestation?: boolean
   }
 }
 
@@ -48,6 +49,9 @@ export interface ThreadResumeParams {
 }
 
 export interface ThreadForkParams {
+  includeTurns?: boolean
+  beforeTurnId?: string
+  lastTurnId?: string
   config?: Record<string, unknown>
   threadId: string
   model?: string | null
@@ -57,6 +61,44 @@ export interface ThreadForkParams {
   sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null
   ephemeral?: boolean
   persistExtendedHistory: boolean
+}
+
+export interface ThreadRollbackParams {
+  threadId: string
+  numTurns: number
+}
+
+export interface Thread {
+  id: string
+  turns?: unknown[]
+}
+
+export interface ThreadRollbackResponse {
+  thread: Thread
+}
+
+export interface ThreadTurnsListParams {
+  threadId: string
+  cursor?: string | null
+  limit: number
+  sortDirection: "desc"
+  itemsView: "summary"
+}
+
+export interface ThreadTurnsListResponse {
+  data: Array<{ id: string; status: string; itemsView?: string; items: Array<{ type: string }> }>
+  nextCursor?: string | null
+}
+
+export interface ThreadRevertParams {
+  threadId: string
+  /** Excludes this turn and every later turn; does not revert file changes. */
+  beforeTurnId: string
+}
+
+export interface ThreadRevertResponse {
+  /** Metadata only: turns are empty, retained history is paginated separately. */
+  thread: Thread
 }
 
 export interface TextUserInput {
@@ -91,6 +133,7 @@ export interface CollaborationMode {
 export type ReasoningEffort = CodexReasoningEffort
 
 export interface TurnStartParams {
+  clientUserMessageId?: string
   threadId: string
   input: CodexUserInput[]
   approvalPolicy?: "never" | "on-request" | "on-failure" | "untrusted" | null

@@ -287,8 +287,8 @@ function createWorld(options?: { projectPath?: string }) {
     getPendingTool: () => null,
     cancel: async () => {},
     closeChat: async () => {},
-    forkChat: async (chatId: string) => {
-      requireChat(chatId)
+    forkChat: async (command: { chatId: string }) => {
+      requireChat(command.chatId)
       nextId += 1
       const fork = { ...makeChat(`chat-fork-${nextId}`, Date.now()), title: "Fork" }
       state.chatsById.set(fork.id, fork as never)
