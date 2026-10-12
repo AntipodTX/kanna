@@ -1391,7 +1391,6 @@ export class AgentCoordinator {
   }
 
   dispose() {
-    this.activeCodexCommands.clear()
     for (const reservation of this.codexHistoryChecks.values()) this.cancelledCodexHistoryChecks.add(reservation)
     for (const operation of this.historyOperations.values()) operation.cancelled = true
     this.startingClaudeTurns.clear()
@@ -1402,6 +1401,10 @@ export class AgentCoordinator {
       active.customTools?.abort()
       this.activeTurns.delete(chatId)
     }
+    this.activeCodexCommands.clear()
+    for (const chatId of [...this.idleSessionTimers.keys()]) {
+      this.clearIdleSessionTimer(chatId)
+    }
     for (const session of this.claudeSessions.values()) {
       session.forceClosed = true
       session.releasePublication()
@@ -1409,10 +1412,6 @@ export class AgentCoordinator {
     }
     this.claudeSessions.clear()
     for (const stream of this.drainingStreams.values()) stream.turn.close()
-    this.claudeSessions.clear()
-    for (const chatId of [...this.idleSessionTimers.keys()]) {
-      this.clearIdleSessionTimer(chatId)
-    }
     this.drainingStreams.clear()
     this.codexManager.stopAll()
     this.piManager.dispose()
@@ -1920,11 +1919,12 @@ export class AgentCoordinator {
   }
 
   private async dequeueAndStartQueuedMessage(chatId: string, queuedMessage: QueuedChatMessage, options?: { steered?: boolean }) {
+    if (this.resolveProvider(queuedMessage, this.store.requireChat(chatId).provider) === "codex")
+      await this.assertCodexHistoryReady(chatId)
+    if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
+    await this.store.removeQueuedMessage(chatId, queuedMessage.id)
     const chat = this.store.requireChat(chatId)
     const provider = this.resolveProvider(queuedMessage, chat.provider)
-    if (provider === "codex")
-      await this.assertCodexHistoryReady(chatId)
-    await this.store.removeQueuedMessage(chatId, queuedMessage.id)
     const settings = this.getProviderSettings(provider, queuedMessage, chat)
     await this.startTurnForChat({
       chatId,
@@ -2103,6 +2103,7 @@ export class AgentCoordinator {
     const pendingCommit = this.claudeReadinessCommits.get(args.chatId)
     if (pendingCommit) await pendingCommit
     if (args.startupReservation && this.startingClaudeTurns.get(args.chatId) !== args.startupReservation) return
+    if (this.activeCodexCommands.has(args.chatId)) throw new Error("A Codex command is already running")
     const chat = this.store.requireChat(args.chatId)
     if (this.activeTurns.has(args.chatId)) throw new Error("Chat is already running")
     const draining = this.drainingStreams.get(args.chatId)
@@ -3305,6 +3306,7 @@ export class AgentCoordinator {
   }
 
   async editUserPrompt(command: Extract<ClientCommand, { type: "chat.editUserPrompt" }>) {
+    if (this.activeCodexCommands.has(command.chatId)) throw new Error("A Codex command is already running")
     if (this.store.requireChat(command.chatId).provider === "codex") {
       return this.withHistoryOperation(command.chatId, () => this.performEditUserPrompt(command))
     }
@@ -3312,6 +3314,7 @@ export class AgentCoordinator {
   }
 
   private async performEditUserPrompt(command: Extract<ClientCommand, { type: "chat.editUserPrompt" }>) {
+    if (this.activeCodexCommands.has(command.chatId)) throw new Error("A Codex command is already running")
     let content = command.content.trim()
     if (!content) {
       throw new Error("Message cannot be empty")
@@ -3759,13 +3762,14 @@ export class AgentCoordinator {
       ? { type: "chat.fork" as const, chatId: commandOrChatId }
       : commandOrChatId
 
+    if (this.activeCodexCommands.has(command.chatId)) throw new Error("A Codex command is already running")
+
     if (command.messageId) {
       return await this.forkChatAtUserPrompt(command)
     }
 
     const chatId = command.chatId
     if (this.codexHistoryChecks.has(chatId)) throw new Error("A Codex history check is running; retry after it finishes")
-    if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
     const chat = this.store.requireChat(chatId)
     if (!chat.provider) {
       throw new Error("Chat must have a provider before forking")
@@ -3860,6 +3864,7 @@ export class AgentCoordinator {
   }
 
   private async forkChatAtUserPrompt(command: Extract<ClientCommand, { type: "chat.fork" }>) {
+    if (this.activeCodexCommands.has(command.chatId)) throw new Error("A Codex command is already running")
     if (this.store.requireChat(command.chatId).provider === "codex") {
       return this.withHistoryOperation(command.chatId, () => this.performForkChatAtUserPrompt(command))
     }
