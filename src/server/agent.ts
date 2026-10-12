@@ -1952,7 +1952,7 @@ export class AgentCoordinator {
       active = createActiveTurn(null, "starting")
       registerActiveTurn(active)
       try {
-        turn = await this.startClaudeTurn({
+        const startedTurn = await this.startClaudeTurn({
           chatId: args.chatId,
           localPath: project.localPath,
           model: args.model,
@@ -1964,7 +1964,10 @@ export class AgentCoordinator {
           forkSession: Boolean(chat.pendingForkSessionToken),
           onToolRequest,
           customTools,
+          isCurrentTurn: () => this.activeTurns.get(args.chatId) === active && active?.cancelRequested === false,
         })
+        if (!startedTurn) return
+        turn = startedTurn
       } catch (error) {
         if (this.activeTurns.get(args.chatId) === active) {
           this.activeTurns.delete(args.chatId)
@@ -2138,8 +2141,10 @@ export class AgentCoordinator {
     forkSession: boolean
     customTools?: KannaToolHost
     onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
-  }): Promise<HarnessTurn> {
+    isCurrentTurn: () => boolean
+  }): Promise<HarnessTurn | null> {
     let session = this.claudeSessions.get(args.chatId)
+    let createdSession = false
 
     // autoPlan changes the SDK's `tools` allowlist, which is fixed at query()
     // time — unlike planMode (setPermissionMode) it can only be applied by
@@ -2157,6 +2162,7 @@ export class AgentCoordinator {
         this.claudeSessions.delete(args.chatId)
       }
 
+      const sessionInstanceId = crypto.randomUUID()
       const started = await this.startClaudeSessionFn({
         localPath: args.localPath,
         model: args.model,
@@ -2169,12 +2175,26 @@ export class AgentCoordinator {
         onToolRequest: args.onToolRequest,
         customTools: args.customTools,
         onRateLimitEvent: (info) => this.onClaudeRateLimit?.(info),
-        onSubagentActivity: (update) => this.applySubagentActivity(args.chatId, update),
+        onSubagentActivity: (update) => {
+          if (args.isCurrentTurn() || this.claudeSessions.get(args.chatId)?.id === sessionInstanceId) {
+            this.applySubagentActivity(args.chatId, update)
+          }
+        },
       })
+      // A cancelled startup owns this handle, not the chat's next session.
+      // Close it before registering its stream or persisting any session token.
+      if (!args.isCurrentTurn()) {
+        await this.interruptAndCloseTurn(started)
+        return null
+      }
       this.refreshClaudeModelCatalog(started)
+      if (!args.isCurrentTurn()) {
+        await this.interruptAndCloseTurn(started)
+        return null
+      }
 
       session = {
-        id: crypto.randomUUID(),
+        id: sessionInstanceId,
         chatId: args.chatId,
         session: started,
         localPath: args.localPath,
@@ -2193,6 +2213,7 @@ export class AgentCoordinator {
         cancelledPromptSeqs: new Set(),
       }
       this.claudeSessions.set(args.chatId, session)
+      createdSession = true
       void this.runClaudeSession(session)
     } else {
       if (session.model !== args.model) {
@@ -2209,14 +2230,31 @@ export class AgentCoordinator {
       }
     }
 
+    let retiredUnsentSession = false
+    const retireUnsentSession = () => {
+      if (!createdSession || session.nextPromptSeq !== 0 || retiredUnsentSession) return
+      retiredUnsentSession = true
+      if (this.claudeSessions.get(args.chatId) === session) this.claudeSessions.delete(args.chatId)
+      session.session.close()
+    }
     return {
       provider: "claude",
       stream: {
         async *[Symbol.asyncIterator]() {},
       },
       getAccountInfo: session.session.getAccountInfo,
-      interrupt: session.session.interrupt,
-      close: () => {},
+      interrupt: async () => {
+        // Remove an unsent startup before waiting for interrupt: a successor
+        // must create its own native session instead of reusing this handle.
+        retireUnsentSession()
+        await session.session.interrupt()
+      },
+      close: () => {
+        // Cancellation can land after registration but before the turn wrapper
+        // reaches its owner. A new session with no submitted prompt must close;
+        // ordinary cancellation of a reused session keeps its native context.
+        retireUnsentSession()
+      },
     }
   }
 
