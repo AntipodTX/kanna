@@ -132,7 +132,7 @@ function rowLightsItself(row: ResolvedTranscriptRow): boolean {
 
 type TranscriptRowItemProps = Pick<
   ComponentProps<typeof KannaTranscriptRow>,
-  "row" | "toolGroupExpanded" | "onToolGroupExpandedChange" | "onAskUserQuestionSubmit" | "onExitPlanModeConfirm"
+  "row" | "toolGroupExpanded" | "onToolGroupExpandedChange" | "onAskUserQuestionSubmit" | "onExitPlanModeConfirm" | "onCodexApprovalDecision"
 > & { flashBox: boolean; flashRow: boolean }
 
 /**
@@ -156,6 +156,7 @@ const TranscriptRowItem = memo(function TranscriptRowItem({
   onToolGroupExpandedChange,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  onCodexApprovalDecision,
 }: TranscriptRowItemProps) {
   return (
     <MessageScrollerItem
@@ -187,6 +188,7 @@ const TranscriptRowItem = memo(function TranscriptRowItem({
           onToolGroupExpandedChange={onToolGroupExpandedChange}
           onAskUserQuestionSubmit={onAskUserQuestionSubmit}
           onExitPlanModeConfirm={onExitPlanModeConfirm}
+          onCodexApprovalDecision={onCodexApprovalDecision}
         />
       </div>
     </MessageScrollerItem>
@@ -261,6 +263,7 @@ interface ChatTranscriptViewportProps {
   onOpenLocalLink: KannaState["handleOpenLocalLink"]
   onAskUserQuestionSubmit: KannaState["handleAskUserQuestion"]
   onExitPlanModeConfirm: KannaState["handleExitPlanMode"]
+  onCodexApprovalDecision: KannaState["handleCodexApproval"]
   showScrollButton: boolean
   onIsAtEndChange: (isAtEnd: boolean) => void
   scrollToBottom: () => void
@@ -471,6 +474,7 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
   onOpenLocalLink,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  onCodexApprovalDecision,
   showScrollButton,
   onIsAtEndChange,
   scrollToBottom,
@@ -1133,6 +1137,7 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
                   onToolGroupExpandedChange={handleToolGroupExpandedChange}
                   onAskUserQuestionSubmit={onAskUserQuestionSubmit}
                   onExitPlanModeConfirm={onExitPlanModeConfirm}
+                  onCodexApprovalDecision={onCodexApprovalDecision}
                 />
               ))}
               {listFooter}
