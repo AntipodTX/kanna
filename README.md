@@ -4,6 +4,7 @@
 
 ### Features
 
+- Claude XHigh and Ultracode effort options driven by current SDK metadata.
 
 ### Fixes
 
