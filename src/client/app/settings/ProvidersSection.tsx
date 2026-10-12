@@ -118,7 +118,7 @@ export function ProvidersSection({
   }
 
   function handleProviderDefaultModelChange(provider: AgentProvider, model: string) {
-    setProviderDefaultModel(provider, model)
+    setProviderDefaultModel(provider, model, state.availableProviders.find((entry) => entry.id === provider))
     void handleWriteAppSettings({ providerDefaults: { [provider]: { model } } }).catch((error) => {
       setProvidersError(error instanceof Error ? error.message : "Unable to save provider settings.")
     })
@@ -128,7 +128,7 @@ export function ProvidersSection({
     provider: AgentProvider,
     modelOptions: Partial<typeof providerDefaults[typeof provider]["modelOptions"]>
   ) {
-    setProviderDefaultModelOptions(provider, modelOptions)
+    setProviderDefaultModelOptions(provider, modelOptions, state.availableProviders.find((entry) => entry.id === provider))
     void handleWriteAppSettings({ providerDefaults: { [provider]: { modelOptions } } }).catch((error) => {
       setProvidersError(error instanceof Error ? error.message : "Unable to save provider settings.")
     })

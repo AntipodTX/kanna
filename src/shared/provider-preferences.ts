@@ -9,6 +9,7 @@ import {
   normalizeClaudeContextWindow,
   normalizeClaudeFastMode,
   normalizeClaudeModelId,
+  normalizeClaudeReasoningEffort,
   normalizeCodexModelId,
   normalizeCodexReasoningEffort,
   normalizeCursorModelId,
@@ -16,7 +17,6 @@ import {
   normalizeGrokReasoningEffort,
   normalizePiModelId,
   normalizePiReasoningEffort,
-  supportsClaudeMaxReasoningEffort,
   type AgentProvider,
   type AppSettingsPatch,
   type ChatProviderPreferences,
@@ -57,11 +57,21 @@ export type ProviderPreferenceInput = {
   autoPlan?: unknown
 }
 
+export interface ProviderNormalizationOptions {
+  normalizeClaudeReasoningEffort?: (
+    modelId: string,
+    effort?: unknown,
+  ) => ClaudeModelOptions["reasoningEffort"]
+}
+
 function modelIdFromInput(value?: ProviderPreferenceInput): string | undefined {
   return typeof value?.model === "string" ? value.model : undefined
 }
 
-export function normalizeClaudePreference(value?: ProviderPreferenceInput): ProviderPreference<ClaudeModelOptions> {
+export function normalizeClaudePreference(
+  value?: ProviderPreferenceInput,
+  options?: ProviderNormalizationOptions,
+): ProviderPreference<ClaudeModelOptions> {
   const reasoningEffort = value?.modelOptions?.reasoningEffort
   const normalizedEffort = isClaudeReasoningEffort(reasoningEffort)
     ? reasoningEffort
@@ -73,7 +83,7 @@ export function normalizeClaudePreference(value?: ProviderPreferenceInput): Prov
   return {
     model,
     modelOptions: {
-      reasoningEffort: !supportsClaudeMaxReasoningEffort(model) && normalizedEffort === "max" ? "high" : normalizedEffort,
+      reasoningEffort: (options?.normalizeClaudeReasoningEffort ?? normalizeClaudeReasoningEffort)(model, normalizedEffort),
       contextWindow: normalizeClaudeContextWindow(model, value?.modelOptions?.contextWindow),
       fastMode: normalizeClaudeFastMode(model, value?.modelOptions?.fastMode),
     },
@@ -160,16 +170,20 @@ export const PROVIDER_NORMALIZERS: {
 
 export function normalizeProviderPreference<TProvider extends AgentProvider>(
   provider: TProvider,
-  value?: ProviderPreferenceInput
+  value?: ProviderPreferenceInput,
+  options?: ProviderNormalizationOptions,
 ): ChatProviderPreferences[TProvider] {
-  return PROVIDER_NORMALIZERS[provider](value)
+  return provider === "claude"
+    ? normalizeClaudePreference(value, options) as ChatProviderPreferences[TProvider]
+    : PROVIDER_NORMALIZERS[provider](value)
 }
 
 export function normalizeProviderDefaults(
-  value?: Partial<Record<AgentProvider, ProviderPreferenceInput | undefined>>
+  value?: Partial<Record<AgentProvider, ProviderPreferenceInput | undefined>>,
+  options?: ProviderNormalizationOptions,
 ): ChatProviderPreferences {
   return {
-    claude: normalizeClaudePreference(value?.claude),
+    claude: normalizeClaudePreference(value?.claude, options),
     codex: normalizeCodexPreference(value?.codex),
     cursor: normalizeCursorPreference(value?.cursor),
     grok: normalizeGrokPreference(value?.grok),

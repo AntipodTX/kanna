@@ -14,6 +14,7 @@ import {
   normalizeClaudeContextUsage,
   normalizeClaudeStreamMessage,
   normalizeClaudeUsageSnapshot,
+  resolveClaudeRuntimeOptions,
   RESUME_AFTER_RESTART_MESSAGE,
 } from "./agent"
 import type { HarnessTurn } from "./harness-types"
@@ -21,6 +22,26 @@ import type { SubagentActivityUpdate } from "./background-tasks"
 import type { ChatAttachment, TranscriptEntry } from "../shared/types"
 import type { SessionArtifactStatus } from "./session-artifacts"
 import { timestamped } from "./transcript"
+
+describe("resolveClaudeRuntimeOptions", () => {
+  test("forwards SDK effort levels without extra settings", () => {
+    expect(resolveClaudeRuntimeOptions("xhigh")).toEqual({
+      effort: "xhigh",
+      settings: undefined,
+    })
+    expect(resolveClaudeRuntimeOptions("max")).toEqual({
+      effort: "max",
+      settings: undefined,
+    })
+  })
+
+  test("maps Ultracode to xhigh plus the session setting", () => {
+    expect(resolveClaudeRuntimeOptions("ultracode")).toEqual({
+      effort: "xhigh",
+      settings: { ultracode: true },
+    })
+  })
+})
 
 async function waitFor(condition: () => boolean, timeoutMs = 2000) {
   const start = Date.now()
@@ -2257,7 +2278,7 @@ describe("concurrent agents notice injection", () => {
     await coordinator.send({ type: "chat.send", chatId: "chat-2", provider: "claude", content: "second prompt", model: "claude-opus-4-1" })
 
     expect(prompts).toHaveLength(2)
-    // chat-1 started alone — nothing is appended.
+    // chat-1 started alone — no automatic instructions.
     expect(prompts[0]).toBe("first prompt")
     // chat-2 started while chat-1 was running in the same directory.
     expect(prompts[1]?.startsWith("second prompt")).toBe(true)
