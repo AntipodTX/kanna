@@ -49,7 +49,7 @@ export interface ThreadStartParams {
   approvalPolicy?: CodexApprovalPolicy | null
   sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null
   experimentalRawEvents?: boolean
-  persistExtendedHistory?: boolean
+  persistExtendedHistory: boolean
 }
 
 export interface ThreadResumeParams {
@@ -60,7 +60,7 @@ export interface ThreadResumeParams {
   serviceTier?: ServiceTier | null
   approvalPolicy?: CodexApprovalPolicy | null
   sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null
-  persistExtendedHistory?: boolean
+  persistExtendedHistory: boolean
 }
 
 export interface ThreadForkParams {
@@ -72,7 +72,7 @@ export interface ThreadForkParams {
   approvalPolicy?: CodexApprovalPolicy | null
   sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null
   ephemeral?: boolean
-  persistExtendedHistory?: boolean
+  persistExtendedHistory: boolean
 }
 
 export interface TextUserInput {
