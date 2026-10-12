@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  CLAUDE_REASONING_OPTIONS,
   PROVIDERS,
   deriveClaudeModelLabel,
   deriveModelLabel,
@@ -149,11 +150,23 @@ describe("shared model normalization", () => {
     expect(getCodexReasoningOptions("gpt-5.6-sol").find((option) => option.id === "ultra")?.description).toBe("Delegates to subagents more")
   })
 
-  test("uses declarative metadata for Claude max-effort support", () => {
+  test("uses per-model metadata for Claude effort support", () => {
+    expect(CLAUDE_REASONING_OPTIONS.map((option) => option.id)).toEqual([
+      "low", "medium", "high", "xhigh", "max", "ultracode",
+    ])
     expect(supportsClaudeMaxReasoningEffort("claude-opus-4-8")).toBe(true)
     expect(supportsClaudeMaxReasoningEffort("opus")).toBe(true)
-    expect(supportsClaudeMaxReasoningEffort("fable")).toBe(false)
-    expect(supportsClaudeMaxReasoningEffort("claude-sonnet-4-6")).toBe(false)
+    expect(supportsClaudeMaxReasoningEffort("fable")).toBe(true)
+    expect(supportsClaudeMaxReasoningEffort("claude-sonnet-4-6")).toBe(true)
+    expect(supportsClaudeMaxReasoningEffort("haiku")).toBe(false)
+
+    const claude = PROVIDERS.find((provider) => provider.id === "claude")
+    const fable = claude?.models.find((model) => model.id === "fable") as
+      | { supportedEffortLevels?: readonly string[] }
+      | undefined
+    expect(fable?.supportedEffortLevels).toEqual([
+      "low", "medium", "high", "xhigh", "max", "ultracode",
+    ])
   })
 
   test("derives display labels from bare model ids", () => {
