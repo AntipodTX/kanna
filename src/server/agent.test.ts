@@ -1423,6 +1423,50 @@ describe("AgentCoordinator codex integration", () => {
 })
 
 describe("AgentCoordinator claude integration", () => {
+  test("stops reading a retired Claude stream without disturbing its replacement", async () => {
+    const store = createFakeStore()
+    const replacement = new AsyncEventQueue<any>()
+    let release!: () => void
+    const lateEvents = new Promise<void>(resolve => { release = resolve })
+    let exited!: () => void
+    const retired = new Promise<void>(resolve => { exited = resolve })
+    let starts = 0
+    let consumed = 0
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      startClaudeSession: async () => {
+        const first = ++starts === 1
+        return { provider: "claude", stream: first ? { async *[Symbol.asyncIterator]() {
+          try {
+            await lateEvents
+            for (let i = 0; i < 3; i++) {
+              consumed++
+              yield { type: "transcript" as const, entry: timestamped({ kind: "assistant_text", text: "stale" }) }
+            }
+          } finally { exited() }
+        } } : replacement,
+          interrupt: async () => {}, close: () => { if (!first) replacement.close() },
+          setModel: async () => {}, setPermissionMode: async () => {}, sendPrompt: async () => {},
+        }
+      },
+    })
+    try {
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "first", autoPlan: false })
+      await coordinator.cancel("chat-1")
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "replacement", autoPlan: true })
+      expect(starts).toBe(2)
+      release()
+      await retired
+      expect(consumed).toBe(1)
+      expect(store.messages.some(entry => entry.kind === "assistant_text" && entry.text === "stale")).toBe(false)
+      expect(coordinator.getActiveStatuses().get("chat-1")).toBe("running")
+      expect((coordinator as any).claudeSessions.has("chat-1")).toBe(true)
+    } finally {
+      release()
+      replacement.close()
+      coordinator.dispose()
+    }
+  })
+
   test("tracks analytics for new chats, queued messages, and forks", async () => {
     const events = new AsyncEventQueue<any>()
     const analyticsEvents: string[] = []
