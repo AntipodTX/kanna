@@ -3,7 +3,13 @@ import { DownloadCloud } from "lucide-react"
 import { useNavigate } from "react-router-dom"
 import { ANALYTICS_STATIC_EVENT_NAMES, ANALYTICS_STATIC_PROPERTY_NAMES } from "../../../shared/analytics"
 import type { EditorPreset } from "../../../shared/protocol"
-import { DEFAULT_NEW_PROJECTS_DIRECTORY, isNightlyVersion, type PaneVisibilityScope, type SubmitWhileRunning } from "../../../shared/types"
+import {
+  DEFAULT_NEW_PROJECTS_DIRECTORY,
+  isNightlyVersion,
+  type IdleSessionTimeoutPreference,
+  type PaneVisibilityScope,
+  type SubmitWhileRunning,
+} from "../../../shared/types"
 import { EDITOR_OPTIONS, EditorIcon } from "../../components/editor-icons"
 import { useInstalledEditors } from "../../components/open-external-menu"
 import { Button } from "../../components/ui/button"
@@ -78,6 +84,13 @@ const chatBrowserNotificationPreferenceOptions: { value: ChatBrowserNotification
   { value: "always", label: "Always" },
 ]
 
+const IDLE_SESSION_TIMEOUT_OPTIONS: Array<{ value: IdleSessionTimeoutPreference; label: string }> = [
+  { value: "never", label: "Never" },
+  { value: "15m", label: "15 min" },
+  { value: "30m", label: "30 min" },
+  { value: "1h", label: "1 hour" },
+]
+
 export function GeneralSection({
   state,
   appVersion,
@@ -117,6 +130,7 @@ export function GeneralSection({
   const [newProjectsDirectoryDraft, setNewProjectsDirectoryDraft] = useState(newProjectsDirectory)
   const submitWhileRunning = appSettings?.submitWhileRunning ?? "queue"
   const paneVisibility = appSettings?.paneVisibility ?? { widgets: "chat", terminal: "chat" }
+  const idleSessionTimeout = appSettings?.idleSessionTimeout ?? "1h"
   const transcriptWindow = appSettings?.transcript?.windowAssistantMessages ?? DEFAULT_TRANSCRIPT_WINDOW_ASSISTANT_MESSAGES
   const [transcriptWindowDraft, setTranscriptWindowDraft] = useState(String(transcriptWindow))
   const [appSettingsError, setAppSettingsError] = useState<string | null>(null)
@@ -311,6 +325,12 @@ export function GeneralSection({
     }
   }
 
+  function handleIdleSessionTimeoutChange(nextValue: IdleSessionTimeoutPreference) {
+    void handleWriteAppSettings({ idleSessionTimeout: nextValue }).catch((error) => {
+      setAppSettingsError(error instanceof Error ? error.message : "Unable to save session settings.")
+    })
+  }
+
   async function handleAnalyticsPreferenceChange(enabled: boolean) {
     try {
       setAppSettingsError(null)
@@ -476,6 +496,22 @@ export function GeneralSection({
             >
               <SelectItem value="queue">Queue message</SelectItem>
               <SelectItem value="steer">Steer now</SelectItem>
+            </SettingsSelect>
+          </SettingsRow>
+
+          <SettingsRow
+            title="Idle Agent Sessions"
+            description="Close inactive Claude Code and Codex sessions to release local process and MCP resources"
+          >
+            <SettingsSelect
+              value={idleSessionTimeout}
+              onValueChange={(value) => handleIdleSessionTimeoutChange(value as IdleSessionTimeoutPreference)}
+            >
+              {IDLE_SESSION_TIMEOUT_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
             </SettingsSelect>
           </SettingsRow>
 
