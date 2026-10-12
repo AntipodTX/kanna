@@ -428,6 +428,8 @@ export interface AgentMessageItem {
   id: string
   text: string
   phase?: string
+  delivery?: "async" | null
+  questions?: import("../shared/codex-questions").CodexAsyncQuestion[] | null
 }
 
 export interface PlanItem {

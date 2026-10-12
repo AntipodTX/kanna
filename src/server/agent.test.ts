@@ -21,6 +21,7 @@ import type { SubagentActivityUpdate } from "./background-tasks"
 import type { ChatAttachment, TranscriptEntry } from "../shared/types"
 import type { SessionArtifactStatus } from "./session-artifacts"
 import { timestamped } from "./transcript"
+import { codexAsyncQuestionTool, parseCodexQuestionReplies } from "../shared/codex-questions"
 
 async function waitFor(condition: () => boolean, timeoutMs = 2000) {
   const start = Date.now()
@@ -3360,6 +3361,152 @@ function createFakeStore(options?: {
     },
   }
 }
+
+describe("Codex async question answers", () => {
+  function setup() {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.title = "Existing"
+    store.chat.sessionToken = "thread-1"
+    const tool = codexAsyncQuestionTool({ id: "question-1", delivery: "async", questions: [{ title: "Cleanup?", options: ["All", "Empty"] }] }, "thread-1")!
+    store.messages.push(timestamped({ kind: "tool_call", tool }))
+    const streams: AsyncEventQueue<any>[] = []
+    const starts: string[] = []
+    const steers: string[] = []
+    let interrupts = 0
+    const manager = {
+      async startSession() { return { sessionToken: "thread-1", resumeFellBack: false } },
+      async startTurn(args: { content: string }): Promise<HarnessTurn> {
+        starts.push(args.content)
+        const stream = new AsyncEventQueue<any>()
+        streams.push(stream)
+        return { provider: "codex", providerTurnId: `turn-${starts.length}`, stream,
+          interrupt: async () => { interrupts++; stream.close() }, close: () => stream.close() }
+      },
+      startSteerTurn(args: { content: string; transcriptEntry: TranscriptEntry }) {
+        steers.push(args.content)
+        const settled = new Promise<void>((resolve, reject) => streams.at(-1)!.push({
+          type: "transcript", entry: args.transcriptEntry, onPersisted: (error?: Error) => error ? reject(error) : resolve(),
+        }))
+        return { accepted: Promise.resolve(), settled }
+      },
+    }
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, codexManager: manager as never,
+      checkSessionArtifact: () => "present" })
+    const command = { type: "chat.respondTool" as const, chatId: "chat-1", toolUseId: tool.toolId,
+      result: { questions: [{ question: "Forged title" }], answers: { [tool.input.questions[0]!.id!]: ["All"] } } }
+    return { store, tool, coordinator, command, starts, steers, manager, streams, interrupts: () => interrupts }
+  }
+
+  test("starts an idle turn with a native answer and ignores duplicate submission after reload", async () => {
+    const f = setup()
+    try {
+      await Promise.all([f.coordinator.respondTool(f.command), f.coordinator.respondTool(f.command)])
+      expect(f.starts).toHaveLength(1)
+      expect(parseCodexQuestionReplies(f.starts[0]!)).toEqual([{ questionItemId: f.tool.input.questions[0]!.id!, question: "Cleanup?", answer: "All" }])
+      expect(f.interrupts()).toBe(0)
+      const reloaded = new AgentCoordinator({ store: f.store as never, onStateChange: () => {}, codexManager: f.manager as never })
+      await reloaded.respondTool(f.command)
+      expect(f.starts).toHaveLength(1)
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test("delivers answers to a running Codex turn without cancelling or duplicating them", async () => {
+    const f = setup()
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work", model: "gpt-5.4" })
+      await Promise.all([f.coordinator.respondTool(f.command), f.coordinator.respondTool(f.command)])
+      await waitFor(() => f.store.getQueuedMessages().length === 0)
+      expect(f.starts).toHaveLength(1)
+      expect(f.steers).toHaveLength(1)
+      expect(parseCodexQuestionReplies(f.steers[0]!)[0]?.answer).toBe("All")
+      expect(f.store.messages.filter(entry => entry.kind === "user_prompt" && parseCodexQuestionReplies(entry.content).length)).toHaveLength(1)
+      expect(f.interrupts()).toBe(0)
+      expect(f.coordinator.getPendingTool("chat-1")).toBeNull()
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test("rejects empty answers and changed provider or native session before queuing", async () => {
+    const f = setup()
+    await expect(f.coordinator.respondTool({ ...f.command, result: { answers: {} } })).rejects.toThrow("answer")
+    f.store.chat.provider = "claude"
+    await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Codex")
+    f.store.chat.provider = "codex"
+    f.store.chat.sessionToken = "different"
+    await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("session")
+    expect(f.starts).toHaveLength(0)
+    expect(f.store.getQueuedMessages()).toHaveLength(0)
+  })
+
+  test("does not interrupt a blocking request to deliver an async answer", async () => {
+    const f = setup()
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      const active = f.coordinator.activeTurns.get("chat-1")!
+      active.pendingTool = { toolUseId: "blocking", tool: { ...f.tool, toolId: "blocking", input: { questions: [{ question: "Blocked?" }] } }, resolve: () => {} }
+      await f.coordinator.respondTool(f.command)
+      expect(f.steers).toHaveLength(0)
+      expect(f.interrupts()).toBe(0)
+      expect(active.pendingTool.toolUseId).toBe("blocking")
+      expect(f.store.getQueuedMessages()).toHaveLength(1)
+      await f.coordinator.respondTool(f.command)
+      expect(f.store.getQueuedMessages()).toHaveLength(1)
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test("retries the same durable answer after native delivery rejects it", async () => {
+    const f = setup()
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      const deliver = f.manager.startSteerTurn
+      f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
+      const queuedId = f.store.getQueuedMessages()[0]?.id
+      expect(queuedId).toBeDefined()
+      expect(f.interrupts()).toBe(0)
+      f.manager.startSteerTurn = deliver
+      await f.coordinator.respondTool(f.command)
+      await waitFor(() => f.store.getQueuedMessages().length === 0)
+      expect(f.steers).toHaveLength(1)
+      expect(f.store.messages.some(entry => entry._id === queuedId)).toBe(true)
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test("keeps an async answer queued while the Codex turn is still starting", async () => {
+    const f = setup()
+    await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+    const active = f.coordinator.activeTurns.get("chat-1")!
+    const turn = active.turn
+    active.turn = null as unknown as HarnessTurn
+    try {
+      await f.coordinator.respondTool(f.command)
+      expect(f.store.getQueuedMessages()).toHaveLength(1)
+      expect(f.starts).toHaveLength(1)
+      expect(f.steers).toHaveLength(0)
+      expect(f.interrupts()).toBe(0)
+    } finally {
+      active.turn = turn
+      await f.coordinator.cancel("chat-1")
+    }
+  })
+
+  test("starts a follow-up when the running turn ends while the answer is being queued", async () => {
+    const f = setup()
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      const enqueue = f.store.enqueueMessage.bind(f.store)
+      f.store.enqueueMessage = async (chatId, message) => {
+        f.streams[0]!.close()
+        await waitFor(() => !f.coordinator.activeTurns.has("chat-1"))
+        return enqueue(chatId, message)
+      }
+      await f.coordinator.respondTool(f.command)
+      expect(f.starts).toHaveLength(2)
+      expect(parseCodexQuestionReplies(f.starts[1]!)[0]?.answer).toBe("All")
+      expect(f.interrupts()).toBe(0)
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+})
 
 describe("shared display tool lifecycle", () => {
   for (const provider of ["claude", "codex", "cursor", "pi"] as const) {

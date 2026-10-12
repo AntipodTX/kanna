@@ -1,4 +1,5 @@
 import { useMemo } from "react"
+import { formatCodexQuestionReply } from "../../../shared/codex-questions"
 import type { ChatAttachment } from "../../../shared/types"
 import { CornerUpLeft } from "lucide-react"
 import { TranscriptMarkdown } from "./shared"
@@ -130,7 +131,7 @@ export function UserMessage({ content, attachments = [], steered = false, flash 
               "min-w-0 flex-1 rounded-2xl border border-border bg-muted px-3.5 py-1.5 text-primary prose prose-sm prose-invert [&_p]:whitespace-pre-line",
               flash && "kanna-jump-flash",
             )}>
-              <TranscriptMarkdown text={parsedContent.body} />
+              <TranscriptMarkdown text={formatCodexQuestionReply(parsedContent.body)} />
             </div>
           </div>
         ) : null}
