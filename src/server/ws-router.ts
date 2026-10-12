@@ -71,6 +71,8 @@ export interface ClientState {
    * `chat.loadOlder`, never forward. See shared/transcript-window.ts.
    */
   chatWindowStarts?: Map<string, number>
+  /** Retained boundary identity for translating a window after history edits. */
+  chatWindowStartIds?: Map<string, string>
   /**
    * Outline length last sent per chat subscription. The outline rides only
    * on pushes where it changed, so this is what "changed" is measured
@@ -663,6 +665,14 @@ export function createWsRouter({
     return ws.data.chatWindowStarts
   }
 
+  function setChatWindowStart(ws: ServerWebSocket<ClientState>, id: string, chatId: string, start: number) {
+    ensureChatWindowStarts(ws).set(id, start)
+    const boundaries = ws.data.chatWindowStartIds ??= new Map()
+    const entryId = store.getEntryIdAt?.(chatId, start)
+    if (entryId) boundaries.set(id, entryId)
+    else boundaries.delete(id)
+  }
+
   function ensureChatOutlineCounts(ws: ServerWebSocket<ClientState>) {
     if (!ws.data.chatOutlineCounts) {
       ws.data.chatOutlineCounts = new Map()
@@ -678,11 +688,18 @@ export function createWsRouter({
   function getChatWindowStart(ws: ServerWebSocket<ClientState>, subscriptionId: string, chatId: string) {
     const starts = ensureChatWindowStarts(ws)
     const existing = starts.get(subscriptionId)
-    if (existing !== undefined) return existing
+    if (existing !== undefined) {
+      // An empty subscription can receive its first entries later. Capture
+      // that boundary before a subsequent replacement changes its indices.
+      if (!ws.data.chatWindowStartIds?.has(subscriptionId)) {
+        setChatWindowStart(ws, subscriptionId, chatId, existing)
+      }
+      return existing
+    }
     const start = store.getChat(chatId)
       ? store.getInitialTranscriptWindowStart(chatId, transcriptWindowAssistantMessages())
       : 0
-    starts.set(subscriptionId, start)
+    setChatWindowStart(ws, subscriptionId, chatId, start)
     return start
   }
 
@@ -757,7 +774,7 @@ export function createWsRouter({
     // only applies when it reaches further back than the cache does.
     const defaultStart = getChatWindowStart(ws, subscriptionId, topic.chatId)
     if (span.start < defaultStart) {
-      ensureChatWindowStarts(ws).set(subscriptionId, span.start)
+      setChatWindowStart(ws, subscriptionId, topic.chatId, span.start)
     }
   }
 
@@ -842,7 +859,7 @@ export function createWsRouter({
         if (end !== undefined && ws.data.chatFollowing?.get(id) && end - (checks.get(id) ?? windowStart) >= 64) {
           checks.set(id, end)
           windowStart = store.getRollingTranscriptWindowStart(topic.chatId, windowStart, transcriptWindowAssistantMessages())
-          ensureChatWindowStarts(ws).set(id, windowStart)
+          setChatWindowStart(ws, id, topic.chatId, windowStart)
         }
         const previous = spans.get(id)
         const advanced = previous && windowStart > previous.start
@@ -1580,7 +1597,7 @@ export function createWsRouter({
           return
         }
         case "chat.fork": {
-          const result = await agent.forkChat(command.chatId)
+          const result = await agent.forkChat(command)
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
           await broadcastFilteredSnapshots({ includeSidebar: true, includeLocalProjects: true })
           return
@@ -1729,7 +1746,6 @@ export function createWsRouter({
           if (!store.getChat(command.chatId)) {
             throw new Error("Chat not found")
           }
-          const starts = ensureChatWindowStarts(ws)
           let startIndex = 0
           for (const [subscriptionId, topic] of ws.data.subscriptions.entries()) {
             if (topic.type !== "chat" || topic.chatId !== command.chatId || topic.background) continue
@@ -1739,7 +1755,7 @@ export function createWsRouter({
               ...(command.untilMessageId !== undefined ? { untilMessageId: command.untilMessageId } : {}),
               ...(command.all ? { all: true } : {}),
             })
-            starts.set(subscriptionId, next)
+            setChatWindowStart(ws, subscriptionId, command.chatId, next)
             ws.data.chatFollowing?.set(subscriptionId, false)
             startIndex = next
             await pushSnapshots(ws, { skipPrune: true, onlySubscriptionId: subscriptionId })
@@ -1930,6 +1946,16 @@ export function createWsRouter({
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id })
           return
         }
+        case "chat.getHistoryActions": {
+          const result = await agent.getHistoryActions(command.chatId, command)
+          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
+          return
+        }
+        case "chat.editUserPrompt": {
+          const result = await agent.editUserPrompt(command)
+          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
+          return
+        }
         case "chat.exportStandalone": {
           const { chat, project } = resolveChatProject(command.chatId)
           const result = await writeStandaloneTranscriptExport({
@@ -2047,6 +2073,7 @@ export function createWsRouter({
       ws.data.chatProvidersSent?.clear()
       ws.data.chatOutlineCounts?.clear()
       ws.data.chatWindowStarts?.clear()
+      ws.data.chatWindowStartIds?.clear()
       ws.data.chatFollowing?.clear()
       ws.data.chatWindowChecks?.clear()
       ws.data.sidebarPatchBases?.clear()
@@ -2086,6 +2113,7 @@ export function createWsRouter({
         // A (re)subscribe starts from nothing, so the next push sends a full window.
         ws.data.chatEntrySpans?.delete(parsed.id)
         ws.data.chatWindowStarts?.delete(parsed.id)
+        ws.data.chatWindowStartIds?.delete(parsed.id)
         ws.data.chatOutlineCounts?.delete(parsed.id)
         ws.data.chatProvidersSent?.delete(parsed.id)
         ws.data.chatFollowing?.delete(parsed.id)
@@ -2141,6 +2169,7 @@ export function createWsRouter({
         // A (re)subscribe starts from nothing, so the next push sends a full window.
         ws.data.chatEntrySpans?.delete(parsed.id)
         ws.data.chatWindowStarts?.delete(parsed.id)
+        ws.data.chatWindowStartIds?.delete(parsed.id)
         ws.data.chatOutlineCounts?.delete(parsed.id)
         ws.data.chatProvidersSent?.delete(parsed.id)
         ws.data.chatFollowing?.delete(parsed.id)
@@ -2152,6 +2181,42 @@ export function createWsRouter({
       }
 
       await handleCommand(ws, parsed)
+    },
+    invalidateChatTranscript(chatId: string) {
+      // Preserve each expanded window by its boundary identity; absolute
+      // indexes can shift while the retained history stays the same.
+      let replacementIndexes: Map<string, number> | undefined
+      for (const ws of sockets) {
+        for (const [id, topic] of ws.data.subscriptions) {
+          if (topic.type !== "chat" || topic.chatId !== chatId) continue
+          ensureSnapshotSignatures(ws).delete(id)
+          const boundaryId = ws.data.chatWindowStartIds?.get(id)
+          if (boundaryId && !replacementIndexes) {
+            replacementIndexes = new Map()
+            // Replacement has populated the header cache. This lookup never
+            // hydrates tool payloads or asks cold reads to widen their window.
+            for (let index = 0; ; index += 1) {
+              const entryId = store.getEntryIdAt?.(chatId, index)
+              if (!entryId) break
+              replacementIndexes.set(entryId, index)
+            }
+          }
+          const retainedStart = boundaryId ? replacementIndexes?.get(boundaryId) : undefined
+          if (retainedStart !== undefined) {
+            // Retained IDs can acquire parent attribution during replacement.
+            // Widen to the containing row while preserving the held range.
+            setChatWindowStart(ws, id, chatId, store.snapTranscriptWindowStart(chatId, retainedStart))
+          } else {
+            ws.data.chatWindowStarts?.delete(id)
+            ws.data.chatWindowStartIds?.delete(id)
+          }
+          ws.data.chatEntrySpans?.delete(id)
+          ws.data.chatOutlineCounts?.delete(id)
+          ws.data.chatProvidersSent?.delete(id)
+          ws.data.chatWindowChecks?.delete(id)
+          clearBackgroundChatPush(ws, id)
+        }
+      }
     },
     dispose() {
       if (pendingBroadcastTimer) {
