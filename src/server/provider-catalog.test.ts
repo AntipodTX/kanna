@@ -11,6 +11,7 @@ import {
   normalizeCodexModelOptions,
   normalizeCursorModelOptions,
   normalizeServerModel,
+  getServerClaudeRuntimeEffort,
   resetServerProvidersForTests,
   serviceTierFromModelOptions,
 } from "./provider-catalog"
@@ -61,6 +62,31 @@ describe("provider catalog normalization", () => {
       fastMode: false,
     })
   })
+
+  
+
+  test("Claude fallback belongs to the SDK's supported effort set", () => {
+    applyClaudeSdkModels([{ value: "opus", supportsEffort: true, supportedEffortLevels: ["low", "medium"] }])
+    expect(normalizeClaudeModelOptions("opus").reasoningEffort).toBe("medium")
+    expect(normalizeClaudeModelOptions("opus", { claude: { reasoningEffort: "max" } }).reasoningEffort).toBe("medium")
+    expect(normalizeClaudeModelOptions("opus", undefined, "low").reasoningEffort).toBe("low")
+  })
+
+  test("Claude fallback supports a max-only SDK model and normalized aliases", () => {
+    applyClaudeSdkModels([{ value: "opus", resolvedModel: "claude-opus-4-8", supportsEffort: true, supportedEffortLevels: ["max"] }])
+    expect(normalizeClaudeModelOptions("claude-opus-4-8").reasoningEffort).toBe("max")
+    expect(normalizeClaudeModelOptions("opus", undefined, "low").reasoningEffort).toBe("max")
+  })
+
+  test("Claude wire options omit effort when the SDK disables or cannot support it", () => {
+    applyClaudeSdkModels([{ value: "haiku", supportsEffort: false, supportedEffortLevels: ["low"] }])
+    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
+    applyClaudeSdkModels([{ value: "haiku", supportsEffort: true, supportedEffortLevels: [] }])
+    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
+    applyClaudeSdkModels([{ value: "haiku", supportsEffort: true, supportedEffortLevels: ["future-effort"] }])
+    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
+  })
+
 
   test("normalizes Claude fast mode only for supported models", () => {
     const opus = normalizeClaudeModelOptions("claude-opus-4-8", {

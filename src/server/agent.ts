@@ -69,6 +69,7 @@ import {
   cursorModelIdForOptions,
   getServerProviderCatalog,
   normalizeClaudeModelOptions,
+  getServerClaudeRuntimeEffort,
   normalizeCodexModelOptions,
   normalizeCursorModelOptions,
   normalizeGrokModelOptions,
@@ -938,7 +939,7 @@ async function startClaudeSession(args: {
     options: {
       cwd: args.localPath,
       model: args.model,
-      effort: args.effort as "low" | "medium" | "high" | "max" | undefined,
+      effort: getServerClaudeRuntimeEffort(args.model, args.effort),
       resume: args.sessionToken ?? undefined,
       forkSession: args.forkSession,
       permissionMode: args.planMode ? "plan" : "acceptEdits",
