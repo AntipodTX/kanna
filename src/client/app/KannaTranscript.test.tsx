@@ -779,6 +779,122 @@ Please check the latest error first.`,
     expect(updatedHtml).toContain("Run tool-3")
   })
 
+  test("reveals the selected tool inside an expanded group", () => {
+    const messages = Array.from({ length: 8 }, (_, index) => createToolMessage(`tool-${index + 1}`))
+    const html = renderToStaticMarkup(
+      <CollapsedToolGroup
+        messages={messages}
+        isLoading={false}
+        expanded
+        revealEntryId="tool-8"
+        onExpandedChange={() => undefined}
+      />
+    )
+
+    expect(html).not.toContain("echo tool-1")
+    expect(html).toContain("echo tool-8")
+    expect(html).toContain('id="msg-tool-8"')
+    expect(html).toContain("w-full kanna-jump-flash")
+  })
+
+  test("reveals and marks an exact entry inside an Agent transcript", () => {
+    const rows = buildResolvedTranscriptRows([{
+      id: "agent-1",
+      kind: "tool",
+      toolKind: "subagent_task",
+      toolName: "Agent",
+      toolId: "agent-tool-id",
+      input: { prompt: "Investigate", subagentType: "Explore" },
+      children: [
+        {
+          id: "child-text",
+          kind: "assistant_text",
+          text: "Nested explanation",
+          timestamp: new Date().toISOString(),
+        },
+        createToolMessage("child-tool"),
+      ],
+      timestamp: new Date().toISOString(),
+    }], {
+      isLoading: false,
+      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null },
+    })
+    const row = rows[0]!
+
+    const textHtml = renderToStaticMarkup(
+      <KannaTranscriptRow
+        row={row}
+        revealEntryId="child-text"
+        onToolGroupExpandedChange={() => undefined}
+        onAskUserQuestionSubmit={() => undefined}
+        onExitPlanModeConfirm={() => undefined}
+        {...{ onCodexApprovalDecision: () => undefined }}
+      />
+    )
+    const toolHtml = renderToStaticMarkup(
+      <KannaTranscriptRow
+        row={row}
+        revealEntryId="child-tool"
+        onToolGroupExpandedChange={() => undefined}
+        onAskUserQuestionSubmit={() => undefined}
+        onExitPlanModeConfirm={() => undefined}
+        {...{ onCodexApprovalDecision: () => undefined }}
+      />
+    )
+
+    expect(textHtml).toContain('id="msg-child-text"')
+    expect(textHtml).toContain("w-full kanna-jump-flash")
+    expect(toolHtml).toContain('id="msg-child-tool"')
+    expect(toolHtml).toContain("w-full kanna-jump-flash")
+    expect(toolHtml).toContain("echo child-tool")
+  })
+
+  test("reveals an exact Agent child when the Agent belongs to a tool group", () => {
+    const agent: HydratedTranscriptMessage = {
+      id: "agent-in-group",
+      kind: "tool",
+      toolKind: "subagent_task",
+      toolName: "Agent",
+      toolId: "agent-in-group-tool-id",
+      input: { prompt: "Investigate", subagentType: "Explore" },
+      children: [
+        {
+          id: "grouped-child-text",
+          kind: "assistant_text",
+          text: "Nested explanation",
+          timestamp: new Date().toISOString(),
+        },
+        createToolMessage("grouped-child-tool"),
+      ],
+      timestamp: new Date().toISOString(),
+    }
+
+    const textHtml = renderToStaticMarkup(
+      <CollapsedToolGroup
+        messages={[agent, createToolMessage("sibling-tool")]}
+        isLoading={false}
+        expanded
+        revealEntryId="grouped-child-text"
+        onExpandedChange={() => undefined}
+      />
+    )
+    const toolHtml = renderToStaticMarkup(
+      <CollapsedToolGroup
+        messages={[agent, createToolMessage("sibling-tool")]}
+        isLoading={false}
+        expanded
+        revealEntryId="grouped-child-tool"
+        onExpandedChange={() => undefined}
+      />
+    )
+
+    expect(textHtml).toContain('id="msg-grouped-child-text"')
+    expect(textHtml).toContain("w-full kanna-jump-flash")
+    expect(toolHtml).toContain('id="msg-grouped-child-tool"')
+    expect(toolHtml).toContain("w-full kanna-jump-flash")
+    expect(toolHtml).toContain("echo grouped-child-tool")
+  })
+
   test("reuses unchanged single row objects across streaming updates", () => {
     const latestToolIds = { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null }
     const previousRows = buildResolvedTranscriptRows([

@@ -52,6 +52,16 @@ export function findToolCallRowIndex(rows: ResolvedTranscriptRow[], toolId: stri
   return index === -1 ? null : index
 }
 
+/** Index of the row rendering a concrete transcript entry, or null. */
+export function findEntryRowIndex(rows: ResolvedTranscriptRow[], entryId: string): number | null {
+  const index = rows.findIndex((row) => (
+    row.kind === "single"
+      ? row.message.id === entryId
+      : row.messages.some((message) => message.id === entryId)
+  ))
+  return index === -1 ? null : index
+}
+
 /** Index of the row rendering the most recent user prompt, or null. */
 export function findLatestUserPromptRowIndex(rows: ResolvedTranscriptRow[]): number | null {
   for (let index = rows.length - 1; index >= 0; index -= 1) {
@@ -167,7 +177,9 @@ export function resolveJumpTarget(
   target: ChatJumpTarget,
 ): TranscriptScrollTarget | null {
   const index = typeof target !== "string"
-    ? findToolCallRowIndex(rows, target.toolId)
+    ? "toolId" in target
+      ? findToolCallRowIndex(rows, target.toolId)
+      : findEntryRowIndex(rows, target.entryId)
     : target === "prompt"
       ? findLatestUserPromptRowIndex(rows)
       : findLatestAssistantTextRowIndex(rows)
