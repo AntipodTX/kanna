@@ -4,6 +4,7 @@
 
 ### Features
 
+- Search the complete current chat transcript from the widgets sidebar, with result snippets, exact-message navigation, and optional tool call and result matching.
 
 ### Fixes
 
