@@ -56,11 +56,6 @@ import {
   type SkillReference,
 } from "./harness-skills"
 import {
-  buildKannaAgentCorrection,
-  buildKannaAgentId,
-} from "./attribution"
-import { buildKannaSystemInstructions, buildKannaSystemMessage } from "./harness-instructions"
-import {
   applyClaudeSdkModels,
   applyCodexModels,
   applyCursorModels,
@@ -217,13 +212,6 @@ interface ClaudeSessionState {
   session: ClaudeSessionHandle
   localPath: string
   model: string
-  /**
-   * The agent id baked into this session's system-prompt append. Frozen at
-   * query() time — unlike `model`, which setModel() updates in place — so a
-   * mismatch against the turn's model is exactly the drift the per-turn
-   * correction exists to cover.
-   */
-  promptAgentId: string
   effort?: string
   serviceTier?: "fast"
   planMode: boolean
@@ -954,12 +942,9 @@ async function startClaudeSession(args: {
       // like the rest.
       forwardSubagentText: true,
       settingSources: ["user", "project", "local"],
-      // Append-only: the claude_code preset stays intact, Kanna's session
-      // instructions ride on the end of it (see harness-instructions.ts).
       systemPrompt: {
         type: "preset",
         preset: "claude_code",
-        append: buildKannaSystemInstructions(buildKannaAgentId("claude", args.model)),
       },
       // fastMode must go through the flag-settings layer: the CLI only allows
       // fast mode in Agent SDK sessions when flagSettings.fastMode is true,
@@ -1931,31 +1916,19 @@ export class AgentCoordinator {
       // Refresh the model catalog off the turn's critical path if a previous
       // fetch never succeeded (e.g. the user just logged in to cursor-agent).
       void this.refreshCursorModelCatalog()
-      let cursorContent = buildPromptText(wireContent, args.attachments)
-      // Cursor builds its system prompt server-side and exposes no append hook,
-      // so Kanna's session instructions ride the user-text path instead.
-      cursorContent = appendSystemMessageBlock(
-        cursorContent,
-        buildKannaSystemMessage(buildKannaAgentId("cursor", args.model))
-      )
       // Cursor cannot fork (see canForkChat), so a turn always resumes its own session.
       turn = await this.cursorManager.startTurn({
         cwd: project.localPath,
         customTools,
-        content: cursorContent,
+        content: buildPromptText(wireContent, args.attachments),
         model: args.model,
         sessionToken: chat.sessionToken,
       })
     } else if (args.provider === "grok") {
       void this.refreshGrokModelCatalog()
-      let grokContent = buildPromptText(wireContent, args.attachments)
-      grokContent = appendSystemMessageBlock(
-        grokContent,
-        buildKannaSystemMessage(buildKannaAgentId("grok", args.model)),
-      )
       turn = await this.grokManager.startTurn({
         cwd: project.localPath,
-        content: grokContent,
+        content: buildPromptText(wireContent, args.attachments),
         model: args.model,
         effort: args.effort,
         planMode: args.planMode,
@@ -2063,16 +2036,8 @@ export class AgentCoordinator {
         contentPreview: wireContent.slice(0, 160),
         pendingPromptSeqs: session.pendingPrompts.map((prompt) => prompt.seq),
       })
-      // setModel() swaps the model on the live session without restarting it,
-      // so the agent id in the session prompt can be stale. Re-state it on the
-      // turn text (wire-only — the transcript stores args.content) from the
-      // drift onward.
-      const claudeAgentId = buildKannaAgentId("claude", args.model)
-      const claudePrompt = buildPromptText(wireContent, args.attachments)
       await session.session.sendPrompt(
-        session.promptAgentId === claudeAgentId
-          ? claudePrompt
-          : appendSystemMessageBlock(claudePrompt, buildKannaAgentCorrection(claudeAgentId)),
+        buildPromptText(wireContent, args.attachments),
         promptId,
       )
       return
@@ -2134,7 +2099,6 @@ export class AgentCoordinator {
         session: started,
         localPath: args.localPath,
         model: args.model,
-        promptAgentId: buildKannaAgentId("claude", args.model),
         effort: args.effort,
         serviceTier: args.serviceTier,
         planMode: args.planMode,

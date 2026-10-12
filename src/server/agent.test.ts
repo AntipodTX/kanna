@@ -18,7 +18,7 @@ import {
 } from "./agent"
 import type { HarnessTurn } from "./harness-types"
 import type { SubagentActivityUpdate } from "./background-tasks"
-import type { ChatAttachment, TranscriptEntry } from "../shared/types"
+import type { AgentProvider, ChatAttachment, TranscriptEntry } from "../shared/types"
 import type { SessionArtifactStatus } from "./session-artifacts"
 import { timestamped } from "./transcript"
 
@@ -1488,7 +1488,7 @@ describe("AgentCoordinator claude integration", () => {
     events.close()
   })
 
-  test("reuses a persistent Claude session across turns", async () => {
+  test("reuses a persistent Claude session without altering user text after a model change", async () => {
     const events = new AsyncEventQueue<any>()
     const startSessionCalls: Array<{ model: string; planMode: boolean; sessionToken: string | null }> = []
     const prompts: string[] = []
@@ -1558,7 +1558,7 @@ describe("AgentCoordinator claude integration", () => {
       chatId: "chat-1",
       provider: "claude",
       content: "check task output",
-      model: "claude-opus-4-1",
+      model: "claude-sonnet-4-5",
     })
     await waitFor(() => store.turnFinishedCount === 2)
 
@@ -2257,7 +2257,7 @@ describe("concurrent agents notice injection", () => {
     await coordinator.send({ type: "chat.send", chatId: "chat-2", provider: "claude", content: "second prompt", model: "claude-opus-4-1" })
 
     expect(prompts).toHaveLength(2)
-    // chat-1 started alone — nothing is appended.
+    // chat-1 started alone — no automatic instructions.
     expect(prompts[0]).toBe("first prompt")
     // chat-2 started while chat-1 was running in the same directory.
     expect(prompts[1]?.startsWith("second prompt")).toBe(true)
@@ -2831,7 +2831,7 @@ function createFakeChat(id: string, projectId: string, title = "New Chat") {
     id,
     projectId,
     title,
-    provider: null as "claude" | "codex" | null,
+    provider: null as AgentProvider | null,
     planMode: false,
     autoPlan: false,
     sessionToken: null as string | null,
@@ -2874,7 +2874,7 @@ function createFakeStore(options?: {
     getMessages() {
       return this.messages
     },
-    async setChatProvider(chatId: string, provider: "claude" | "codex") {
+    async setChatProvider(chatId: string, provider: AgentProvider) {
       requireChat(chatId).provider = provider
     },
     async setPlanMode(chatId: string, planMode: boolean) {
@@ -2948,6 +2948,48 @@ function createFakeStore(options?: {
     },
   }
 }
+
+describe("ordinary user prompt delivery", () => {
+  for (const provider of ["claude", "codex", "cursor", "grok", "pi"] as const) {
+    test(`${provider} receives the user's text without automatic Kanna instructions`, async () => {
+      const events = new AsyncEventQueue<any>()
+      const prompts: string[] = []
+      const content = "  Explain this change.\nKeep my formatting.  "
+      const manager = {
+        async startSession() { return { sessionToken: "native-session", resumeFellBack: false } },
+        async listModels() { return [] },
+        async startTurn(args: { content: string }): Promise<HarnessTurn> {
+          prompts.push(args.content)
+          return { provider, stream: events, interrupt: async () => {}, close: () => {} }
+        },
+      }
+      const store = createFakeStore()
+      store.chat.provider = provider
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => {},
+        codexManager: manager as never,
+        cursorManager: manager as never,
+        grokManager: manager as never,
+        piManager: manager as never,
+        resolvePiConnection: async () => ({ provider: "openai", baseUrl: "https://example.invalid", apiKey: "test" }),
+        startClaudeSession: async () => ({
+          provider: "claude", stream: events,
+          interrupt: async () => {}, close: () => {},
+          sendPrompt: async (text: string) => { prompts.push(text) },
+          setModel: async () => {}, setPermissionMode: async () => {},
+        }),
+      })
+      try {
+        await coordinator.send({ type: "chat.send", chatId: "chat-1", provider, content, model: "test-model" })
+        expect(prompts).toEqual(["Explain this change.\nKeep my formatting."])
+      } finally {
+        await coordinator.cancel("chat-1")
+        events.close()
+      }
+    })
+  }
+})
 
 describe("shared display tool lifecycle", () => {
   for (const provider of ["claude", "codex", "cursor", "pi"] as const) {
