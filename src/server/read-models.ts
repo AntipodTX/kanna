@@ -421,7 +421,8 @@ export function deriveChatSnapshot(
   drainingChatIds: Set<string>,
   chatId: string,
   getMessages: (chatId: string) => Pick<ChatSnapshot, "messages" | "startIndex" | "readAnchor"> & { outline?: TranscriptOutlineEntry[] },
-  subagents?: readonly SubagentActivity[]
+  subagents?: readonly SubagentActivity[],
+  steeringQueuedMessageIds: ReadonlySet<string> = new Set(),
 ): ChatSnapshot | null {
   const chat = state.chatsById.get(chatId)
   if (!chat || chat.deletedAt) return null
@@ -449,6 +450,7 @@ export function deriveChatSnapshot(
     queuedMessages: (state.queuedMessagesByChatId.get(chat.id) ?? []).map((entry) => ({
       ...entry,
       attachments: [...entry.attachments],
+      steering: steeringQueuedMessageIds.has(entry.id),
     })),
     messages: transcript.messages,
     startIndex: transcript.startIndex,

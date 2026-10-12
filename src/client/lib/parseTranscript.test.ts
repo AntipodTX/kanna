@@ -1,3 +1,4 @@
+import { codexAsyncQuestionTool, encodeCodexQuestionReplies } from "../../shared/codex-questions"
 import { describe, expect, test } from "bun:test"
 import { processTranscriptMessages } from "./parseTranscript"
 import { getLatestToolIds } from "../app/derived"
@@ -322,6 +323,33 @@ describe("processTranscriptMessages", () => {
     expect(messages[0]?.kind).toBe("tool")
     if (messages[0]?.kind !== "tool") throw new Error("unexpected message")
     expect(messages[0].result).toEqual({ answers: { "Provider?": ["Claude"] } })
+  })
+
+
+  test("an async card does not hide an older blocking question", () => {
+    const blocking = entry({ kind: "tool_call", tool: { kind: "tool", toolKind: "ask_user_question", toolName: "AskUserQuestion", toolId: "blocking", input: { questions: [{ question: "Blocking?" }] } } })
+    const tool = codexAsyncQuestionTool({ id: "async", delivery: "async", questions: [{ title: "Async?" }] }, "thread")!
+    expect(getLatestToolIds(processTranscriptMessages([blocking, entry({ kind: "tool_call", tool })])).AskUserQuestion).toBe(blocking._id)
+  })
+
+
+  test("hydrates async answers after turn completion identically on reload and incremental updates", () => {
+    const tool = codexAsyncQuestionTool({ id: "async-1", delivery: "async", questions: [
+      { title: "Same?", options: ["A", "B"] }, { title: "Same?" },
+    ] }, "thread-1")!
+    const entries = [entry({ kind: "tool_call", tool }), entry({ kind: "result", subtype: "success", isError: false, durationMs: 1, result: "Done" })]
+    const before = processTranscriptMessages(entries)
+    const replies = tool.input.questions.map((question, index) => ({ questionItemId: question.id!, question: question.question, answer: `Answer ${index}` }))
+    const partial = [...entries, entry({ kind: "user_prompt", content: encodeCodexQuestionReplies([replies[0]!]) })]
+    const partialMessages = processTranscriptMessages(partial, before)
+    expect(partialMessages[0]).toMatchObject({ result: { answers: { [replies[0]!.questionItemId]: ["Answer 0"] } } })
+    expect(before[0]).not.toHaveProperty("result")
+    const complete = [...partial, entry({ kind: "user_prompt", content: encodeCodexQuestionReplies([replies[1]!]) })]
+    const incremental = processTranscriptMessages(complete, partialMessages)
+    expect(incremental).toEqual(processTranscriptMessages(complete))
+    expect(incremental[0]).toMatchObject({ result: { answers: {
+      [replies[0]!.questionItemId]: ["Answer 0"], [replies[1]!.questionItemId]: ["Answer 1"],
+    } } })
   })
 })
 
