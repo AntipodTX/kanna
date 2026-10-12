@@ -2,6 +2,7 @@ import { useSidebarStore } from "./sidebarStore"
 import type { SidebarProjectGroup } from "../../shared/types"
 import { afterEach, describe, expect, test } from "bun:test"
 import {
+  composerStateFromModelSettings,
   migrateChatPreferencesState,
   NEW_CHAT_COMPOSER_ID,
   useChatPreferencesStore,
@@ -258,6 +259,152 @@ describe("migrateChatPreferencesState", () => {
 })
 
 describe("chat preference store", () => {
+  test("runtime hydration preserves pending provider switches across navigation", () => {
+    const store = useChatPreferencesStore.getState()
+    const runtime = composerStateFromModelSettings({ provider: "claude", model: "opus" })!
+    store.hydrateComposerFromRuntime("chat-a", runtime)
+    store.resetChatComposerFromProvider("chat-a", "codex")
+    store.markPendingProviderSwitch("chat-a")
+    store.hydrateComposerFromRuntime("chat-a", runtime)
+    expect(store.getComposerState("chat-a").provider).toBe("codex")
+    expect(useChatPreferencesStore.getState().pendingProviderSwitches["chat-a"]).toBe(true)
+    const acknowledgement = store.getComposerState("chat-a")
+    store.hydrateComposerFromRuntime("chat-a", acknowledgement)
+    expect(store.getComposerState("chat-a")).toEqual(acknowledgement)
+  })
+
+  test("runtime hydration preserves unsent model and options across navigation", () => {
+    const store = useChatPreferencesStore.getState()
+    const runtime = composerStateFromModelSettings({ provider: "claude", model: "opus" })!
+    store.hydrateComposerFromRuntime("chat-a", runtime)
+    store.setChatComposerModel("chat-a", "sonnet")
+    store.setChatComposerModelOptions("chat-a", { reasoningEffort: "low" })
+    const selected = store.getComposerState("chat-a")
+    store.hydrateComposerFromRuntime("chat-b", runtime)
+    store.hydrateComposerFromRuntime("chat-a", runtime)
+    expect(store.getComposerState("chat-a")).toEqual(selected)
+  })
+
+  test("runtime acknowledgement releases draft protection for later server updates", () => {
+    const store = useChatPreferencesStore.getState()
+    const initial = composerStateFromModelSettings({ provider: "claude", model: "opus" })!
+    store.hydrateComposerFromRuntime("chat-a", initial)
+    store.setChatComposerModel("chat-a", "sonnet")
+    store.setChatComposerModelOptions("chat-a", { reasoningEffort: "low" })
+    const submitted = store.getComposerState("chat-a")
+    store.hydrateComposerFromRuntime("chat-a", initial)
+    expect(store.getComposerState("chat-a")).toEqual(submitted)
+    store.hydrateComposerFromRuntime("chat-a", submitted)
+    store.hydrateComposerFromRuntime("chat-a", initial)
+    expect(store.getComposerState("chat-a")).toEqual(initial)
+  })
+
+  test("runtime hydration follows server model updates when composer is untouched", () => {
+    const store = useChatPreferencesStore.getState()
+    const initial = composerStateFromModelSettings({ provider: "claude", model: "opus" })!
+    const updated = composerStateFromModelSettings({ provider: "claude", model: "sonnet",
+      modelOptions: { claude: { reasoningEffort: "low", fastMode: false, contextWindow: "1m" } } })!
+    store.hydrateComposerFromRuntime("chat-a", initial)
+    store.hydrateComposerFromRuntime("chat-a", updated)
+    expect(store.getComposerState("chat-a")).toEqual(updated)
+  })
+
+  test("picker writes protect drafts while programmatic initialization allows hydration", () => {
+    const store = useChatPreferencesStore.getState()
+    const initial = composerStateFromModelSettings({ provider: "claude", model: "opus" })!
+    const selection = composerStateFromModelSettings({ provider: "claude", model: "sonnet",
+      modelOptions: { claude: { reasoningEffort: "low" } } })!
+    store.setComposerState("chat-a", initial)
+    store.hydrateComposerFromRuntime("chat-a", selection)
+    expect(store.getComposerState("chat-a")).toEqual(selection)
+    store.setComposerState("chat-a", initial, { userEdit: true })
+    store.hydrateComposerFromRuntime("chat-a", selection)
+    expect(store.getComposerState("chat-a")).toEqual(initial)
+  })
+
+  test("a choice made before the first runtime snapshot survives late hydration", () => {
+    const store = useChatPreferencesStore.getState()
+    store.initializeComposerForChat("chat-a")
+    store.setChatComposerModel("chat-a", "sonnet")
+    store.setChatComposerMode("chat-a", "plan")
+    const selected = store.getComposerState("chat-a")
+    store.hydrateComposerFromRuntime("chat-a", composerStateFromModelSettings({ provider: "claude", model: "opus" })!)
+    expect(store.getComposerState("chat-a")).toEqual(selected)
+  })
+
+  test("unchanged selections and automatic plan approval keep runtime hydration active", () => {
+    const store = useChatPreferencesStore.getState()
+    const initial = composerStateFromModelSettings({ provider: "claude", model: "opus", planMode: true })!
+    store.hydrateComposerFromRuntime("chat-a", initial)
+    store.setChatComposerModel("chat-a", initial.model)
+    store.setChatComposerModelOptions("chat-a", initial.modelOptions)
+    store.setChatComposerMode("chat-a", "plan")
+    store.clearChatComposerPlanMode("chat-a")
+    const updated = composerStateFromModelSettings({ provider: "claude", model: "sonnet" })!
+    store.hydrateComposerFromRuntime("chat-a", updated)
+    expect(store.getComposerState("chat-a")).toEqual(updated)
+  })
+
+  test("a later unsent choice survives acknowledgement of an earlier submitted choice", () => {
+    const store = useChatPreferencesStore.getState()
+    store.hydrateComposerFromRuntime("chat-a", composerStateFromModelSettings({ provider: "claude", model: "opus" })!)
+    store.setChatComposerModel("chat-a", "sonnet")
+    const submitted = store.getComposerState("chat-a")
+    store.setChatComposerModelOptions("chat-a", { reasoningEffort: "low" })
+    const draft = store.getComposerState("chat-a")
+    store.hydrateComposerFromRuntime("chat-a", submitted)
+    expect(store.getComposerState("chat-a")).toEqual(draft)
+  })
+
+  test("normalizes persisted model settings for every provider", () => {
+    expect(composerStateFromModelSettings({
+      provider: "claude",
+      model: "opus",
+      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "1m" } },
+      planMode: true,
+    })).toMatchObject({
+      provider: "claude",
+      model: "opus",
+      modelOptions: { reasoningEffort: "max", contextWindow: "1m", fastMode: false },
+      planMode: true,
+      autoPlan: false,
+    })
+    expect(composerStateFromModelSettings({
+      provider: "codex",
+      model: "gpt-5.6-luna",
+      modelOptions: { codex: { reasoningEffort: "ultra", fastMode: true } },
+      planMode: true,
+    })).toEqual({
+      provider: "codex",
+      model: "gpt-5.6-luna",
+      modelOptions: { reasoningEffort: "max", fastMode: true },
+      planMode: true,
+      autoPlan: false,
+    })
+    expect(composerStateFromModelSettings({
+      provider: "cursor",
+      model: "composer-2.5",
+      modelOptions: { cursor: { fastMode: true } },
+      planMode: true,
+    })).toEqual({
+      provider: "cursor",
+      model: "composer-2.5",
+      modelOptions: { fastMode: true },
+      planMode: false,
+      autoPlan: false,
+    })
+    expect(composerStateFromModelSettings({
+      provider: "codex",
+      model: "gpt-5.6-sol",
+    })).toEqual({
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      modelOptions: { reasoningEffort: "medium", fastMode: false },
+      planMode: false,
+      autoPlan: false,
+    })
+  })
+
   test("starts with GPT-5.6 Sol and Medium as the default Codex configuration", () => {
     expect(INITIAL_STATE.providerDefaults.codex).toEqual({
       model: "gpt-5.6-sol",
@@ -619,6 +766,29 @@ describe("chat preference store", () => {
     useChatPreferencesStore.getState().setChatComposerModel("chat-a", "gpt-5.3-codex-spark")
     expect(useChatPreferencesStore.getState().getComposerState("chat-a", { provider: "codex", model: "gpt-5.5" }).model)
       .toBe("gpt-5.3-codex-spark")
+  })
+
+  test("syncProviderDefaults preserves runtime-hydrated chat settings", () => {
+    const store = useChatPreferencesStore.getState()
+    const persistedState = {
+      provider: "claude" as const,
+      model: INITIAL_STATE.providerDefaults.claude.model,
+      modelOptions: { ...INITIAL_STATE.providerDefaults.claude.modelOptions },
+      planMode: INITIAL_STATE.providerDefaults.claude.planMode,
+      autoPlan: INITIAL_STATE.providerDefaults.claude.autoPlan,
+    }
+
+    store.hydrateComposerFromRuntime("chat-a", persistedState)
+    store.syncProviderDefaults("claude", {
+      ...INITIAL_STATE.providerDefaults,
+      claude: {
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "low", contextWindow: "1m" },
+        planMode: true,
+      },
+    })
+
+    expect(useChatPreferencesStore.getState().getComposerState("chat-a")).toEqual(persistedState)
   })
 
   test("syncProviderDefaults does not replace a changed new-chat state", () => {

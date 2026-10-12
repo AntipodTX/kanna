@@ -261,3 +261,11 @@ describe("buildHandoffMessageContent", () => {
     expect(buildHandoffMessageContent("<handoff/>", "  ")).toBe("<handoff/>")
   })
 })
+
+
+test("restricted restoration never points at the complete older transcript", () => {
+  const context = buildHandoffContext({ entries: [userPrompt("allowed prefix"), assistantText("allowed answer")], fromProvider: "claude", toProvider: "codex", transcriptPath: undefined })
+  expect(context?.text).not.toContain("complete conversation record")
+  expect(context?.text).not.toContain("undefined")
+  expect(context?.text).toContain("allowed prefix")
+})

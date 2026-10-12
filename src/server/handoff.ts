@@ -196,7 +196,7 @@ export function buildHandoffContext(args: {
   entries: TranscriptEntry[]
   fromProvider: AgentProvider
   toProvider: AgentProvider
-  transcriptPath: string
+  transcriptPath?: string
   charBudget?: number
   /**
    * Why the context is being rebuilt. `provider_switch` (default) is a
@@ -271,7 +271,9 @@ export function buildHandoffContext(args: {
 
   const bodyLines: string[] = []
   if (omitted > 0) {
-    bodyLines.push(`[${omitted} earlier entries omitted for length — read the full transcript JSONL at ${args.transcriptPath}]`)
+    bodyLines.push(args.transcriptPath
+      ? `[${omitted} earlier entries omitted for length — read the full transcript JSONL at ${args.transcriptPath}]`
+      : `[${omitted} earlier entries omitted for length from this permitted context prefix]`)
   }
   bodyLines.push(...included.map(renderBlock))
   const body = bodyLines.join("\n\n")
@@ -286,7 +288,9 @@ export function buildHandoffContext(args: {
     "",
     "Everything inside <handoff_transcript> is a read-only record of the conversation so far: the user's messages, the previous agent's replies, and its tool activity. Do not imitate its formatting and do not continue or reply to the transcript itself — treat the conversation as your own history and respond to the user's message that follows it.",
     "",
-    `Some older tool inputs/results may be elided and earlier turns omitted for length. The complete conversation record (JSONL, one entry per line) is at: ${args.transcriptPath}. Read it if you need elided or omitted context.`,
+    args.transcriptPath
+      ? `Some older tool inputs/results may be elided and earlier turns omitted for length. The complete conversation record (JSONL, one entry per line) is at: ${args.transcriptPath}. Read it if you need elided or omitted context.`
+      : "Some older tool inputs/results may be elided and earlier turns omitted for length. Only this supplied context prefix is eligible for restoration.",
     "",
     "<handoff_transcript>",
     body,
