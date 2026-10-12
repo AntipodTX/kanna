@@ -1423,6 +1423,112 @@ describe("AgentCoordinator codex integration", () => {
 })
 
 describe("AgentCoordinator claude integration", () => {
+  test("a failed Claude setter releases session configuration so the next turn can retry", async () => {
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    const prompts: string[] = []
+    let modelCalls = 0
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => ({
+        provider: "claude", stream: events, echoesPromptIds: true,
+        interrupt: async () => {}, close: () => events.close(),
+        setModel: async () => { if (++modelCalls === 1) throw new Error("model setting failed") },
+        setPermissionMode: async () => {},
+        sendPrompt: async (content, promptId) => {
+          prompts.push(content.split("\n\n")[0]!)
+          events.push({ type: "transcript", promptIds: [promptId], entry: timestamped({
+            kind: "result", subtype: "success", isError: false, durationMs: 0, result: "complete",
+          }) })
+        },
+      }),
+    })
+    const send = (content: string, model: string) => coordinator.send({
+      type: "chat.send", chatId: "chat-1", provider: "claude", content, model,
+    })
+    try {
+      await send("initial", "claude-opus-4-8")
+      await waitFor(() => store.turnFinishedCount === 1)
+      await expect(send("failed", "claude-sonnet-4-6")).rejects.toThrow("model setting failed")
+      expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+      await send("retry", "claude-sonnet-4-6")
+      await waitFor(() => store.turnFinishedCount === 2)
+      expect(modelCalls).toBe(2)
+      expect(prompts).toEqual(["initial", "retry"])
+    } finally { events.close() }
+  })
+  for (const setting of ["model", "permission", "fast"] as const) {
+    test(`a cancelled Claude ${setting} setter cannot interrupt or reconfigure its replacement turn`, async () => {
+      const events = new AsyncEventQueue<any>()
+      const store = createFakeStore()
+      const prompts: string[] = []
+      let interrupts = 0
+      let markConfiguring!: () => void
+      const configuring = new Promise<void>((resolve) => { markConfiguring = resolve })
+      let releaseConfiguration!: () => void
+      const configured = new Promise<void>((resolve) => { releaseConfiguration = resolve })
+      let markReplacement!: () => void
+      const replacementPrepared = new Promise<void>((resolve) => { markReplacement = resolve })
+      let preparationCount = 0
+      store.setAutoPlan = async (_chatId, autoPlan) => {
+        store.chat.autoPlan = autoPlan
+        if (++preparationCount === 3) markReplacement()
+      }
+      const native = { model: "", permission: false, fast: false }
+      let initialModel = ""
+      let settingCalls = 0
+      const applySetting = async (kind: typeof setting, value: string | boolean) => {
+        if (kind === setting && ++settingCalls === 1) { markConfiguring(); await configured }
+        if (kind === "model") native.model = value as string
+        else native[kind] = value as boolean
+      }
+      const coordinator = new AgentCoordinator({
+        store: store as never, onStateChange: () => {},
+        startClaudeSession: async (args) => {
+          native.model = initialModel = args.model
+          return {
+            provider: "claude", stream: events, echoesPromptIds: true,
+            interrupt: async () => { interrupts += 1 }, close: () => events.close(),
+            setModel: async (model) => applySetting("model", model),
+            setPermissionMode: async (planMode) => applySetting("permission", planMode),
+            setFastMode: async (fastMode) => applySetting("fast", fastMode),
+            sendPrompt: async (content, promptId) => {
+              prompts.push(content.split("\n\n")[0]!)
+              if (prompts.length === 1) events.push({ type: "transcript", promptIds: [promptId], entry: timestamped({
+                kind: "result", subtype: "success", isError: false, durationMs: 0, result: "initial complete",
+              }) })
+            },
+          }
+        },
+      })
+      const send = (content: string, changed = false) => coordinator.send({
+        type: "chat.send", chatId: "chat-1", provider: "claude", content,
+        model: changed && setting === "model" ? "claude-sonnet-4-6" : "claude-opus-4-8",
+        planMode: changed && setting === "permission",
+        modelOptions: { claude: { fastMode: changed && setting === "fast" } },
+      })
+      try {
+        await send("initial")
+        await waitFor(() => store.turnFinishedCount === 1)
+        const cancelled = send("cancelled", true)
+        await configuring
+        await coordinator.cancel("chat-1")
+        const replacement = send("replacement")
+        await replacementPrepared
+        releaseConfiguration()
+        await Promise.all([cancelled, replacement])
+        expect(interrupts).toBe(0)
+        expect(prompts).toEqual(["initial", "replacement"])
+        expect(native).toEqual({ model: initialModel, permission: false, fast: false })
+        expect(settingCalls).toBe(2)
+        expect(coordinator.getActiveStatuses().get("chat-1")).toBe("running")
+      } finally {
+        releaseConfiguration()
+        events.close()
+      }
+    })
+  }
   test("tracks Claude startup as active so cancel and queuing work before the session is ready", async () => {
     const events = new AsyncEventQueue<any>()
     let resolveStartRequested!: () => void
