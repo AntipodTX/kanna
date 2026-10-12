@@ -4,6 +4,7 @@
 
 ### Features
 
+- Isolated Codex approval prompts with consistent plan-progress rendering.
 
 ### Fixes
 
