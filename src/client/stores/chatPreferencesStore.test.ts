@@ -9,6 +9,7 @@ const INITIAL_STATE = useChatPreferencesStore.getInitialState()
 
 afterEach(() => {
   useChatPreferencesStore.setState(INITIAL_STATE)
+  useAppSettingsStore.setState(useAppSettingsStore.getInitialState())
 })
 
 describe("migrateChatPreferencesState", () => {
@@ -920,5 +921,35 @@ describe("chat preference store", () => {
     store.setProviderDefaultModel("claude", "haiku", liveClaude)
     store.setProviderDefaultModelOptions("claude", { reasoningEffort: "max" }, liveClaude)
     expect(useChatPreferencesStore.getState().providerDefaults.claude.modelOptions.reasoningEffort).toBe("max")
+  })
+
+
+  test("runtime hydration uses its chat catalog while settings metadata is older", () => {
+    const liveClaude = { ...PROVIDERS.find(provider => provider.id === "claude")!,
+      models: [{ id: "haiku", label: "Haiku", supportsEffort: true, supportedEffortLevels: ["low", "max"] as const }] }
+    const state = composerStateFromModelSettings({ provider: "claude", model: "haiku",
+      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "200k", fastMode: false } },
+      planMode: false, autoPlan: false }, liveClaude)!
+    useChatPreferencesStore.getState().hydrateComposerFromRuntime("runtime-live", state, { providerConfig: liveClaude })
+    expect(useChatPreferencesStore.getState().chatStates["runtime-live"]?.modelOptions.reasoningEffort).toBe("max")
+  })
+
+
+  test("a live-catalog draft acknowledges max without losing protection to an older runtime choice", () => {
+    const liveClaude = { ...PROVIDERS.find(provider => provider.id === "claude")!,
+      models: [{ id: "haiku", label: "Haiku", supportsEffort: true, supportedEffortLevels: ["low", "max"] as const }] }
+    const selected = composerStateFromModelSettings({ provider: "claude", model: "haiku",
+      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "200k", fastMode: false } } }, liveClaude)!
+    const prior = composerStateFromModelSettings({ provider: "claude", model: "haiku",
+      modelOptions: { claude: { reasoningEffort: "low", contextWindow: "200k", fastMode: false } } }, liveClaude)!
+    const store = useChatPreferencesStore.getState()
+    store.setComposerState("live-draft", selected, { userEdit: true, providerConfig: liveClaude })
+    store.hydrateComposerFromRuntime("live-draft", prior, { providerConfig: liveClaude })
+    expect(useChatPreferencesStore.getState().chatStates["live-draft"]).toEqual(selected)
+    expect(useChatPreferencesStore.getState().pendingComposerEdits["live-draft"]).toBe(true)
+    store.hydrateComposerFromRuntime("live-draft", selected, { providerConfig: liveClaude })
+    expect(useChatPreferencesStore.getState().pendingComposerEdits["live-draft"]).toBeUndefined()
+    store.hydrateComposerFromRuntime("live-draft", prior, { providerConfig: liveClaude })
+    expect(useChatPreferencesStore.getState().chatStates["live-draft"]).toEqual(prior)
   })
 })
