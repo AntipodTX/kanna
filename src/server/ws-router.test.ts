@@ -1,3 +1,4 @@
+import { createWsRouter } from "./ws-router"
 import { describe, expect, test } from "bun:test"
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
@@ -11,16 +12,7 @@ import { createEmptyState } from "./events"
 import { EventStore } from "./event-store"
 import { deriveLocalProjectsSnapshot } from "./read-models"
 import { SERVER_PROVIDERS, applyCodexModels, resetServerProvidersForTests } from "./provider-catalog"
-import {
-  assertSafeSkillId,
-  assertSafeSkillSource,
-  buildInstallSkillCommand,
-  buildUninstallSkillCommand,
-  listGlobalSkillsWithSources,
-  listInstalledSkills,
-  parseInstalledSkillsLock,
-} from "./skills"
-import { createWsRouter } from "./ws-router"
+import { assertSafeSkillId, assertSafeSkillSource, buildInstallSkillCommand, buildUninstallSkillCommand, listGlobalSkillsWithSources, listInstalledSkills, parseInstalledSkillsLock } from "./skills"
 
 function withSidebarGroupDefaults(group: {
   groupKey: string
@@ -395,7 +387,11 @@ function createTestRouter(overrides: Partial<CreateWsRouterArgs> = {}) {
     store: createFakeStore(),
     diffStore: createFakeDiffStore(),
     worktreeProbe: { getStates: () => new Map(), getRepoLabels: () => new Map(), getProjectsWithoutRepo: () => new Set() },
-    agent: { getActiveStatuses: () => new Map(), getDrainingChatIds: () => new Set() } as never,
+    agent: {
+      getActiveStatuses: () => new Map(),
+      getDrainingChatIds: () => new Set(),
+      getPendingCodexSteerIds: () => new Set(),
+    } as never,
     terminals: {
       getSnapshot: () => null,
       onEvent: () => () => {},

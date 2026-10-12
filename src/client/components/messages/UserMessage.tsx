@@ -1,3 +1,4 @@
+import { formatCodexQuestionReply } from "../../../shared/codex-questions"
 import {
   useCallback,
   useEffect,
@@ -357,7 +358,7 @@ export function UserMessage({
               </form>
               </div>
             ) : (
-              <TranscriptMarkdown text={parsedContent.body} />
+              <TranscriptMarkdown text={formatCodexQuestionReply(parsedContent.body)} />
             )}
           </div>
           {actionControls}

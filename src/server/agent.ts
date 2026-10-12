@@ -84,6 +84,7 @@ import { buildHandoffContext, buildHandoffMessageContent } from "./handoff"
 import { checkSessionArtifact, type SessionArtifactStatus } from "./session-artifacts"
 import { timestamped } from "./transcript"
 import { prepareClaudeTranscriptFork, type PreparedClaudeTranscriptFork } from "./claude-fork"
+import { encodeCodexQuestionReplies, parseCodexQuestionReplies, type CodexQuestionReply } from "../shared/codex-questions"
 import {
   findWorkflowOf,
   finishActivity,
@@ -1235,6 +1236,10 @@ export class AgentCoordinator {
     sessionToken: string
     transcriptPrefix: TranscriptEntry[]
   }>()
+  private readonly codexSteerCompletions = new Map<string, Promise<string | undefined>>()
+  private readonly pendingCodexSteers = new Map<string, Set<string>>()
+  private readonly cancelingChats = new Set<string>()
+  private readonly asyncQuestionResponses = new Map<string, Promise<void>>()
 
   constructor(args: AgentCoordinatorArgs) {
     this.store = args.store
@@ -1340,6 +1345,11 @@ export class AgentCoordinator {
   }
 
   dispose() {
+    for (const active of this.activeTurns.values()) if (active.provider === "codex") {
+      active.cancelRequested = true
+      active.customTools?.abort()
+      this.activeTurns.delete(active.chatId)
+    }
     for (const reservation of this.codexHistoryChecks.values()) this.cancelledCodexHistoryChecks.add(reservation)
     for (const operation of this.historyOperations.values()) operation.cancelled = true
     this.startingClaudeTurns.clear()
@@ -1573,6 +1583,10 @@ export class AgentCoordinator {
     if (changed) this.emitStateChange(chatId)
   }
 
+  getPendingCodexSteerIds(chatId: string): Set<string> {
+    return new Set(this.pendingCodexSteers.get(chatId) ?? [])
+  }
+
   private emitStateChange(chatId?: string, options?: { immediate?: boolean }) {
     this.onStateChange(chatId, options)
   }
@@ -1792,12 +1806,53 @@ export class AgentCoordinator {
     return queued
   }
 
+  private hasPendingCodexSteer(chatId: string, queuedMessageId?: string) {
+    const pending = this.pendingCodexSteers.get(chatId)
+    return queuedMessageId ? Boolean(pending?.has(queuedMessageId)) : Boolean(pending?.size)
+  }
+
+  private beginCodexSteer(chatId: string, queuedMessageId: string) {
+    let pending = this.pendingCodexSteers.get(chatId)
+    if (!pending) {
+      pending = new Set()
+      this.pendingCodexSteers.set(chatId, pending)
+    }
+    if (pending.has(queuedMessageId)) {
+      throw new Error("Queued message is already being steered")
+    }
+    pending.add(queuedMessageId)
+    let complete!: (error?: string) => void
+    const completion = new Promise<string | undefined>((resolve) => { complete = resolve })
+    this.codexSteerCompletions.set(chatId, completion)
+    this.emitStateChange(chatId)
+
+    let ended = false
+    return (error?: string) => {
+      if (ended) return
+      ended = true
+      pending?.delete(queuedMessageId)
+      if (pending?.size === 0) {
+        this.pendingCodexSteers.delete(chatId)
+      }
+      if (this.codexSteerCompletions.get(chatId) === completion) this.codexSteerCompletions.delete(chatId)
+      complete(error)
+      this.emitStateChange(chatId)
+    }
+  }
+
   private async dequeueAndStartQueuedMessage(chatId: string, queuedMessage: QueuedChatMessage, options?: { steered?: boolean }) {
     const chat = this.store.requireChat(chatId)
     const provider = this.resolveProvider(queuedMessage, chat.provider)
     if (provider === "codex")
       await this.assertCodexHistoryReady(chatId)
+    const alreadyPersisted = this.store.getMessages(chatId).some((entry) => (
+      entry.kind === "user_prompt" && entry._id === queuedMessage.id
+    ))
     await this.store.removeQueuedMessage(chatId, queuedMessage.id)
+    if (alreadyPersisted) {
+      this.emitStateChange(chatId)
+      return
+    }
     const settings = this.getProviderSettings(provider, queuedMessage, chat)
     await this.startTurnForChat({
       chatId,
@@ -1816,7 +1871,7 @@ export class AgentCoordinator {
   }
 
   private async maybeStartNextQueuedMessage(chatId: string) {
-    if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId)) return false
+    if (this.activeTurns.has(chatId) || this.hasPendingCodexSteer(chatId) || this.startingClaudeTurns.has(chatId)) return false
     const nextQueuedMessage = typeof this.store.getQueuedMessages === "function"
       ? this.store.getQueuedMessages(chatId)[0]
       : undefined
@@ -1933,9 +1988,30 @@ export class AgentCoordinator {
     }
   }
 
-  
+  private async preparePromptInput(args: {
+    provider: AgentProvider
+    chatId: string
+    content: string
+    steered?: boolean
+    cwd: string
+    awaitOwned?: <T>(operation: () => Promise<T>) => Promise<T>
+  }) {
+    const awaitOwned = args.awaitOwned ?? (async <T>(operation: () => Promise<T>) => await operation())
+    const isQuestionReply = args.provider === "codex" && parseCodexQuestionReplies(args.content).length > 0
+    const skills = isQuestionReply ? [] : await awaitOwned(() => this.resolvePromptSkills(args.provider, args.chatId, args.content))
+    let wireContent = args.steered && !isQuestionReply ? buildSteeredMessageContent(args.content) : args.content
+    if (args.provider !== "codex" && skills.length > 0) {
+      wireContent = appendSystemMessageBlock(wireContent, buildSkillSystemMessage(skills))
+    }
+    const concurrentAgentsNotice = buildConcurrentAgentsNotice(
+      this.collectConcurrentProjectChats(args.chatId, args.cwd)
+    )
+    if (concurrentAgentsNotice && !isQuestionReply) {
+      wireContent = appendSystemMessageBlock(wireContent, concurrentAgentsNotice)
+    }
 
-  
+    return { skills, wireContent }
+  }
 
   private async startTurnForChat(args: {
     chatId: string
@@ -2657,7 +2733,7 @@ export class AgentCoordinator {
     if (chat.archivedAt) {
       await this.store.unarchiveChat(chatId)
     }
-    if (this.activeTurns.has(chatId) || (this.startingClaudeTurns.has(chatId) && this.startingClaudeTurns.get(chatId) !== startupReservation)) {
+    if (this.activeTurns.has(chatId) || this.hasPendingCodexSteer(chatId) || (this.startingClaudeTurns.has(chatId) && this.startingClaudeTurns.get(chatId) !== startupReservation)) {
       this.analytics.track("message_sent")
       const queuedMessage = await this.enqueueMessage(chatId, command.content, command.attachments ?? [], {
         provider: command.provider,
@@ -3351,14 +3427,13 @@ export class AgentCoordinator {
     return { queuedMessageId: queuedMessage.id }
   }
 
-  private async recordCodexHistoryFailure(chatId: string, error: unknown) {
-    const message = `Codex history could not be saved or recovered: ${error instanceof Error ? error.message : String(error)}`
-    await this.store.appendMessage(chatId, timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: message }))
-    await this.store.recordTurnFailed(chatId, message)
-    this.emitStateChange(chatId)
-  }
-
-  async steer(command: Extract<ClientCommand, { type: "message.steer" }>) {
+  async steer(command: Extract<ClientCommand, { type: "message.steer" }>): Promise<void> {
+    const preceding = this.codexSteerCompletions.get(command.chatId)
+    if (preceding) {
+      const error = await preceding
+      if (error) throw new Error(error)
+      return this.steer(command)
+    }
     const queuedMessage = this.store.getQueuedMessage(command.chatId, command.queuedMessageId)
     if (!queuedMessage) {
       throw new Error("Queued message not found")
@@ -3374,6 +3449,113 @@ export class AgentCoordinator {
       activeTurn: this.activeTurns.has(command.chatId),
       queuedMessagePreview: queuedMessage.content.slice(0, 160),
     })
+
+    const active = this.activeTurns.get(command.chatId)
+    const expectedTurnId = active?.turn?.providerTurnId
+    if (active?.provider === "codex" && expectedTurnId && !active.pendingTool) {
+      const chat = this.store.requireChat(command.chatId)
+      const provider = this.resolveProvider(queuedMessage, chat.provider)
+      if (provider === "codex") {
+        const endSteer = this.beginCodexSteer(command.chatId, queuedMessage.id)
+        let settlementStarted = false
+        let lifecycleFinished = false
+        const finishSteerLifecycle = async () => {
+          if (lifecycleFinished) return
+          lifecycleFinished = true
+          const cancellationInProgress = this.cancelingChats.has(command.chatId) || active.cancelRequested
+          endSteer(cancellationInProgress ? "Codex turn was cancelled" : undefined)
+          if (cancellationInProgress) {
+            if (!this.hasPendingCodexSteer(command.chatId)) {
+              this.cancelingChats.delete(command.chatId)
+            }
+            return
+          }
+          await this.maybeStartNextQueuedMessage(command.chatId)
+        }
+
+        try {
+          const isQuestionReply = parseCodexQuestionReplies(queuedMessage.content).length > 0
+          const content = isQuestionReply ? queuedMessage.content : buildSteeredMessageContent(queuedMessage.content)
+          const selectedSkills = isQuestionReply ? [] : await this.resolvePromptSkills("codex", command.chatId, queuedMessage.content)
+          if (
+            this.activeTurns.get(command.chatId) !== active
+            || !this.store.getQueuedMessage(command.chatId, queuedMessage.id)
+          ) {
+            return
+          }
+          const transcriptEntry = {
+            ...timestamped({
+              kind: "user_prompt",
+              content,
+              attachments: queuedMessage.attachments,
+              steered: true,
+            }),
+            // Reusing the durable queue id makes recovery idempotent if Kanna
+            // exits after transcript persistence but before queue removal.
+            _id: queuedMessage.id,
+          } as Extract<TranscriptEntry, { kind: "user_prompt" }>
+          let steer: ReturnType<CodexAppServerManager["startSteerTurn"]>
+          try {
+            steer = this.codexManager.startSteerTurn({
+              chatId: command.chatId,
+              expectedTurnId,
+              content: buildPromptText(content, queuedMessage.attachments),
+              selectedSkills: selectedSkills.flatMap((skill) => (
+                skill.path ? [{ name: skill.name, path: skill.path }] : []
+              )),
+              clientUserMessageId: queuedMessage.id,
+              transcriptEntry,
+            })
+          } catch (error) {
+            // If the original turn ended while the native request was in flight,
+            // leave the durable queue intact and promote it once the gate closes.
+            if (this.activeTurns.get(command.chatId) === active) {
+              throw error
+            }
+            return
+          }
+          settlementStarted = true
+          void (async () => {
+            try {
+              try {
+                await steer.settled
+              } catch (error) {
+                // If the original turn ended while the native request was in
+                // flight, leave the durable queue intact for promotion.
+                if (this.activeTurns.get(command.chatId) === active) {
+                  const message = error instanceof Error ? error.message : String(error)
+                  this.reportBackgroundError?.(
+                    `[codex-steer] chat ${command.chatId} failed to settle message ${queuedMessage.id}: ${message}`
+                  )
+                }
+                return
+              }
+              if (this.store.getQueuedMessage(command.chatId, queuedMessage.id)) {
+                await this.store.removeQueuedMessage(command.chatId, queuedMessage.id)
+                this.emitStateChange(command.chatId)
+              }
+            } finally {
+              await finishSteerLifecycle()
+            }
+          })().catch((error) => {
+            const message = error instanceof Error ? error.message : String(error)
+            this.reportBackgroundError?.(
+              `[codex-steer] chat ${command.chatId} failed to finalize message ${queuedMessage.id}: ${message}`
+            )
+          })
+        } finally {
+          if (!settlementStarted) {
+            await finishSteerLifecycle()
+          }
+        }
+        return
+      }
+    }
+
+    // A different native Codex steer may still be waiting for its echoed
+    // userMessage. Keep this message durable and let the last settling steer
+    // promote the queue instead of interrupting or replacing the active turn.
+    if (this.hasPendingCodexSteer(command.chatId)) return
 
     if (this.activeTurns.has(command.chatId)) {
       await this.cancel(command.chatId, { hideInterrupted: true })
@@ -3395,6 +3577,9 @@ export class AgentCoordinator {
     const queuedMessage = this.store.getQueuedMessage(command.chatId, command.queuedMessageId)
     if (!queuedMessage) {
       throw new Error("Queued message not found")
+    }
+    if (this.hasPendingCodexSteer(command.chatId, command.queuedMessageId)) {
+      throw new Error("Queued message is being steered")
     }
 
     await this.store.removeQueuedMessage(command.chatId, command.queuedMessageId)
@@ -4078,8 +4263,22 @@ export class AgentCoordinator {
         }
 
         if (!event.entry || customToolEvents.skip(event.entry)) continue
-        await this.store.appendMessage(active.chatId, event.entry)
-        if (active.cancelRequested) break
+        try {
+          await this.store.appendMessage(active.chatId, event.entry)
+        } catch (error) {
+          const failure = error instanceof Error ? error : new Error(String(error))
+          try {
+            event.onPersisted?.(failure)
+          } catch {
+            // Persistence observers must not replace the storage failure.
+          }
+          throw error
+        }
+        try {
+          event.onPersisted?.()
+        } catch {
+          // The transcript is already durable; observer failures are isolated.
+        }
         this.trackSubagentFromEntry(active.chatId, event.entry)
 
         if (event.entry.kind === "system_init") {
@@ -4192,6 +4391,8 @@ export class AgentCoordinator {
   }
 
   async cancel(chatId: string, options?: { hideInterrupted?: boolean }) {
+    this.cancelingChats.add(chatId)
+    try {
     this.startingClaudeTurns.delete(chatId)
     const historyOperation = this.historyOperations.get(chatId)
     const checking = this.codexHistoryChecks.get(chatId)
@@ -4203,15 +4404,15 @@ export class AgentCoordinator {
         this.codexManager.stopSession(chatId)
       }
     }
-    // Also clean up any draining stream for this chat.
-    const draining = this.drainingStreams.get(chatId)
-    if (draining) {
+      // Also clean up any draining stream for this chat.
+      const draining = this.drainingStreams.get(chatId)
+      if (draining) {
         draining.turn.close()
         this.drainingStreams.delete(chatId)
       }
 
-    const active = this.activeTurns.get(chatId)
-    if (!active) return
+      const active = this.activeTurns.get(chatId)
+      if (!active) return
 
     logClaudeSteer("cancel_requested", {
         chatId,
@@ -4237,9 +4438,9 @@ export class AgentCoordinator {
         }
       }
 
-    const pendingTool = active.pendingTool
-    active.pendingTool = null
-    active.customTools?.abort()
+      const pendingTool = active.pendingTool
+      active.pendingTool = null
+      active.customTools?.abort()
 
     if (pendingTool && pendingTool.resultOwner !== "tool") {
         const result = discardedToolResult(pendingTool.tool)
@@ -4267,18 +4468,23 @@ export class AgentCoordinator {
     active.cancelRecorded = true
     active.hasFinalResult = true
 
-    // Remove from activeTurns immediately so the UI reflects the cancellation
-    // right away, rather than waiting for interrupt() which may hang.
-    this.activeTurns.delete(chatId)
-    this.closeRunningSubagents(chatId)
-    this.emitStateChange(chatId)
-    logClaudeSteer("cancel_active_turn_deleted", {
+      // Remove from activeTurns immediately so the UI reflects the cancellation
+      // right away, rather than waiting for interrupt() which may hang.
+      this.activeTurns.delete(chatId)
+      this.closeRunningSubagents(chatId)
+      this.emitStateChange(chatId)
+      logClaudeSteer("cancel_active_turn_deleted", {
         chatId,
         provider: active.provider,
         activePromptSeq: active.claudePromptSeq ?? null,
       })
 
-    await this.interruptAndCloseTurn(active.turn)
+      await this.interruptAndCloseTurn(active.turn)
+    } finally {
+      if (!this.hasPendingCodexSteer(chatId)) {
+        this.cancelingChats.delete(chatId)
+      }
+    }
   }
 
   private async requestToolInput(chatId: string, request: HarnessToolRequest, signal?: AbortSignal): Promise<unknown> {
@@ -4314,6 +4520,22 @@ export class AgentCoordinator {
 
   async respondTool(command: Extract<ClientCommand, { type: "chat.respondTool" }>) {
     const active = this.activeTurns.get(command.chatId)
+    if (active?.pendingTool?.toolUseId !== command.toolUseId) {
+      const entry = [...this.store.getMessages(command.chatId)].reverse().find(entry => (
+        entry.kind === "tool_call" && entry.tool.toolId === command.toolUseId
+      ))
+      if (entry?.kind === "tool_call" && entry.tool.toolKind === "ask_user_question" && entry.tool.input.codexAsync) {
+        // Serialize across sockets as well as repeated clicks. Re-read durable
+        // answers inside the lock, so a retry after restart is idempotent too.
+        const previous = this.asyncQuestionResponses.get(command.chatId) ?? Promise.resolve()
+        const response = previous.catch(() => {}).then(() => this.respondAsyncQuestion(command))
+        this.asyncQuestionResponses.set(command.chatId, response)
+        try { await response } finally {
+          if (this.asyncQuestionResponses.get(command.chatId) === response) this.asyncQuestionResponses.delete(command.chatId)
+        }
+        return
+      }
+    }
     if (!active || !active.pendingTool) {
       throw new Error("No pending tool request")
     }
@@ -4396,5 +4618,64 @@ export class AgentCoordinator {
     pending.resolve(command.result)
 
     this.emitStateChange(command.chatId)
+  }
+
+  private async respondAsyncQuestion(command: Extract<ClientCommand, { type: "chat.respondTool" }>) {
+    const chat = this.store.requireChat(command.chatId)
+    const entries = this.store.getMessages(command.chatId)
+    const entry = [...entries].reverse().find(entry => entry.kind === "tool_call" && entry.tool.toolId === command.toolUseId)
+    if (entry?.kind !== "tool_call" || entry.tool.toolKind !== "ask_user_question" || !entry.tool.input.codexAsync) {
+      throw new Error("Question is no longer available")
+    }
+    if (chat.provider !== "codex") throw new Error("This question belongs to a Codex chat")
+    if (chat.sessionToken !== entry.tool.input.codexAsync.threadId) throw new Error("This question belongs to a different Codex session")
+    const answers = asRecord(asRecord(command.result)?.answers)
+    const sent = new Map(entries.flatMap(entry => entry.kind === "user_prompt" ? parseCodexQuestionReplies(entry.content) : [])
+      .map(reply => [reply.questionItemId, reply.answer]))
+    const queued = this.store.getQueuedMessages(command.chatId)
+    const queuedReplies = new Map(queued.flatMap(message => parseCodexQuestionReplies(message.content)
+      .map(reply => [reply.questionItemId, { answer: reply.answer, message }] as const)))
+    const replies: CodexQuestionReply[] = []
+    const queuedIds = new Set<string>()
+    for (const question of entry.tool.input.questions) {
+      const id = question.id!
+      const raw = answers?.[id]
+      if (raw === undefined && sent.has(id)) continue
+      if (!Array.isArray(raw) || raw.length !== 1 || typeof raw[0] !== "string" || !raw[0].trim()) {
+        throw new Error("Choose or enter an answer for each question")
+      }
+      const answer = raw[0].trim()
+      const previous = sent.get(id) ?? queuedReplies.get(id)?.answer
+      if (previous !== undefined && previous !== answer) throw new Error("An answer to this question has already been submitted")
+      if (sent.has(id)) continue
+      const pending = queuedReplies.get(id)
+      if (pending) queuedIds.add(pending.message.id)
+      else replies.push({ questionItemId: id, question: question.question, answer })
+    }
+    if (replies.length) {
+      const message = await this.enqueueMessage(command.chatId, encodeCodexQuestionReplies(replies), [], {
+        provider: "codex", planMode: chat.planMode, autoPlan: chat.autoPlan,
+      })
+      queuedIds.add(message.id)
+    }
+    for (const queuedMessageId of queuedIds) {
+      if (!this.store.getQueuedMessage(command.chatId, queuedMessageId) || this.hasPendingCodexSteer(command.chatId, queuedMessageId)) continue
+      const active = this.activeTurns.get(command.chatId)
+      // Never take the generic cancel/restart route for an asynchronous answer.
+      // A starting turn or a blocking tool will drain this durable input later.
+      if (active && (active.provider !== "codex" || !active.turn?.providerTurnId || active.pendingTool || active.cancelRequested)) continue
+      try {
+        await this.steer({ type: "message.steer", chatId: command.chatId, queuedMessageId })
+      } catch (error) {
+        if (this.store.getQueuedMessage(command.chatId, queuedMessageId)) throw error
+      }
+    }
+  }
+
+  private async recordCodexHistoryFailure(chatId: string, error: unknown) {
+    const message = `Codex history could not be saved or recovered: ${error instanceof Error ? error.message : String(error)}`
+    await this.store.appendMessage(chatId, timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: message }))
+    await this.store.recordTurnFailed(chatId, message)
+    this.emitStateChange(chatId)
   }
 }
