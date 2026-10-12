@@ -215,6 +215,7 @@ export interface ProviderModelOption {
    */
   contextWindowTokens?: number
   supportsMaxReasoningEffort?: boolean
+  supportedEffortLevels?: readonly ClaudeReasoningEffort[]
 }
 
 export interface ProviderEffortOption {
@@ -301,6 +302,12 @@ export type PiReasoningEffort = (typeof PI_REASONING_OPTIONS)[number]["id"]
 export type GrokReasoningEffort = (typeof GROK_REASONING_OPTIONS)[number]["id"]
 
 export type ClaudeReasoningEffort = (typeof CLAUDE_REASONING_OPTIONS)[number]["id"]
+
+export const CLAUDE_STANDARD_REASONING_EFFORT_LEVELS: readonly ClaudeReasoningEffort[] = [
+  "low",
+  "medium",
+  "high",
+] as const
 export type ClaudeContextWindow = "200k" | "1m"
 export type ServiceTier = "fast"
 
@@ -622,6 +629,7 @@ export const PROVIDERS: ProviderCatalogEntry[] = [
         supportsEffort: true,
         contextWindowOptions: [...CLAUDE_CONTEXT_WINDOW_OPTIONS],
         supportsMaxReasoningEffort: true,
+        supportedEffortLevels: [...CLAUDE_STANDARD_REASONING_EFFORT_LEVELS, "max"],
         // Fast mode is available on the Opus family. The SDK confirms this at
         // runtime via supportedModels() (see applyClaudeSdkModels).
         supportsFastMode: true,
