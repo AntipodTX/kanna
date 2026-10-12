@@ -191,6 +191,8 @@ export interface QueuedChatMessage {
   content: string
   attachments: ChatAttachment[]
   createdAt: number
+  /** Transient server-derived state; never persisted in queue events. */
+  steering?: boolean
   provider?: AgentProvider
   model?: string
   modelOptions?: ModelOptions

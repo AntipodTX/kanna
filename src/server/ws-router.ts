@@ -615,7 +615,8 @@ export function createWsRouter({
           agent.getDrainingChatIds(),
           topic.chatId,
           (chatId) => store.getClientTranscript(chatId),
-          agent.getSubagents?.(topic.chatId)
+          agent.getSubagents?.(topic.chatId),
+          agent.getPendingCodexSteerIds(topic.chatId),
         ),
       },
     }
@@ -650,7 +651,8 @@ export function createWsRouter({
       agent.getDrainingChatIds(),
       chatId,
       (id) => store.getClientTranscript(id, fromIndex ?? getEarliestChatWindowStart(id)),
-      agent.getSubagents?.(chatId)
+      agent.getSubagents?.(chatId),
+      agent.getPendingCodexSteerIds(chatId),
     )
     if (cache) {
       (cache.chat ??= new Map()).set(key, data)

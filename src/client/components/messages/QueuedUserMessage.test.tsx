@@ -53,4 +53,27 @@ describe("QueuedUserMessage", () => {
     expect(html).toContain("Queued")
     expect(html.match(/<button/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
   })
+
+  test("renders a settling steer as a non-actionable sent-mid-turn message", () => {
+    const message: QueuedChatMessage = {
+      id: "queued-steering",
+      content: "Already sent follow-up",
+      attachments: [],
+      createdAt: Date.now(),
+      steering: true,
+    }
+
+    const html = renderToStaticMarkup(
+      <QueuedUserMessage
+        message={message}
+        onRemove={() => undefined}
+        onSendNow={() => undefined}
+      />
+    )
+
+    expect(html).toContain("Already sent follow-up")
+    expect(html).toContain('aria-label="Sent mid-turn"')
+    expect(html).not.toContain("border-dashed")
+    expect(html).not.toContain("<button")
+  })
 })
