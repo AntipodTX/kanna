@@ -10,7 +10,7 @@ import type {
   TodoItem,
   TranscriptEntry,
 } from "../shared/types"
-import type { HarnessEvent, HarnessToolRequest, HarnessTurn } from "./harness-types"
+import type { HarnessEvent, HarnessStartupOutcome, HarnessToolRequest, HarnessTurn } from "./harness-types"
 import { appendSystemMessageBlock, buildSkillSystemMessage } from "./harness-skills"
 import { buildKannaAgentId } from "./attribution"
 import { buildKannaSystemInstructions } from "./harness-instructions"
@@ -150,10 +150,14 @@ export interface StartCodexSessionArgs {
   serviceTier?: ServiceTier
   sessionToken: string | null
   pendingForkSessionToken?: string | null
+  isCurrentTurn?: () => boolean
+  signal?: AbortSignal
 }
 
 export interface StartCodexTurnArgs {
   chatId: string
+  isCurrentTurn?: () => boolean
+  signal?: AbortSignal
   model: string
   effort?: CodexReasoningEffort
   serviceTier?: ServiceTier
@@ -757,6 +761,10 @@ function itemToToolResults(item: ThreadItem): TranscriptEntry[] {
 
 export class CodexAppServerManager {
   private readonly sessions = new Map<string, SessionContext>()
+  private readonly sessionStarts = new Map<
+    string,
+    Promise<{ sessionToken: string; resumeFellBack: boolean; startupOutcome: HarnessStartupOutcome }>
+  >()
   private readonly spawnProcess: SpawnCodexAppServer
   private onRateLimits: ((snapshot: CodexRateLimitSnapshot) => void) | null = null
 
@@ -869,14 +877,15 @@ export class CodexAppServerManager {
   }
 
   async startSession(args: StartCodexSessionArgs) {
+    args.signal?.throwIfAborted()
     const existing = this.sessions.get(args.chatId)
-    if (existing && !existing.closed && existing.cwd === args.cwd && !args.pendingForkSessionToken) {
-      return
-    }
-
-    if (existing) {
+    if (existing && !existing.closed && existing.cwd === args.cwd && !args.pendingForkSessionToken
+      && (!existing.sessionToken || !args.sessionToken || existing.sessionToken === args.sessionToken)) {
+      if (existing.sessionToken) return { sessionToken: existing.sessionToken, resumeFellBack: false, startupOutcome: { kind: "reused" as const } }
+      const sessionStart = this.sessionStarts.get(args.chatId)
+      if (sessionStart) return await sessionStart
       this.stopSession(args.chatId)
-    }
+    } else if (existing) this.stopSession(args.chatId)
 
     const child = this.spawnProcess(args.cwd)
     const customTools = args.customTools ? createKannaMcpServer(args.customTools) : undefined
@@ -894,7 +903,18 @@ export class CodexAppServerManager {
     this.sessions.set(args.chatId, context)
     this.attachListeners(context)
 
-    try {
+    const assertCurrent = () => {
+      if (context.closed || this.sessions.get(args.chatId) !== context || (args.isCurrentTurn && !args.isCurrentTurn())) {
+        throw new Error("Codex startup was cancelled or replaced")
+      }
+    }
+    const onStartupAbort = () => {
+      if (this.sessions.get(args.chatId) === context) this.stopSession(args.chatId)
+    }
+    args.signal?.addEventListener("abort", onStartupAbort, { once: true })
+    if (args.signal?.aborted) onStartupAbort()
+    const sessionStart = (async () => {
+      try {
       await this.sendRequest(context, "initialize", {
         clientInfo: {
           name: "kanna_desktop",
@@ -905,6 +925,7 @@ export class CodexAppServerManager {
           experimentalApi: true,
         },
       } satisfies InitializeParams)
+      assertCurrent()
       this.writeMessage(context, {
         method: "initialized",
       })
@@ -960,9 +981,10 @@ export class CodexAppServerManager {
           } satisfies ThreadResumeParams)
         } catch (error) {
           if (!isRecoverableResumeError(error)) {
-            this.stopSession(args.chatId)
+            if (this.sessions.get(args.chatId) === context) this.stopSession(args.chatId)
             throw error
           }
+          assertCurrent()
           response = await this.sendRequest<ThreadStartResponse>(context, "thread/start", threadParams)
           resumeFellBack = true
         }
@@ -970,16 +992,33 @@ export class CodexAppServerManager {
         response = await this.sendRequest<ThreadStartResponse>(context, "thread/start", threadParams)
       }
 
+      assertCurrent()
       context.sessionToken = response.thread.id
-      return { sessionToken: context.sessionToken, resumeFellBack }
-    } catch (error) {
-      this.stopSession(args.chatId)
-      throw error
+      return { sessionToken: context.sessionToken, resumeFellBack, startupOutcome: {
+        kind: args.pendingForkSessionToken ? "forked" as const : resumeFellBack || !args.sessionToken ? "fresh" as const : "resumed" as const,
+      } }
+      } catch (error) {
+        if (this.sessions.get(args.chatId) === context) this.stopSession(args.chatId)
+        throw error
+      }
+    })()
+    this.sessionStarts.set(args.chatId, sessionStart)
+    try { return await sessionStart } finally {
+      args.signal?.removeEventListener("abort", onStartupAbort)
+      if (this.sessionStarts.get(args.chatId) === sessionStart) this.sessionStarts.delete(args.chatId)
     }
   }
 
   async startTurn(args: StartCodexTurnArgs): Promise<HarnessTurn> {
     const context = this.requireSession(args.chatId)
+    const assertOwner = () => {
+      if (args.signal?.aborted || (args.isCurrentTurn && !args.isCurrentTurn())) throw new Error("Codex turn startup was cancelled or replaced")
+    }
+    const assertCurrent = () => {
+      assertOwner()
+      if (context.closed || this.sessions.get(args.chatId) !== context) throw new Error("Codex turn startup was cancelled or replaced")
+    }
+    assertCurrent()
     if (context.pendingTurn) {
       throw new Error("Codex turn is already running")
     }
@@ -1009,8 +1048,13 @@ export class CodexAppServerManager {
       onApprovalRequest: args.onApprovalRequest,
     }
     context.pendingTurn = pendingTurn
+    const onStartupAbort = () => {
+      if (this.sessions.get(args.chatId) === context && context.pendingTurn === pendingTurn) this.stopSession(args.chatId)
+    }
+    args.signal?.addEventListener("abort", onStartupAbort, { once: true })
 
     try {
+      assertCurrent()
       const input: CodexUserInput[] = [
         {
           type: "text",
@@ -1042,23 +1086,23 @@ export class CodexAppServerManager {
           },
         },
       } satisfies TurnStartParams)
-      if (context.pendingTurn) {
-        context.pendingTurn.turnId = response.turn.id
-      } else {
-        pendingTurn.turnId = response.turn.id
-      }
+      // A native error can close context immediately after ACK; keep its
+      // queued result observable when this caller still owns the turn.
+      assertOwner()
+      pendingTurn.turnId = response.turn.id
     } catch (error) {
-      context.pendingTurn = null
+      if (context.pendingTurn === pendingTurn) context.pendingTurn = null
       queue.finish()
       throw error
+    } finally {
+      args.signal?.removeEventListener("abort", onStartupAbort)
     }
 
     return {
       provider: "codex",
       stream: queue,
       interrupt: async () => {
-        const pendingTurn = context.pendingTurn
-        if (!pendingTurn) return
+        if (context.pendingTurn !== pendingTurn) return
 
         context.pendingTurn = null
         pendingTurn.resolved = true
