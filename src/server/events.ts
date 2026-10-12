@@ -29,6 +29,18 @@ export interface ChatReadAnchor {
   offsetFromMessage?: number
 }
 
+/** Required local context not yet confirmed delivered to the destination. */
+export interface ContextRestoration {
+  id: string
+  provider: AgentProvider
+  fromProvider: AgentProvider
+  reason: "provider_switch" | "session_restore" | "explicit_reset"
+  /** Prefix before the input that first requested restoration; excludes retries. */
+  endExclusive: number
+  /** Durable lower bound even before an explicit-reset boundary row commits. */
+  startInclusive?: number
+}
+
 export interface ChatRecord {
   id: string
   projectId: string
@@ -54,6 +66,7 @@ export interface ChatRecord {
   autoPlan: boolean
   sessionToken: string | null
   pendingForkSessionToken?: string | null
+  contextRestoration?: ContextRestoration | null
   hasMessages?: boolean
   lastMessageAt?: number
   /**
@@ -396,6 +409,20 @@ export type TurnEvent =
       timestamp: number
       chatId: string
       pendingForkSessionToken: string | null
+    }
+  | {
+      v: 2
+      type: "context_restoration_set"
+      timestamp: number
+      chatId: string
+      restoration: ContextRestoration | null
+    }
+  | {
+      v: 2
+      type: "context_restoration_acknowledged"
+      timestamp: number
+      chatId: string
+      restorationId: string
     }
 
 export type StoreEvent = ProjectEvent | ChatEvent | MessageEvent | QueuedMessageEvent | TurnEvent
