@@ -112,13 +112,17 @@ describe("CodexAppServerManager", () => {
       sessionToken: "missing-thread",
     })
 
-    expect(started).toEqual({ sessionToken: "thread-2", resumeFellBack: true })
+    expect(started).toEqual({ sessionToken: "thread-2", resumeFellBack: true, startupOutcome: { kind: "fresh" } })
     expect(process.messages.map((message: any) => message.method)).toEqual([
       "initialize",
       "initialized",
       "thread/resume",
       "thread/start",
     ])
+    const reused = await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: "thread-2" })
+    expect(reused).toEqual({ sessionToken: "thread-2", resumeFellBack: false, startupOutcome: { kind: "reused" } })
+    expect(process.messages.filter((message: any) => message.method === "thread/start")).toHaveLength(1)
+
   })
 
   // Regression coverage for the real-world "thread/resume failed: thread X
@@ -213,7 +217,7 @@ describe("CodexAppServerManager", () => {
       pendingForkSessionToken: "thread-source",
     })
 
-    expect(started).toEqual({ sessionToken: "thread-fork-1", resumeFellBack: false })
+    expect(started).toEqual({ sessionToken: "thread-fork-1", resumeFellBack: false, startupOutcome: { kind: "forked" } })
     expect(process.messages.map((message: any) => message.method)).toEqual([
       "initialize",
       "initialized",
@@ -2477,4 +2481,199 @@ describe("Codex shared tools", () => {
       }
     })
   }
+})
+
+test("Codex cancelled serialized startup retires its own process before a successor starts", async () => {
+  let entered!: () => void
+  const observed = new Promise<void>(resolve => { entered = resolve })
+  const first = new FakeCodexProcess((message, child) => {
+    if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: { userAgent: "test" } })
+    if (message.method === "thread/start") entered()
+  })
+  const second = new FakeCodexProcess((message, child) => {
+    if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: { userAgent: "test" } })
+    if (message.method === "thread/start") child.writeServerMessage({ id: message.id, result: { thread: { id: "successor-thread" } } })
+  })
+  let spawns = 0
+  const manager = new CodexAppServerManager({ spawnProcess: () => (spawns++ === 0 ? first : second) as never })
+  const abort = new AbortController()
+  const old = manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null, signal: abort.signal } as any)
+  const settled = old.catch(error => error)
+  try {
+    await observed
+    abort.abort()
+    expect(first.killed).toBe(true)
+    const result = await manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null })
+    expect(result).toEqual({ sessionToken: "successor-thread", resumeFellBack: false, startupOutcome: { kind: "fresh" } })
+    expect(await settled).toBeInstanceOf(Error)
+    expect(first.killed).toBe(true)
+    expect(second.killed).toBe(false)
+    expect(spawns).toBe(2)
+  } finally { manager.stopAll(); await settled }
+})
+
+class ReviewProcess extends EventEmitter {
+  readonly stdin = new PassThrough()
+  readonly stdout = new PassThrough()
+  readonly stderr = new PassThrough()
+  killed = false
+  constructor(onMessage: (message: any, child: ReviewProcess) => void) {
+    super()
+    let buffer = ""
+    this.stdin.on("data", chunk => {
+      buffer += chunk.toString()
+      const lines = buffer.split("\n")
+      buffer = lines.pop() ?? ""
+      for (const line of lines) if (line.trim()) onMessage(JSON.parse(line), this)
+    })
+  }
+  reply(id: number, result: unknown) { this.stdout.write(`${JSON.stringify({ id, result })}\n`) }
+  fail(id: number) { this.stdout.write(`${JSON.stringify({ id, error: { message: "thread/resume failed: thread not found" } })}\n`) }
+  kill() { this.killed = true; this.emit("close", 0) }
+}
+
+test("main integration: cancelling a pending native turn/start stops its owned process", async () => {
+  let entered!: () => void
+  const started = new Promise<void>(resolve => { entered = resolve })
+  const processes: ReviewProcess[] = []
+  const manager = new CodexAppServerManager({ spawnProcess: () => {
+    const child = new ReviewProcess((message, child) => {
+      if (message.method === "initialize") child.reply(message.id, {})
+      else if (message.method === "thread/start") child.reply(message.id, { thread: { id: "thread" } })
+      else if (message.method === "turn/start") entered()
+    })
+    processes.push(child)
+    return child as never
+  } })
+  const abort = new AbortController()
+  let pending: Promise<unknown> | undefined
+  try {
+    await manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null })
+    pending = manager.startTurn({ chatId: "chat", model: "gpt-5.4", content: "cancel me", planMode: false,
+      onToolRequest: async () => ({}), signal: abort.signal } as any).catch(error => error)
+    await started
+    abort.abort()
+    expect(processes[0]?.killed).toBe(true)
+    expect(await pending).toBeInstanceOf(Error)
+    await manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null })
+    expect(processes).toHaveLength(2)
+    expect(processes[1]?.killed).toBe(false)
+  } finally { manager.stopAll(); await pending }
+})
+
+test("main integration: an old native turn handle cannot interrupt its successor", async () => {
+  let turns = 0
+  const interrupts: string[] = []
+  const process = new ReviewProcess((message, child) => {
+    if (message.method === "initialize") child.reply(message.id, {})
+    else if (message.method === "thread/start") child.reply(message.id, { thread: { id: "thread" } })
+    else if (message.method === "turn/start") child.reply(message.id, { turn: { id: `turn-${++turns}` } })
+    else if (message.method === "turn/interrupt") { interrupts.push(message.params.turnId); child.reply(message.id, {}) }
+  })
+  const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+  const args = { chatId: "chat", model: "gpt-5.4", content: "go", planMode: false, onToolRequest: async () => ({}) }
+  try {
+    await manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null })
+    const old = await manager.startTurn(args)
+    process.stdout.write(`${JSON.stringify({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn-1", status: "completed", error: null } } })}\n`)
+    await collectStream(old.stream)
+    const current = await manager.startTurn(args)
+    await old.interrupt()
+    expect(interrupts).toEqual([])
+    await current.interrupt()
+    expect(interrupts).toEqual(["turn-2"])
+  } finally { manager.stopAll() }
+})
+
+test("main integration: a late native turn/start acknowledgement cannot overwrite the successor turn ID", async () => {
+  let entered!: () => void
+  const started = new Promise<void>(resolve => { entered = resolve })
+  let release!: () => void
+  let turns = 0
+  const interrupts: string[] = []
+  const process = new ReviewProcess((message, child) => {
+    if (message.method === "initialize") child.reply(message.id, {})
+    else if (message.method === "thread/start") child.reply(message.id, { thread: { id: "thread" } })
+    else if (message.method === "turn/start") {
+      if (++turns === 1) { release = () => child.reply(message.id, { turn: { id: "turn-1" } }); entered() }
+      else child.reply(message.id, { turn: { id: "turn-2" } })
+    } else if (message.method === "turn/interrupt") { interrupts.push(message.params.turnId); child.reply(message.id, {}) }
+  })
+  const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+  const args = { chatId: "chat", model: "gpt-5.4", content: "go", planMode: false, onToolRequest: async () => ({}) }
+  let pending: Promise<unknown> | undefined
+  try {
+    await manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null })
+    pending = manager.startTurn(args).catch(error => error)
+    await started
+    process.stdout.write(`${JSON.stringify({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn-1", status: "completed", error: null } } })}\n`)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const current = await manager.startTurn(args)
+    release()
+    await pending
+    await current.interrupt()
+    expect(interrupts).toEqual(["turn-2"])
+  } finally { release?.(); manager.stopAll(); await pending }
+})
+
+test("main integration: current Codex successor does not inherit cancelled initialization ownership", async () => {
+  let entered!: () => void
+  const initialized = new Promise<void>(resolve => { entered = resolve })
+  let release!: () => void
+  const processes: ReviewProcess[] = []
+  const manager = new CodexAppServerManager({ spawnProcess: () => {
+    const ordinal = processes.length
+    const child = new ReviewProcess((message, child) => {
+      if (message.method === "initialize") {
+        if (ordinal === 0) { release = () => child.reply(message.id, {}); entered() }
+        else child.reply(message.id, {})
+      } else if (message.method === "thread/start") child.reply(message.id, { thread: { id: "replacement-thread" } })
+    })
+    processes.push(child)
+    return child as never
+  } })
+  let ownsFirst = true
+  const abortFirst = new AbortController()
+  const args = { chatId: "chat", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null }
+  const first = manager.startSession({ ...args, isCurrentTurn: () => ownsFirst, signal: abortFirst.signal }).catch(error => error)
+  try {
+    await initialized
+    ownsFirst = false
+    abortFirst.abort()
+    const second = manager.startSession({ ...args, isCurrentTurn: () => true }).catch(error => error)
+    release()
+    expect(await first).toBeInstanceOf(Error)
+    const result = await second
+    expect(result).not.toBeInstanceOf(Error)
+    expect(result).toMatchObject({ sessionToken: "replacement-thread", startupOutcome: { kind: "fresh" } })
+    expect(processes).toHaveLength(2)
+  } finally { release?.(); manager.stopSession("chat"); await first }
+})
+
+test("main integration: a fresh Codex fallback cannot count as continuation of a different requested native token", async () => {
+  const processes: ReviewProcess[] = []
+  const manager = new CodexAppServerManager({ spawnProcess: () => {
+    const ordinal = processes.length
+    const child = new ReviewProcess((message, child) => {
+      if (message.method === "initialize") child.reply(message.id, {})
+      else if (message.method === "thread/resume") child.fail(message.id)
+      else if (message.method === "thread/start") child.reply(message.id, { thread: { id: `fresh-${ordinal}` } })
+    })
+    processes.push(child)
+    return child as never
+  } })
+  let ownsFirst = true
+  const abortFirst = new AbortController()
+  const args = { chatId: "chat", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: "missing-original" }
+  try {
+    const first = await manager.startSession({ ...args, isCurrentTurn: () => ownsFirst, signal: abortFirst.signal })
+    expect(first?.startupOutcome.kind).toBe("fresh")
+    ownsFirst = false // old caller cancelled before publishing native token / preparing restoration
+    abortFirst.abort()
+    const second = await manager.startSession({ ...args, isCurrentTurn: () => true })
+    expect(second?.startupOutcome.kind).toBe("fresh")
+    expect(second?.sessionToken).toBe("fresh-1")
+    expect(processes[0]?.killed).toBe(true)
+  } finally { manager.stopSession("chat") }
+
 })

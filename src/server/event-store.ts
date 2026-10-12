@@ -12,6 +12,7 @@ import { STORE_VERSION } from "../shared/types"
 import {
   type ChatEvent,
   type ChatRecord,
+  type ContextRestoration,
   type ProjectEvent,
   type QueuedMessageEvent,
   type SnapshotFile,
@@ -264,6 +265,9 @@ function getReplayEventPriority(event: StoreEvent) {
       return 6
     case "pending_fork_session_token_set":
       return 6
+    case "context_restoration_set":
+    case "context_restoration_acknowledged":
+      return 7
     case "turn_cancelled":
     case "turn_resume_pending_set":
       return 7
@@ -942,6 +946,16 @@ export class EventStore {
         }
         break
       }
+      case "context_restoration_set": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (chat) chat.contextRestoration = event.restoration
+        break
+      }
+      case "context_restoration_acknowledged": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (chat?.contextRestoration?.id === event.restorationId) chat.contextRestoration = null
+        break
+      }
       case "session_token_set": {
         const chat = this.state.chatsById.get(event.chatId)
         if (!chat) break
@@ -1426,6 +1440,13 @@ export class EventStore {
     await this.setPlanMode(chatId, sourceChat.planMode)
     await this.setAutoPlan(chatId, sourceChat.autoPlan)
     await this.setPendingForkSessionToken(chatId, sourceSessionToken)
+    if (sourceChat.contextRestoration) {
+      await this.setContextRestoration(chatId, {
+        ...sourceChat.contextRestoration, id: crypto.randomUUID(), endExclusive: branchPoint,
+        ...(options?.atLastCompletedTurn && sourceChat.contextRestoration.startInclusive !== undefined
+          && sourceChat.contextRestoration.startInclusive >= branchPoint ? { startInclusive: 0 } : {}),
+      })
+    }
 
     // The fork gets its own copy of any images, and its entries point at
     // that copy, so deleting the source later does not blank its screenshots.
@@ -2109,6 +2130,43 @@ export class EventStore {
       pending,
     }
     await this.append(this.turnsLogPath, event)
+  }
+
+  async setContextRestoration(chatId: string, restoration: ContextRestoration | null) {
+    this.requireChat(chatId)
+    const event: TurnEvent = {
+      v: STORE_VERSION, type: "context_restoration_set", timestamp: Date.now(), chatId, restoration,
+    }
+    await this.append(this.turnsLogPath, event)
+  }
+
+  async acknowledgeContextRestoration(chatId: string, restorationId: string) {
+    const event: TurnEvent = {
+      v: STORE_VERSION, type: "context_restoration_acknowledged", timestamp: Date.now(), chatId, restorationId,
+    }
+    await this.append(this.turnsLogPath, event)
+  }
+
+  /** Exact queue/steer identity without loading any transcript payloads. */
+  hasUserPrompt(chatId: string, messageId: string) {
+    return this.getTranscriptEntries(chatId).some(entry => entry._id === messageId && entry.kind === "user_prompt")
+  }
+
+  /** Header-only probe. Explicit clear starts a new recoverable context epoch. */
+  getContextBounds(chatId: string, endExclusive?: number) {
+    const entries = this.getTranscriptEntries(chatId).slice(0, endExclusive)
+    let start = 0
+    let hasConversation = false
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index]!
+      if (entry.kind === "context_cleared") {
+        start = index + 1
+        hasConversation = false
+      } else if (entry.kind === "user_prompt" || entry.kind === "assistant_text" || entry.kind === "tool_call" || entry.kind === "tool_result") {
+        hasConversation = true
+      }
+    }
+    return { start, endExclusive: entries.length, hasConversation }
   }
 
   async setSessionToken(chatId: string, sessionToken: string | null) {

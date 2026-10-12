@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import type {
@@ -23,7 +23,7 @@ import type { Model } from "@mariozechner/pi-ai"
 import type { ContextWindowUsageSnapshot, HarnessSkill, LlmProviderKind, PiReasoningEffort } from "../shared/types"
 import { getDataRootDir } from "../shared/branding"
 import { normalizeToolCall } from "../shared/tools"
-import type { HarnessEvent, HarnessTurn } from "./harness-types"
+import type { HarnessEvent, HarnessStartupOutcome, HarnessTurn, PrepareHarnessContent } from "./harness-types"
 import { AsyncQueue } from "./async-queue"
 import { KANNA_TOOL_NAMES, type KannaToolHost } from "./kanna-tools"
 import { createPiKannaTools } from "./kanna-tool-adapters"
@@ -262,6 +262,8 @@ export interface StartPiTurnArgs {
   chatId: string
   cwd: string
   content: string
+  prepareContent?: PrepareHarnessContent
+  isCurrentTurn?: () => boolean
   /** Model id on the registry endpoint, e.g. "moonshotai/kimi-k2.6" or any arbitrary id. */
   model: string
   effort: PiReasoningEffort
@@ -273,6 +275,7 @@ export interface StartPiTurnArgs {
 }
 
 interface PiChatSession {
+  startupOutcome: HarnessStartupOutcome
   session: AgentSession
   authStorage: AuthStorage
   modelRegistry: ModelRegistry
@@ -341,6 +344,69 @@ function failedPiTurn(message: string): HarnessTurn {
   }
 }
 
+/** Inspect what the SDK actually loaded, without submitting a model input. */
+export function preparePiNativeSession(
+  SessionManager: typeof import("@mariozechner/pi-coding-agent").SessionManager,
+  args: { cwd: string; sessionsDir: string; sessionToken: string | null; forkSession: boolean },
+) {
+  let sourceHeaderId: string | null = null
+  let sourceEntries: Array<Record<string, any>> = []
+  if (args.sessionToken && existsSync(args.sessionToken)) {
+    // Pi skips bad JSON lines and can rewrite an invalid file as an empty
+    // session. Refuse corruption before allowing that destructive fallback.
+    try {
+      sourceEntries = readFileSync(args.sessionToken, "utf8").split("\n").filter(line => line.trim()).map(line => JSON.parse(line))
+      const header = sourceEntries[0]
+      if (!header || header.type !== "session" || typeof header.id !== "string" || !header.id) throw new Error("missing first native session header")
+      if ((header.version ?? 1) < 2 && args.forkSession) throw new Error("legacy fork has no verifiable native branch")
+      if (header.version >= 2) {
+        const seen = new Set<string>()
+        for (const entry of sourceEntries.slice(1)) {
+          if (typeof entry.id !== "string" || !entry.id || seen.has(entry.id)
+            || (entry.parentId !== null && (typeof entry.parentId !== "string" || !seen.has(entry.parentId)))) {
+            throw new Error("invalid native session branch")
+          }
+          seen.add(entry.id)
+        }
+      }
+      sourceHeaderId = header.id
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`Cannot verify Pi session: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  const sessionManager = sourceHeaderId && args.sessionToken
+    ? args.forkSession
+      ? SessionManager.forkFrom(args.sessionToken, args.cwd, args.sessionsDir)
+      : SessionManager.open(args.sessionToken, args.sessionsDir, args.cwd)
+    : SessionManager.create(args.cwd, args.sessionsDir)
+  const header = sessionManager.getHeader()
+  if (sourceHeaderId && (header?.id === sourceHeaderId || header?.parentSession === args.sessionToken)) {
+    const loadedEntries = sessionManager.getEntries()
+    if (loadedEntries.length !== sourceEntries.length - 1) throw new Error("Cannot verify Pi session: native history changed while opening")
+    if ((sourceEntries[0]?.version ?? 1) < 2) {
+      // Legacy open migrates ids/parents, but its message bodies and complete
+      // linear branch must still equal the source read before opening.
+      const expectedMessages = sourceEntries.slice(1).filter(entry => entry.type === "message").map(entry => entry.message?.role === "hookMessage" ? { ...entry.message, role: "custom" } : entry.message)
+      const loadedMessages = loadedEntries.filter(entry => entry.type === "message").map(entry => entry.message)
+      if (sessionManager.getBranch().length !== loadedEntries.length || JSON.stringify(expectedMessages) !== JSON.stringify(loadedMessages)) {
+        throw new Error("Cannot verify Pi session: loaded legacy history differs")
+      }
+    } else {
+      const expected = sourceEntries.slice(1).map(entry => entry.type === "message" && entry.message?.role === "hookMessage"
+        ? { ...entry, message: { ...entry.message, role: "custom" } } : entry)
+      if (JSON.stringify(loadedEntries) !== JSON.stringify(expected)) throw new Error("Cannot verify Pi session: loaded native history differs")
+    }
+  }
+  const startupOutcome: HarnessStartupOutcome = !sourceHeaderId
+    ? { kind: "fresh" }
+    : args.forkSession && header?.parentSession === args.sessionToken
+      ? { kind: "forked" }
+      : !args.forkSession && header?.id === sourceHeaderId
+        ? { kind: "resumed" }
+        : { kind: "fresh" }
+  return { sessionManager, startupOutcome }
+}
+
 export class PiAgentManager {
   private readonly sessions = new Map<string, PiChatSession>()
   private readonly agentDir: string
@@ -405,6 +471,8 @@ export class PiAgentManager {
   }
 
   private async openSession(args: StartPiTurnArgs & { connection: PiConnection }): Promise<PiChatSession> {
+    const assertCurrent = () => { if (args.isCurrentTurn && !args.isCurrentTurn()) throw new Error("Pi startup was cancelled or replaced") }
+    assertCurrent()
     const existing = this.sessions.get(args.chatId)
     const connectionUnchanged = existing
       && existing.connectionProvider === args.connection.provider
@@ -414,11 +482,14 @@ export class PiAgentManager {
       if (existing.model !== args.model) {
         await existing.session.setModel(this.resolveModel(existing.modelRegistry, args.connection, args.model))
         existing.model = args.model
+        assertCurrent()
+        if (this.sessions.get(args.chatId) !== existing) throw new Error("Pi session was replaced")
       }
       if (existing.effort !== args.effort) {
         existing.session.setThinkingLevel(args.effort)
         existing.effort = args.effort
       }
+      existing.startupOutcome = { kind: "reused" }
       return existing
     }
 
@@ -430,6 +501,7 @@ export class PiAgentManager {
     // All state is Kanna-owned: in-memory credentials/settings, sessions under
     // Kanna's data root, and no discovery of the user's ~/.pi setup.
     const { AuthStorage, ModelRegistry, SettingsManager, DefaultResourceLoader, SessionManager, createAgentSession } = await loadPiSdk()
+    assertCurrent()
     const authStorage = AuthStorage.inMemory()
     authStorage.setRuntimeApiKey(args.connection.provider, args.connection.apiKey)
     const modelRegistry = ModelRegistry.inMemory(authStorage)
@@ -450,13 +522,13 @@ export class PiAgentManager {
       appendSystemPrompt: [buildKannaSystemInstructions(buildKannaAgentId("pi", args.model))],
     })
     await resourceLoader.reload()
+    assertCurrent()
 
-    const sessionManager = args.forkSession && args.sessionToken && existsSync(args.sessionToken)
-      ? SessionManager.forkFrom(args.sessionToken, args.cwd, this.sessionsDir)
-      : args.sessionToken && existsSync(args.sessionToken)
-        ? SessionManager.open(args.sessionToken, this.sessionsDir, args.cwd)
-        : SessionManager.create(args.cwd, this.sessionsDir)
+    const { sessionManager, startupOutcome } = preparePiNativeSession(SessionManager, {
+      cwd: args.cwd, sessionsDir: this.sessionsDir, sessionToken: args.sessionToken, forkSession: args.forkSession,
+    })
 
+    const expectedMessages = sessionManager.buildSessionContext().messages
     const { session } = await createAgentSession({
       cwd: args.cwd,
       agentDir: this.agentDir,
@@ -471,7 +543,16 @@ export class PiAgentManager {
       customTools: args.customTools ? createPiKannaTools(args.customTools) : undefined,
     })
 
+    if (args.isCurrentTurn && !args.isCurrentTurn()) {
+      session.dispose()
+      throw new Error("Pi startup was cancelled or replaced")
+    }
+    if (JSON.stringify(session.messages) !== JSON.stringify(expectedMessages)) {
+      session.dispose()
+      throw new Error("Cannot verify Pi session: agent did not load the prepared context")
+    }
     const chatSession: PiChatSession = {
+      startupOutcome,
       session,
       authStorage,
       modelRegistry,
@@ -492,6 +573,7 @@ export class PiAgentManager {
       return failedPiTurn(MISSING_PI_CONNECTION_MESSAGE)
     }
 
+    const previousSession = this.sessions.get(args.chatId)
     let chatSession: PiChatSession
     try {
       chatSession = await this.openSession({ ...args, connection: args.connection })
@@ -499,11 +581,21 @@ export class PiAgentManager {
       return failedPiTurn(error instanceof Error ? error.message : String(error))
     }
     const session = chatSession.session
-    // A previous turn on this reused session may still be streaming (its turn
-    // was closed without an interrupt); pi throws on concurrent prompt() calls,
-    // so stop the old run before starting the new one.
-    if (session.isStreaming) {
-      await session.abort()
+    let content: string
+    try {
+      if (args.isCurrentTurn && !args.isCurrentTurn()) throw new Error("Pi startup was cancelled or replaced")
+      content = args.prepareContent ? await args.prepareContent(chatSession.startupOutcome) : args.content
+      if (args.isCurrentTurn && !args.isCurrentTurn()) throw new Error("Pi startup was cancelled or replaced")
+      // Retire a previous streaming run before submitting this owned prompt.
+      if (session.isStreaming) await session.abort()
+      if (args.isCurrentTurn && !args.isCurrentTurn()) throw new Error("Pi startup was cancelled or replaced")
+    } catch (error) {
+      // A failed preparation owns only a newly opened unsent session.
+      if (chatSession !== previousSession) {
+        if (this.sessions.get(args.chatId) === chatSession) this.sessions.delete(args.chatId)
+        session.dispose()
+      }
+      throw error
     }
     const queue = new AsyncQueue<HarnessEvent>()
     const startedAt = Date.now()
@@ -631,8 +723,8 @@ export class PiAgentManager {
     // Re-state it on the turn text from the drift onward.
     const piAgentId = buildKannaAgentId("pi", args.model)
     const piContent = chatSession.promptAgentId === piAgentId
-      ? args.content
-      : appendSystemMessageBlock(args.content, buildKannaAgentCorrection(piAgentId))
+      ? content
+      : appendSystemMessageBlock(content, buildKannaAgentCorrection(piAgentId))
 
     void session.prompt(piContent)
       .then(() => {
@@ -651,6 +743,7 @@ export class PiAgentManager {
 
     return {
       provider: "pi",
+      startupOutcome: chatSession.startupOutcome,
       stream: queue,
       interrupt: async () => {
         await session.abort()
