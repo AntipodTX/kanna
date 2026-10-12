@@ -1841,11 +1841,9 @@ export class AgentCoordinator {
   private async dequeueAndStartQueuedMessage(chatId: string, queuedMessage: QueuedChatMessage, options?: { steered?: boolean }) {
     const chat = this.store.requireChat(chatId)
     const provider = this.resolveProvider(queuedMessage, chat.provider)
-    if (provider === "codex")
+    const alreadyPersisted = this.store.hasUserPrompt(chatId, queuedMessage.id)
+    if (provider === "codex" && !alreadyPersisted)
       await this.assertCodexHistoryReady(chatId)
-    const alreadyPersisted = this.store.getMessages(chatId).some((entry) => (
-      entry.kind === "user_prompt" && entry._id === queuedMessage.id
-    ))
     await this.store.removeQueuedMessage(chatId, queuedMessage.id)
     if (alreadyPersisted) {
       this.emitStateChange(chatId)
@@ -3254,10 +3252,10 @@ export class AgentCoordinator {
         attachments = plan.attachments
         sessionToken = await this.prepareCodexHistoryPlan(command.chatId, command.messageId, plan, project.localPath, settings)
         this.assertHistoryOperation(command.chatId)
-        pendingForkSessionToken = null
-        stopCodexSessionOnStartFailure = true
+        pendingForkSessionToken=null
+        stopCodexSessionOnStartFailure=true
         const prepared = sessionToken
-        onProviderReady = async (isCurrentTurn, outcome) => {
+        onProviderReady=async(isCurrentTurn,outcome)=> {
           if (!isCurrentTurn() || outcome.kind === "fresh") return
           this.assertHistoryOperation(command.chatId)
           if (!isCurrentTurn()) return
@@ -3265,10 +3263,9 @@ export class AgentCoordinator {
           this.assertHistoryOperation(command.chatId)
           if (!isCurrentTurn()) return
           const retained: Record<string, CodexPromptBinding> = {}
-          for (const entry of prefix) if (bindings[entry._id]) {
+          for(const entry of prefix) if(bindings[entry._id]) {
             const binding = bindings[entry._id]!
-            retained[entry._id] = { ...binding,
-              sessionToken: binding.sessionToken === plan.sessionToken ? prepared! : binding.sessionToken }
+            retained[entry._id]={...binding,sessionToken:binding.sessionToken===plan.sessionToken?prepared!:binding.sessionToken}
           }
           await this.codexPromptHistory.remember(command.chatId, retained)
           await this.retainCodexClassification(command.chatId, chat.codexHistoryIntegrity,
@@ -3404,6 +3401,23 @@ export class AgentCoordinator {
     return { queuedMessageId: queuedMessage.id }
   }
 
+  private async failCodexHistoryTurn(chatId: string, active: ActiveTurn, error: unknown) {
+    if (active.cancelRequested) return
+    if (this.activeTurns.has(chatId) && this.activeTurns.get(chatId) !== active) return
+    active.cancelRequested = true
+    active.cancelRecorded = true
+    active.customTools?.abort()
+    void active.turn?.interrupt().catch(() => {})
+    active.turn?.close()
+    this.codexManager.stopSession(chatId)
+    if (this.activeTurns.get(chatId) === active) this.activeTurns.delete(chatId)
+    if (this.drainingStreams.get(chatId)?.turn === active.turn) this.drainingStreams.delete(chatId)
+    const message = `Codex history could not be saved or recovered: ${error instanceof Error ? error.message : String(error)}`
+    await this.store.appendMessage(chatId, timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: message }))
+    await this.store.recordTurnFailed(chatId, message)
+    this.emitStateChange(chatId)
+  }
+
   async steer(command: Extract<ClientCommand, { type: "message.steer" }>): Promise<void> {
     const preceding = this.codexSteerCompletions.get(command.chatId)
     if (preceding) {
@@ -3415,7 +3429,6 @@ export class AgentCoordinator {
     if (!queuedMessage) {
       throw new Error("Queued message not found")
     }
-
     // Before native startup registers an active turn there is no turn to
     // interrupt. Keep the queued message for the owning turn's normal drain.
     if (this.startingClaudeTurns.has(command.chatId) && !this.activeTurns.has(command.chatId)) return
@@ -3434,13 +3447,16 @@ export class AgentCoordinator {
       const provider = this.resolveProvider(queuedMessage, chat.provider)
       if (provider === "codex") {
         const endSteer = this.beginCodexSteer(command.chatId, queuedMessage.id)
+        let historyFailed = false
         let settlementStarted = false
         let lifecycleFinished = false
         const finishSteerLifecycle = async () => {
           if (lifecycleFinished) return
           lifecycleFinished = true
           const cancellationInProgress = this.cancelingChats.has(command.chatId) || active.cancelRequested
-          endSteer(cancellationInProgress ? "Codex turn was cancelled" : undefined)
+          endSteer(historyFailed ? "Codex history needs recovery before the next message can run"
+            : cancellationInProgress ? "Codex turn was cancelled" : undefined)
+          if (historyFailed) return
           if (cancellationInProgress) {
             if (!this.hasPendingCodexSteer(command.chatId)) {
               this.cancelingChats.delete(command.chatId)
@@ -3451,6 +3467,13 @@ export class AgentCoordinator {
         }
 
         try {
+          try {
+            await this.assertCodexHistoryReady(command.chatId, active)
+          } catch (error) {
+            historyFailed = true
+            await this.failCodexHistoryTurn(command.chatId, active, error)
+            throw error
+          }
           const content = buildSteeredMessageContent(queuedMessage.content)
           const selectedSkills = await this.resolvePromptSkills("codex", command.chatId, queuedMessage.content)
           if (
@@ -3470,6 +3493,15 @@ export class AgentCoordinator {
             // exits after transcript persistence but before queue removal.
             _id: queuedMessage.id,
           } as Extract<TranscriptEntry, { kind: "user_prompt" }>
+          try {
+            await this.store.appendMessage(command.chatId, transcriptEntry)
+            this.emitStateChange(command.chatId)
+          } catch (error) {
+            historyFailed = true
+            await this.failCodexHistoryTurn(command.chatId, active, error)
+            throw error
+          }
+          if (this.activeTurns.get(command.chatId) !== active || active.cancelRequested) return
           let steer: ReturnType<CodexAppServerManager["startSteerTurn"]>
           try {
             steer = this.codexManager.startSteerTurn({
@@ -3483,33 +3515,40 @@ export class AgentCoordinator {
               transcriptEntry,
             })
           } catch (error) {
-            // If the original turn ended while the native request was in flight,
-            // leave the durable queue intact and promote it once the gate closes.
-            if (this.activeTurns.get(command.chatId) === active) {
-              throw error
-            }
-            return
+            historyFailed = true
+            await this.failCodexHistoryTurn(command.chatId, active, error)
+            throw error
           }
           settlementStarted = true
           void (async () => {
+            let accepted = false
+            let transcriptPersisted = false
             try {
-              try {
-                await steer.settled
-              } catch (error) {
-                // If the original turn ended while the native request was in
-                // flight, leave the durable queue intact for promotion.
-                if (this.activeTurns.get(command.chatId) === active) {
-                  const message = error instanceof Error ? error.message : String(error)
-                  this.reportBackgroundError?.(
-                    `[codex-steer] chat ${command.chatId} failed to settle message ${queuedMessage.id}: ${message}`
-                  )
-                }
-                return
-              }
+              await steer.accepted
+              accepted = true
+              await steer.settled
+              transcriptPersisted = true
+              if (!chat.sessionToken) throw new Error("Accepted Codex input has no session token")
+              await this.codexPromptHistory.recordPrompt(command.chatId, queuedMessage.id, {
+                sessionToken: chat.sessionToken, turnId: expectedTurnId, mergeTurn: true,
+              })
               if (this.store.getQueuedMessage(command.chatId, queuedMessage.id)) {
                 await this.store.removeQueuedMessage(command.chatId, queuedMessage.id)
                 this.emitStateChange(command.chatId)
               }
+            } catch (error) {
+              historyFailed = true
+              await this.failCodexHistoryTurn(command.chatId, active, error)
+              if (accepted) {
+                // A failed transcript write leaves the only durable copy in the
+                // queue. A persisted prompt is recovered by its stable queue ID.
+                if (transcriptPersisted && this.store.getQueuedMessage(command.chatId, queuedMessage.id))
+                  await this.store.removeQueuedMessage(command.chatId, queuedMessage.id)
+              }
+              const message = error instanceof Error ? error.message : String(error)
+              this.reportBackgroundError?.(
+                `[codex-steer] chat ${command.chatId} failed to settle message ${queuedMessage.id}: ${message}`
+              )
             } finally {
               await finishSteerLifecycle()
             }
@@ -4239,6 +4278,12 @@ export class AgentCoordinator {
         }
 
         if (!event.entry || customToolEvents.skip(event.entry)) continue
+        if (active.provider === "codex" && event.entry.kind === "user_prompt" && event.onPersisted
+          && this.store.hasUserPrompt(active.chatId, event.entry._id)) {
+          // The correlated steer echo confirms the prompt saved before input.
+          try { event.onPersisted() } catch { /* Observer failures do not change the saved prompt. */ }
+          continue
+        }
         try {
           await this.store.appendMessage(active.chatId, event.entry)
         } catch (error) {
@@ -4255,6 +4300,7 @@ export class AgentCoordinator {
         } catch {
           // The transcript is already durable; observer failures are isolated.
         }
+        if (active.cancelRequested) break
         this.trackSubagentFromEntry(active.chatId, event.entry)
 
         if (event.entry.kind === "system_init") {
@@ -4367,9 +4413,6 @@ export class AgentCoordinator {
   }
 
   async cancel(chatId: string, options?: { hideInterrupted?: boolean }) {
-    this.cancelingChats.add(chatId)
-    try {
-    this.startingClaudeTurns.delete(chatId)
     const historyOperation = this.historyOperations.get(chatId)
     const checking = this.codexHistoryChecks.get(chatId)
     if (checking) this.cancelledCodexHistoryChecks.add(checking)
@@ -4380,6 +4423,9 @@ export class AgentCoordinator {
         this.codexManager.stopSession(chatId)
       }
     }
+    this.cancelingChats.add(chatId)
+    this.startingClaudeTurns.delete(chatId)
+    try {
       // Also clean up any draining stream for this chat.
       const draining = this.drainingStreams.get(chatId)
       if (draining) {
@@ -4389,17 +4435,18 @@ export class AgentCoordinator {
 
       const active = this.activeTurns.get(chatId)
       if (!active) return
-    logClaudeSteer("cancel_requested", {
-        chatId,
-        provider: active.provider,
-        activePromptSeq: active.claudePromptSeq ?? null,
-      })
+
 
       logClaudeSteer("cancel_requested", {
         chatId,
         provider: active.provider,
         activePromptSeq: active.claudePromptSeq ?? null,
       })
+
+      // Guard against concurrent cancel() calls — only the first one does work.
+      if (active.cancelRequested) return
+      active.cancelRequested = true
+      active.startupAbort?.abort()
 
     // Keep in-flight stream entries (emitted before the interrupt lands)
     // from re-registering an active turn via resumeBackgroundTurn, and mark
