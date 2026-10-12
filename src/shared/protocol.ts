@@ -154,6 +154,15 @@ export type ClientCommand =
   | { type: "browser.unexposeLocalHttpServer"; port: number }
   | { type: "project.readQuickActions"; projectId: string }
   | { type: "project.writeQuickActions"; projectId: string; quickActions: ProjectQuickAction[] }
+  | {
+      type: "project.search"
+      projectId: string
+      query: string
+      includeArchived?: boolean
+      includeToolEntries?: boolean
+      cursor?: string
+      limit?: number
+    }
   | { type: "update.check"; force?: boolean }
   | { type: "update.install" }
   | { type: "update.installNightly" }

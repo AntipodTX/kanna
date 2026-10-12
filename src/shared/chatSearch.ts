@@ -18,10 +18,25 @@ export interface ChatSearchEntryResult {
   preview: string
 }
 
+export interface ProjectChatSearchEntryResult extends ChatSearchEntryResult {
+  chatTitle: string
+  isArchived: boolean
+}
+
+export interface ProjectChatSearchCommandResult {
+  query: string
+  projectId: string
+  matches: ProjectChatSearchEntryResult[]
+  nextCursor?: string
+  hasMore: boolean
+}
+
 interface ChatSearchOptions {
   chatId: string
   localPath?: string | null
   includeToolEntries?: boolean
+  skipMatches?: number
+  limit?: number
 }
 
 /** Payloads omitted from a snapshot and needed only for tool-inclusive search. */
@@ -50,6 +65,11 @@ export function searchTranscriptEntries(
   if (!normalizedQuery) return []
 
   const results: ChatSearchEntryResult[] = []
+  const skipMatches = Math.max(0, Math.floor(options.skipMatches ?? 0))
+  const limit = options.limit !== undefined && options.limit > 0
+    ? Math.floor(options.limit)
+    : Number.POSITIVE_INFINITY
+  let skippedMatches = 0
   const toolCallsByToolId = new Map<string, Extract<TranscriptEntry, { kind: "tool_call" }>>()
   const searchableToolResultsByToolId = new Set<string>()
   const visibility = buildTranscriptEntrySearchVisibility(entries)
@@ -73,6 +93,10 @@ export function searchTranscriptEntries(
 
     const matchCount = countMatches(searchableText, normalizedQuery)
     if (matchCount === 0) continue
+    if (skippedMatches < skipMatches) {
+      skippedMatches += 1
+      continue
+    }
 
     const navigationTarget = getTranscriptEntrySearchTarget(entry, toolCallsByToolId)
     results.push({
@@ -86,6 +110,7 @@ export function searchTranscriptEntries(
       matchCount,
       preview: buildMatchPreview(searchableText, normalizedQuery),
     })
+    if (results.length >= limit) break
   }
 
   return results
