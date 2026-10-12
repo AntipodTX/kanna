@@ -5,6 +5,7 @@ import { homedir } from "node:os"
 import path from "node:path"
 import { getDataDir, LOG_PREFIX } from "../shared/branding"
 import { toMessagePreview } from "../shared/message-preview"
+import { getUserMessageDisplayText } from "../shared/user-message-content"
 import { buildTranscriptOutline, findTranscriptWindowStart } from "../shared/transcript-window"
 import type { TranscriptOutlineEntry } from "../shared/types"
 import type { AgentProvider, QueuedChatMessage, ResolvedChatReadAnchor, TranscriptEntry } from "../shared/types"
@@ -138,6 +139,10 @@ function buildChatMessagePreview(text: string) {
     : preview
 }
 
+function buildChatUserMessagePreview(content: string) {
+  return buildChatMessagePreview(getUserMessageDisplayText(content))
+}
+
 /**
  * Entries the agent itself produced, as opposed to the user's prompts or the
  * bookkeeping entries a session emits around them (system_init, account_info,
@@ -191,7 +196,7 @@ function summarizeForkedTranscript(entries: TranscriptEntry[]) {
   } = {}
   for (const entry of entries) {
     if (entry.kind === "user_prompt" && !entry.hidden) {
-      const preview = buildChatMessagePreview(entry.content)
+      const preview = buildChatUserMessagePreview(entry.content)
       if (preview) summary.lastUserMessagePreview = preview
     } else if (entry.kind === "assistant_text" && !entry.hidden) {
       const preview = buildChatMessagePreview(entry.text)
@@ -997,7 +1002,7 @@ export class EventStore {
       // inherited timestamp would lose to the older prompt inside the copy.
       chat.lastMessageAt = Math.max(chat.lastMessageAt ?? 0, entry.createdAt)
       if (!entry.hidden) {
-        const preview = buildChatMessagePreview(entry.content)
+        const preview = buildChatUserMessagePreview(entry.content)
         if (preview) chat.lastUserMessagePreview = preview
       }
     } else if (entry.kind === "assistant_text" && !entry.hidden && !entry.parentToolUseId) {
