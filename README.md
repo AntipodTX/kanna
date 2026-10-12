@@ -7,6 +7,7 @@
 
 ### Fixes
 
+- Stop automatically injecting Kanna chat-link rules, Git attribution instructions, and agent-ID corrections into user messages or session prompts.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
