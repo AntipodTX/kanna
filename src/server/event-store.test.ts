@@ -2643,4 +2643,50 @@ describe("stored Claude plan recovery", () => {
       read.mockRestore()
     }
   })
+
+
+  test("replaceTranscript invalidates warmed stored plan recovery with reused operation and exit IDs", async () => {
+    const { dataDir, store, chat } = await setup()
+    const operations = (before: string, after: string) => [
+      call("write", "write_file", { filePath: planPath, content: `## Plan\n\n- ${before}` }), result("write"),
+      call("edit", "edit_file", { filePath: planPath, oldString: before, newString: after }), result("edit"),
+      call("exit", "exit_plan_mode", { plan: "" }),
+    ]
+    for (const entry of operations("Old step", "Old adjusted step")) await store.appendMessage(chat.id, entry)
+    const warmSnapshot = store.getClientTranscript(chat.id)
+    expect(plan(warmSnapshot.messages, "exit")).toBe("## Plan\n\n- Old adjusted step")
+
+    const replacement = operations("Current step", "Current adjusted step")
+    const sourceBefore = JSON.stringify(replacement)
+    await store.replaceTranscript(chat.id, replacement)
+    const diskBefore = await readFile(store.getTranscriptPath(chat.id), "utf8")
+    const sidecarBefore = await readFile(join(dataDir, "transcripts", `${chat.id}.payloads.jsonl`), "utf8")
+    const current = store.getClientTranscript(chat.id)
+    expect(plan(current.messages, "exit")).toBe("## Plan\n\n- Current adjusted step")
+    expect(plan(store.getClientTranscript(chat.id, 4).messages, "exit")).toBe("## Plan\n\n- Current adjusted step")
+    for (const entry of current.messages) {
+      if (entry.kind !== "tool_call" || entry.tool.toolKind === "exit_plan_mode") continue
+      expect(entry.tool.input).toEqual({ filePath: planPath })
+      expect(entry.tool.rawInput).toBeUndefined()
+      expect(entry.trimmed).toBe(true)
+    }
+    expect(plan(store.getEntriesById(chat.id, ["exit"]), "exit")).toBe("")
+    expect(JSON.stringify(replacement)).toBe(sourceBefore)
+    expect(await readFile(store.getTranscriptPath(chat.id), "utf8")).toBe(diskBefore)
+    expect(await readFile(join(dataDir, "transcripts", `${chat.id}.payloads.jsonl`), "utf8")).toBe(sidecarBefore)
+    expect(diskBefore).not.toContain("Current adjusted step")
+    expect(plan(warmSnapshot.messages, "exit")).toBe("## Plan\n\n- Old adjusted step")
+
+    const restarted = new EventStore(dataDir)
+    await restarted.initialize()
+    expect(plan(restarted.getClientTranscript(chat.id).messages, "exit")).toBe("## Plan\n\n- Current adjusted step")
+    // The replacement retains the old IDs but no successful operations. Neither
+    // warmed recovery nor the append-only sidecar may resurrect their old plan.
+    await store.replaceTranscript(chat.id, [call("exit", "exit_plan_mode", { plan: "" })])
+    expect(plan(store.getClientTranscript(chat.id).messages, "exit")).toBe("")
+    await store.replaceTranscript(chat.id, [])
+    expect(store.getClientTranscript(chat.id).messages).toEqual([])
+    await store.replaceTranscript(chat.id, operations("Fresh step", "Fresh adjusted step"))
+    expect(plan(store.getClientTranscript(chat.id, 4).messages, "exit")).toBe("## Plan\n\n- Fresh adjusted step")
+  })
 })
