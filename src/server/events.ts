@@ -1,4 +1,4 @@
-import type { AgentProvider, ProjectSummary, QueuedChatMessage, TranscriptEntry } from "../shared/types"
+import type { AgentProvider, ModelOptions, ProjectSummary, QueuedChatMessage, TranscriptEntry } from "../shared/types"
 
 export interface ProjectRecord extends ProjectSummary {
   sidebarTitle?: string
@@ -37,8 +37,21 @@ export interface ContextRestoration {
   reason: "provider_switch" | "session_restore" | "explicit_reset"
   /** Prefix before the input that first requested restoration; excludes retries. */
   endExclusive: number
-  /** Durable lower bound even before an explicit-reset boundary row commits. */
+  /** Durable lower bound for an explicit reset even before its boundary row commits. */
   startInclusive?: number
+}
+
+export interface CodexHistoryIntegrity {
+  /** Matches the user-history revision, native session, and context boundary. */
+  key: string
+  gap?: { messageId: string; error: string }
+  messages?: Record<string, "missing" | "unknown">
+  invalidated?: boolean
+  segments?: Record<string, {
+    ids: string[]; gap?: { messageId: string; error: string };
+    messages?: Record<string, "missing" | "unknown">; invalidated?: boolean
+  }>
+  repair?: import("../shared/types").HistoryRepairStatus
 }
 
 export interface ChatRecord {
@@ -61,12 +74,20 @@ export interface ChatRecord {
    */
   readAnchor?: ChatReadAnchor | null
   provider: AgentProvider | null
+  model?: string | null
+  modelOptions?: ModelOptions | null
   planMode: boolean
   /** "Auto Plan": the harness keeps its EnterPlanMode tool. Claude only. */
   autoPlan: boolean
   sessionToken: string | null
   pendingForkSessionToken?: string | null
+  pendingForkResumeAt?: string | null
+  pendingForkUserPrompt?: boolean
   contextRestoration?: ContextRestoration | null
+  promptHistoryRevision?: string
+  /** Integrity timestamp; local-only inputs may still advance sidebar recency. */
+  promptHistoryLastMessageAt?: number | null
+  codexHistoryIntegrity?: CodexHistoryIntegrity
   hasMessages?: boolean
   lastMessageAt?: number
   /**
@@ -287,6 +308,14 @@ export type ChatEvent =
     }
   | {
       v: 2
+      type: "chat_model_settings_set"
+      timestamp: number
+      chatId: string
+      model: string | null
+      modelOptions: ModelOptions | null
+    }
+  | {
+      v: 2
       type: "chat_read_state_set"
       timestamp: number
       chatId: string
@@ -325,6 +354,16 @@ export type ChatEvent =
        * One line per prompt, not per entry.
        */
       at: number
+      promptHistoryRevision?: string
+      /** Hidden and subagent inputs do not change the visible prompt sequence. */
+      promptHistoryUnchanged?: true
+    }
+  | {
+      v: 2
+      type: "codex_history_integrity_set"
+      timestamp: number
+      chatId: string
+      integrity: CodexHistoryIntegrity
     }
   | {
       v: 2
@@ -335,6 +374,21 @@ export type ChatEvent =
       files?: TouchedFile[]
       /** Legacy shape: paths with no base blob. Read on replay, never written. */
       paths?: string[]
+    }
+  | {
+      v: 2
+      type: "chat_transcript_metadata_set"
+      timestamp: number
+      chatId: string
+      hasMessages: boolean
+      promptHistoryRevision?: string
+      lastMessageAt: number | null
+      lastUserMessagePreview: string | null
+      lastAgentMessagePreview: string | null
+      /** Optional for compatibility with transcript-rewrite events from older releases. */
+      lastAgentMessagePreviewAt?: number | null
+      /** Optional for compatibility with transcript-rewrite events from older releases. */
+      lastAgentMessageAt?: number | null
     }
 
 export type MessageEvent = {
@@ -364,11 +418,24 @@ export type QueuedMessageEvent =
 export type TurnEvent =
   | {
       v: 2
+      type: "turn_count_restored"
+      timestamp: number
+      chatId: string
+      /** Exact pre-edit count; null restores an absent count. */
+      turnCount: number | null
+    }
+  | {
+      v: 2
       type: "turn_started"
       timestamp: number
       chatId: string
       /** Model this turn runs with. Optional — absent on every pre-existing log line. */
       model?: string
+      /**
+       * Exact count after a transcript rewrite. Ordinary starts omit this and
+       * increment the existing count.
+       */
+      turnCount?: number
     }
   | {
       v: 2
@@ -409,6 +476,20 @@ export type TurnEvent =
       timestamp: number
       chatId: string
       pendingForkSessionToken: string | null
+    }
+  | {
+      v: 2
+      type: "pending_fork_resume_at_set"
+      timestamp: number
+      chatId: string
+      pendingForkResumeAt: string | null
+    }
+  | {
+      v: 2
+      type: "pending_fork_user_prompt_set"
+      timestamp: number
+      chatId: string
+      pendingForkUserPrompt: boolean
     }
   | {
       v: 2

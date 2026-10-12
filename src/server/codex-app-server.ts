@@ -1,3 +1,4 @@
+const CODEX_APPROVAL_POLICY = "never" as const
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { createInterface } from "node:readline"
@@ -19,6 +20,7 @@ import type { KannaToolHost } from "./kanna-tools"
 import { createKannaMcpServer } from "./kanna-mcp"
 import { asNumber, asRecord } from "../shared/json"
 import { timestamped } from "./transcript"
+import type { CodexNativeInput } from "./codex-prompt-history"
 import {
   type AccountRateLimitsUpdatedNotification,
   type CollabAgentToolCallItem,
@@ -51,7 +53,14 @@ import {
   type ModelListResponse,
   type SkillsListParams,
   type SkillsListResponse,
+  type Thread,
   type ThreadItem,
+  type ThreadRollbackParams,
+  type ThreadRollbackResponse,
+  type ThreadTurnsListParams,
+  type ThreadTurnsListResponse,
+  type ThreadRevertParams,
+  type ThreadRevertResponse,
   type ThreadResumeParams,
   type ThreadResumeResponse,
   type ThreadForkParams,
@@ -142,7 +151,16 @@ interface SessionContext {
   closed: boolean
 }
 
+interface NativePromptHistoryThread {
+  id: string
+  path?: string
+  historyMode?: string
+  turns?: Array<{id:string;status:string;completedAt?:number|null;items:Array<{type:string;clientId?:string;content?:Array<{type:string;text?:string}>}>}>
+}
+
 export interface StartCodexSessionArgs {
+  isCurrentTurn?: () => boolean
+  signal?: AbortSignal
   customTools?: KannaToolHost
   chatId: string
   cwd: string
@@ -150,14 +168,13 @@ export interface StartCodexSessionArgs {
   serviceTier?: ServiceTier
   sessionToken: string | null
   pendingForkSessionToken?: string | null
-  isCurrentTurn?: () => boolean
-  signal?: AbortSignal
 }
 
 export interface StartCodexTurnArgs {
-  chatId: string
   isCurrentTurn?: () => boolean
   signal?: AbortSignal
+  clientUserMessageId?: string
+  chatId: string
   model: string
   effort?: CodexReasoningEffort
   serviceTier?: ServiceTier
@@ -199,6 +216,20 @@ function codexSystemInitEntry(model: string): TranscriptEntry {
 function errorMessage(value: unknown): string {
   if (value instanceof Error) return value.message
   return String(value)
+}
+
+export class CodexRequestError extends Error {
+  constructor(readonly method: string, readonly code: number | undefined, message: string) {
+    super(`${method} failed: ${message}`)
+  }
+}
+
+/** Only an actual provider rejection of a selected turn proves a stale
+ * boundary. Socket/auth failures and unsupported methods do not. */
+export function isMissingCodexHistoryBoundary(error: unknown): boolean {
+  if (!(error instanceof CodexRequestError) || error.method !== "thread/fork") return false
+  if (/\b(?:auth\w*|unauthorized|forbidden|unsupported|schema)\b|unknown field|unknown parameter|unrecognized field|invalid type/i.test(error.message)) return false
+  return /\b(?:beforeTurnId|lastTurnId|turn|boundary)\b.*?(?:not found|does not exist|missing|unknown)|\b(?:missing|unknown|no such)\b.*?\b(?:turn|boundary)\b/i.test(error.message)
 }
 
 /**
@@ -805,14 +836,7 @@ export class CodexAppServerManager {
       this.sendRequest<GetAccountRateLimitsResponse>(context, "account/rateLimits/read", {}))
   }
 
-  /**
-   * The models the signed-in account can run, from `model/list`. Reuses a
-   * live session's app-server process when one exists; otherwise spawns a
-   * short-lived probe. Hidden rows (internal models the picker should not
-   * show) are left out. Returns null only when Codex is unusable (binary
-   * missing). Throws on protocol errors, including "method not found" from a
-   * codex older than model/list — callers keep the static catalog then.
-   */
+  
   async listModels(probeCwd: string): Promise<CodexModelSummary[] | null> {
     for (const context of this.sessions.values()) {
       if (context.closed) continue
@@ -876,16 +900,340 @@ export class CodexAppServerManager {
     }
   }
 
+  /** Read full native user history for an explicit history action, never for ordinary send. */
+  async readPromptHistory(args: {
+    cwd: string
+    threadId: string
+  }): Promise<{ inputs: CodexNativeInput[]; path?: string; historyMode?: "paginated" }> {
+    return this.withUtilityContext(args.cwd, (context) =>
+      this.readPromptHistoryInContext(context, args.threadId),
+    )
+  }
+
+  private async readPromptHistoryInContext(
+    context: SessionContext,
+    threadId: string,
+  ) {
+    const response = await this.sendRequest<{
+      thread: NativePromptHistoryThread
+    }>(context, "thread/read", { threadId, includeTurns: true })
+    const thread = response.thread
+    if (thread?.id !== threadId)
+      throw new Error("Codex returned a different thread history")
+    const inputs: CodexNativeInput[] = []
+    const historyTurns: Array<{ id: string; items: unknown[] }> = []
+    const orderedItems: Array<{ turnId: string; item: unknown; startedAtMs?: number }> = []
+    const completedAtUpperBounds = new Map<string, number>()
+    const addItems = (
+      turnId: string,
+      items: Array<{
+        type: string
+        clientId?: string
+        content?: Array<{ type: string; text?: string }>
+      }>,
+    ) => {
+      historyTurns.push({
+        id: turnId,
+        items: items.map((item) => {
+          const { id: _id, ...content } = item as typeof item & { id?: string }
+          return content
+        }),
+      })
+      let userIndex = 0
+      for (const item of items) {
+        if (item.type !== "userMessage") continue
+        if (!Array.isArray(item.content))
+          throw new Error("Incomplete Codex user history")
+        inputs.push({
+          turnId,
+          userIndex: userIndex++,
+          text: item.content
+            .filter((block) => block.type === "text")
+            .map((block) => block.text ?? "")
+            .join("\n"),
+          ...(item.clientId ? { promptId: item.clientId } : {}),
+        })
+      }
+    }
+    const validateTurn = (turn: { id: string; status: string; completedAt?: number | null }) => {
+      if (
+        !turn.id ||
+        !["completed", "failed", "interrupted"].includes(turn.status)
+      )
+        throw new Error(
+          "Cannot read stable Codex history while a turn is running or invalid",
+        )
+      // Turn timestamps have second precision; item timestamps have millisecond
+      // precision. Only the next whole second proves an item was created later.
+      if (typeof turn.completedAt === "number" && turn.completedAt >= 0 &&
+        Number.isSafeInteger(turn.completedAt) && Number.isSafeInteger((turn.completedAt + 1) * 1000))
+        completedAtUpperBounds.set(turn.id, (turn.completedAt + 1) * 1000)
+    }
+    if (thread.historyMode !== "paginated") {
+      if (!Array.isArray(thread.turns))
+        throw new Error("Incomplete Codex thread history")
+      const seen = new Set<string>()
+      for (const turn of thread.turns) {
+        validateTurn(turn)
+        if (seen.has(turn.id) || !Array.isArray(turn.items))
+          throw new Error("Invalid Codex turn history")
+        seen.add(turn.id)
+        addItems(turn.id, turn.items)
+      }
+    } else {
+      const turns: Array<{ id: string; status: string; completedAt?: number | null }> = []
+      const seen = new Set<string>()
+      const cursors = new Set<string>()
+      let cursor: string | undefined
+      do {
+        const page = await this.sendRequest<{
+          data: Array<{ id: string; status: string; completedAt?: number | null }>
+          nextCursor?: string | null
+        }>(context, "thread/turns/list", {
+          threadId,
+          cursor,
+          limit: 100,
+          sortDirection: "asc",
+          itemsView: "summary",
+        })
+        if (!Array.isArray(page.data))
+          throw new Error("Incomplete Codex turn page")
+        for (const turn of page.data) {
+          validateTurn(turn)
+          if (seen.has(turn.id)) throw new Error("Repeated Codex turn history")
+          seen.add(turn.id)
+          turns.push(turn)
+        }
+        cursor = page.nextCursor ?? undefined
+        if (cursor) {
+          if (cursors.has(cursor) || !page.data.length)
+            throw new Error("Repeated or empty Codex turn page")
+          cursors.add(cursor)
+        }
+      } while (cursor)
+      // Page across the thread to retain persistence order. A background result
+      // can belong to an earlier turn while being first recorded in a later one.
+      type Item = {
+        type: string
+        clientId?: string
+        content?: Array<{ type: string; text?: string }>
+      }
+      const byTurn = new Map(turns.map((turn) => [turn.id, [] as Item[]]))
+      const itemCursors = new Set<string>()
+      type ItemPage = {
+        data: Array<{ turnId: string; item: Item; startedAtMs?: number | null }>
+        nextCursor?: string | null
+      }
+      cursor = undefined
+      do {
+        const page: ItemPage = await this.sendRequest<ItemPage>(context, "thread/items/list", {
+          threadId,
+          cursor,
+          limit: 100,
+          sortDirection: "asc",
+        })
+        if (
+          !Array.isArray(page.data) ||
+          page.data.some((entry) => !byTurn.has(entry.turnId) || !entry.item)
+        )
+          throw new Error("Incomplete Codex item page")
+        for (const entry of page.data) {
+          byTurn.get(entry.turnId)!.push(entry.item)
+          const { id: _id, ...item } = entry.item as Item & { id?: string }
+          orderedItems.push({ turnId: entry.turnId, item,
+            ...(typeof entry.startedAtMs === "number" && entry.startedAtMs >= 0 && Number.isSafeInteger(entry.startedAtMs)
+              ? { startedAtMs: entry.startedAtMs } : {}),
+          })
+        }
+        cursor = page.nextCursor ?? undefined
+        if (cursor) {
+          if (itemCursors.has(cursor) || !page.data.length)
+            throw new Error("Repeated or empty Codex item page")
+          itemCursors.add(cursor)
+        }
+      } while (cursor)
+      for (const turn of turns) addItems(turn.id, byTurn.get(turn.id)!)
+    }
+    return {
+      inputs,
+      turns: historyTurns,
+      completedAtUpperBounds,
+      ...(thread.historyMode === "paginated" ? { historyMode: "paginated" as const, orderedItems } : {}),
+      ...(typeof thread.path === "string" ? { path: thread.path } : {}),
+    }
+  }
+
+  /** Prepare an isolated replacement at a saved canonical turn boundary. */
+  async forkBeforeTurn(args: {
+    cwd: string
+    threadId: string
+    beforeTurnId: string
+    model: string
+    serviceTier?: ServiceTier
+  }) {
+    return this.forkAtTurnBoundary(args)
+  }
+
+  async forkAfterTurn(args: {
+    cwd: string
+    threadId: string
+    afterTurnId: string
+    model: string
+    serviceTier?: ServiceTier
+  }) {
+    return this.forkAtTurnBoundary(args)
+  }
+
+  private async forkAtTurnBoundary(args: {
+    cwd: string
+    threadId: string
+    beforeTurnId?: string
+    afterTurnId?: string
+    model: string
+    serviceTier?: ServiceTier
+  }) {
+    return this.withUtilityContext(args.cwd, async (context) => {
+      const boundary: Pick<ThreadForkParams, "beforeTurnId" | "lastTurnId"> =
+        args.afterTurnId ? { lastTurnId: args.afterTurnId } : { beforeTurnId: args.beforeTurnId }
+      // Codex validates and applies the saved turn boundary. Loading both
+      // histories here would defeat the purpose of durable prompt bindings.
+      const response = await this.sendRequest<ThreadForkResponse>(context, "thread/fork", {
+        threadId: args.threadId, ...boundary, includeTurns: false,
+        model: args.model, cwd: args.cwd, serviceTier: args.serviceTier,
+        approvalPolicy: CODEX_APPROVAL_POLICY, sandbox: "danger-full-access",
+        persistExtendedHistory: true,
+      } satisfies ThreadForkParams)
+      const threadId = response.thread?.id
+      if (!threadId || threadId === args.threadId)
+        throw new Error("Codex did not return an isolated forked session")
+      return threadId
+    })
+  }
+
+  async rollbackThread(args: { chatId?: string; cwd: string; threadId: string; numTurns: number }): Promise<Thread> {
+    if (!Number.isSafeInteger(args.numTurns) || args.numTurns < 1) {
+      throw new Error("Codex history rollback requires a positive integer number of turns")
+    }
+    const activeContext = args.chatId ? this.sessions.get(args.chatId) : null
+    if (activeContext && !activeContext.closed && activeContext.cwd === args.cwd && activeContext.sessionToken === args.threadId) {
+      if (activeContext.pendingTurn) {
+        throw new Error("Cannot rollback Codex thread while a turn is running")
+      }
+      return await this.rollbackThreadInContext(activeContext, args.threadId, args.numTurns)
+    }
+
+    return await this.withUtilityContext(args.cwd, async (context) => {
+      await this.sendRequest<ThreadResumeResponse>(context, "thread/resume", {
+        threadId: args.threadId,
+        cwd: args.cwd,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+        persistExtendedHistory: true,
+      } satisfies ThreadResumeParams)
+      return await this.rollbackThreadInContext(context, args.threadId, args.numTurns)
+    })
+  }
+
+  private async rollbackThreadInContext(context: SessionContext, threadId: string, numTurns: number): Promise<Thread> {
+    try {
+      const beforeTurnId = await this.findRevertBoundary(context, threadId, numTurns)
+      if (context.pendingTurn) {
+        throw new Error("Cannot rollback Codex thread while a turn is running")
+      }
+      const response = await this.sendRequest<ThreadRevertResponse>(context, "thread/revert", {
+        threadId,
+        beforeTurnId,
+      } satisfies ThreadRevertParams)
+      return response.thread
+    } catch (error) {
+      // Only an explicit unsupported method permits a legacy fallback. An
+      // ordinary revert failure may have already changed the durable history.
+      const unsupported = error instanceof CodexRequestError
+        && (error.method === "thread/turns/list" || error.method === "thread/revert")
+        && (error.code === -32601 || (error.code === -32600
+          && error.message.includes(`unknown variant \`${error.method}\``)))
+      if (!unsupported) throw error
+    }
+    if (context.pendingTurn) {
+      throw new Error("Cannot rollback Codex thread while a turn is running")
+    }
+    const response = await this.sendRequest<ThreadRollbackResponse>(context, "thread/rollback", {
+      threadId,
+      numTurns,
+    } satisfies ThreadRollbackParams)
+    return response.thread
+  }
+
+  private async findRevertBoundary(context: SessionContext, threadId: string, numTurns: number) {
+    // New Codex versions use an exclusive turn-id boundary instead of a count.
+    // Kanna counts user prompts, but native history also contains standalone
+    // compaction/service turns. Summary includes the first user item without
+    // loading tool payloads; only user-bearing turns advance the prompt count.
+    // Refuse ambiguous history instead of guessing a destructive boundary.
+    const turnIds = new Set<string>()
+    const cursors = new Set<string>()
+    let userTurnCount = 0
+    let cursor: string | undefined
+    let beforeTurnId: string | undefined
+    while (!beforeTurnId) {
+      const page = await this.sendRequest<ThreadTurnsListResponse>(context, "thread/turns/list", {
+        threadId,
+        ...(cursor === undefined ? {} : { cursor }),
+        limit: Math.min(100, numTurns - userTurnCount),
+        sortDirection: "desc",
+        itemsView: "summary",
+      } satisfies ThreadTurnsListParams)
+      if (!Array.isArray(page?.data) || page.data.length === 0) {
+        throw new Error("Cannot determine Codex rollback boundary: missing turn history")
+      }
+      for (const turn of page.data) {
+        if (typeof turn?.id !== "string" || !turn.id.trim() || turnIds.has(turn.id)) {
+          throw new Error("Cannot determine Codex rollback boundary: invalid or duplicate turn ID")
+        }
+        if (turn.status === "inProgress") {
+          throw new Error("Cannot rollback Codex thread while a turn is running")
+        }
+        if (turn.status !== "completed" && turn.status !== "interrupted" && turn.status !== "failed") {
+          throw new Error("Cannot determine Codex rollback boundary: invalid turn status")
+        }
+        if ((turn.itemsView !== undefined && turn.itemsView !== "summary" && turn.itemsView !== "full")
+          || !Array.isArray(turn.items)
+          || turn.items.some((item) => typeof item?.type !== "string" || !item.type)) {
+          throw new Error("Cannot determine Codex rollback boundary: missing turn items")
+        }
+        turnIds.add(turn.id)
+        if (turn.items.some((item) => item.type === "userMessage")) userTurnCount += 1
+        if (userTurnCount === numTurns) {
+          beforeTurnId = turn.id
+          break
+        }
+      }
+      if (beforeTurnId) break
+      if (typeof page.nextCursor !== "string" || !page.nextCursor || cursors.has(page.nextCursor)) {
+        throw new Error("Cannot determine Codex rollback boundary: incomplete or repeated history page")
+      }
+      cursor = page.nextCursor
+      cursors.add(cursor)
+    }
+    return beforeTurnId
+  }
+
   async startSession(args: StartCodexSessionArgs) {
     args.signal?.throwIfAborted()
     const existing = this.sessions.get(args.chatId)
     if (existing && !existing.closed && existing.cwd === args.cwd && !args.pendingForkSessionToken
       && (!existing.sessionToken || !args.sessionToken || existing.sessionToken === args.sessionToken)) {
-      if (existing.sessionToken) return { sessionToken: existing.sessionToken, resumeFellBack: false, startupOutcome: { kind: "reused" as const } }
+      if (existing.sessionToken) {
+        return { sessionToken: existing.sessionToken, resumeFellBack: false, startupOutcome: { kind: "reused" as const } }
+      }
       const sessionStart = this.sessionStarts.get(args.chatId)
-      if (sessionStart) return await sessionStart
+      if (sessionStart) {
+        return await sessionStart
+      }
       this.stopSession(args.chatId)
-    } else if (existing) this.stopSession(args.chatId)
+    } else if (existing) {
+      this.stopSession(args.chatId)
+    }
 
     const child = this.spawnProcess(args.cwd)
     const customTools = args.customTools ? createKannaMcpServer(args.customTools) : undefined
@@ -927,8 +1275,8 @@ export class CodexAppServerManager {
       } satisfies InitializeParams)
       assertCurrent()
       this.writeMessage(context, {
-        method: "initialized",
-      })
+          method: "initialized",
+        })
 
       // Resume and fork accept MCP config, but this CLI only accepts dynamic tools on thread/start.
       const toolConfig = customTools ? {
@@ -947,7 +1295,7 @@ export class CodexAppServerManager {
         approvalPolicy: "never",
         sandbox: "danger-full-access",
         experimentalRawEvents: false,
-        persistExtendedHistory: false,
+        persistExtendedHistory: true,
         ...toolConfig,
       } satisfies ThreadStartParams
 
@@ -964,7 +1312,7 @@ export class CodexAppServerManager {
           serviceTier: args.serviceTier,
           approvalPolicy: "never",
           sandbox: "danger-full-access",
-          persistExtendedHistory: false,
+          persistExtendedHistory: true,
           ...toolConfig,
         } satisfies ThreadForkParams)
       } else if (args.sessionToken) {
@@ -976,7 +1324,7 @@ export class CodexAppServerManager {
             serviceTier: args.serviceTier,
             approvalPolicy: "never",
             sandbox: "danger-full-access",
-            persistExtendedHistory: false,
+            persistExtendedHistory: true,
             ...toolConfig,
           } satisfies ThreadResumeParams)
         } catch (error) {
@@ -995,8 +1343,8 @@ export class CodexAppServerManager {
       assertCurrent()
       context.sessionToken = response.thread.id
       return { sessionToken: context.sessionToken, resumeFellBack, startupOutcome: {
-        kind: args.pendingForkSessionToken ? "forked" as const : resumeFellBack || !args.sessionToken ? "fresh" as const : "resumed" as const,
-      } }
+          kind: args.pendingForkSessionToken ? "forked" as const : resumeFellBack || !args.sessionToken ? "fresh" as const : "resumed" as const,
+        } }
       } catch (error) {
         if (this.sessions.get(args.chatId) === context) this.stopSession(args.chatId)
         throw error
@@ -1005,18 +1353,24 @@ export class CodexAppServerManager {
     this.sessionStarts.set(args.chatId, sessionStart)
     try { return await sessionStart } finally {
       args.signal?.removeEventListener("abort", onStartupAbort)
-      if (this.sessionStarts.get(args.chatId) === sessionStart) this.sessionStarts.delete(args.chatId)
+      if (this.sessionStarts.get(args.chatId) === sessionStart) {
+        this.sessionStarts.delete(args.chatId)
+      }
     }
   }
 
   async startTurn(args: StartCodexTurnArgs): Promise<HarnessTurn> {
     const context = this.requireSession(args.chatId)
     const assertOwner = () => {
-      if (args.signal?.aborted || (args.isCurrentTurn && !args.isCurrentTurn())) throw new Error("Codex turn startup was cancelled or replaced")
+      if (args.signal?.aborted || (args.isCurrentTurn && !args.isCurrentTurn())) {
+        throw new Error("Codex turn startup was cancelled or replaced")
+      }
     }
     const assertCurrent = () => {
       assertOwner()
-      if (context.closed || this.sessions.get(args.chatId) !== context) throw new Error("Codex turn startup was cancelled or replaced")
+      if (context.closed || this.sessions.get(args.chatId) !== context) {
+        throw new Error("Codex turn startup was cancelled or replaced")
+      }
     }
     assertCurrent()
     if (context.pendingTurn) {
@@ -1049,7 +1403,9 @@ export class CodexAppServerManager {
     }
     context.pendingTurn = pendingTurn
     const onStartupAbort = () => {
-      if (this.sessions.get(args.chatId) === context && context.pendingTurn === pendingTurn) this.stopSession(args.chatId)
+      if (this.sessions.get(args.chatId) === context && context.pendingTurn === pendingTurn) {
+        this.stopSession(args.chatId)
+      }
     }
     args.signal?.addEventListener("abort", onStartupAbort, { once: true })
 
@@ -1069,6 +1425,7 @@ export class CodexAppServerManager {
       }
       const response = await this.sendRequest<TurnStartResponse>(context, "turn/start", {
         threadId: context.sessionToken ?? "",
+        clientUserMessageId: args.clientUserMessageId,
         input,
         approvalPolicy: "never",
         model: args.model,
@@ -1100,6 +1457,7 @@ export class CodexAppServerManager {
 
     return {
       provider: "codex",
+      providerTurnId: pendingTurn.turnId ?? undefined,
       stream: queue,
       interrupt: async () => {
         if (context.pendingTurn !== pendingTurn) return
@@ -1203,6 +1561,47 @@ export class CodexAppServerManager {
     }
   }
 
+  private async withUtilityContext<TResult>(cwd: string, callback: (context: SessionContext) => Promise<TResult>) {
+    const child = this.spawnProcess(cwd)
+    const context: SessionContext = {
+      chatId: `utility-${randomUUID()}`,
+      cwd,
+      child,
+      pendingRequests: new Map(),
+      pendingTurn: null,
+      sessionToken: null,
+      stderrLines: [],
+      closed: false,
+    }
+    this.attachListeners(context)
+
+    try {
+      await this.sendRequest(context, "initialize", {
+        clientInfo: {
+          name: "kanna_desktop",
+          title: "Kanna",
+          version: "0.1.0",
+        },
+        capabilities: {
+          experimentalApi: true,
+          requestAttestation: false,
+        },
+      } satisfies InitializeParams)
+      this.writeMessage(context, {
+        method: "initialized",
+      })
+      return await callback(context)
+    } finally {
+      context.closed = true
+      context.pendingTurn?.queue.finish()
+      try {
+        context.child.kill("SIGKILL")
+      } catch {
+        // ignore kill failures
+      }
+    }
+  }
+
   private requireSession(chatId: string) {
     const context = this.sessions.get(chatId)
     if (!context || context.closed) {
@@ -1262,7 +1661,7 @@ export class CodexAppServerManager {
     if (!pending) return
     context.pendingRequests.delete(response.id)
     if (response.error) {
-      pending.reject(new Error(`${pending.method} failed: ${response.error.message ?? "Unknown error"}`))
+      pending.reject(new CodexRequestError(pending.method, response.error.code, response.error.message ?? "Unknown error"))
       return
     }
     pending.resolve(response.result)

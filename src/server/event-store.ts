@@ -5,14 +5,15 @@ import { homedir } from "node:os"
 import path from "node:path"
 import { getDataDir, LOG_PREFIX } from "../shared/branding"
 import { toMessagePreview } from "../shared/message-preview"
-import { buildTranscriptOutline, findTranscriptWindowStart } from "../shared/transcript-window"
+import { buildTranscriptOutline, findTranscriptWindowStart, snapToRowStart } from "../shared/transcript-window"
 import type { TranscriptOutlineEntry } from "../shared/types"
-import type { AgentProvider, QueuedChatMessage, ResolvedChatReadAnchor, TranscriptEntry } from "../shared/types"
-import { STORE_VERSION } from "../shared/types"
+import type { AgentProvider, ModelOptions, QueuedChatMessage, ResolvedChatReadAnchor, TranscriptEntry } from "../shared/types"
+import { cloneModelOptions, STORE_VERSION } from "../shared/types"
 import {
   type ChatEvent,
   type ChatRecord,
   type ContextRestoration,
+  type CodexHistoryIntegrity,
   type ProjectEvent,
   type QueuedMessageEvent,
   type SnapshotFile,
@@ -253,33 +254,39 @@ function getReplayEventPriority(event: StoreEvent) {
     case "chat_provider_set":
     case "chat_plan_mode_set":
     case "chat_auto_plan_set":
+    case "chat_model_settings_set":
       return 2
     case "message_appended":
       return 3
+    case "chat_transcript_metadata_set":
+      return 4
     case "queued_message_enqueued":
     case "queued_message_removed":
-      return 4
-    case "turn_started":
       return 5
+    case "turn_started":
+    case "turn_count_restored":
+      // Both use the turns journal; preserve append order for equal timestamps.
+      return 6
     case "session_token_set":
-      return 6
     case "pending_fork_session_token_set":
-      return 6
+    case "pending_fork_resume_at_set":
+    case "pending_fork_user_prompt_set":
     case "context_restoration_set":
     case "context_restoration_acknowledged":
       return 7
     case "turn_cancelled":
     case "turn_resume_pending_set":
-      return 7
+      return 8
     case "turn_finished":
     case "turn_failed":
-      return 8
+      return 9
     case "chat_read_state_set":
     case "chat_done_state_set":
     case "chat_read_anchor_set":
     case "chat_files_touched":
     case "chat_last_message_at_set":
-      return 9
+    case "codex_history_integrity_set":
+      return 10
     case "chat_pin_set":
     case "chat_deleted":
     case "chat_archived":
@@ -302,6 +309,10 @@ function getForkedChatTitle(title: string) {
   const trimmed = title.trim()
   if (!trimmed) return "Fork: New Chat"
   return trimmed.startsWith("Fork: ") ? trimmed : `Fork: ${trimmed}`
+}
+
+function sameModelOptions(left: ModelOptions | null | undefined, right: ModelOptions | null | undefined) {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null)
 }
 
 export class EventStore {
@@ -341,6 +352,8 @@ export class EventStore {
    * which fires per streamed token.
    */
   onTurnEnded?: (chatId: string) => void
+  /** A provider reconciliation replaced rows rather than appending them. */
+  onTranscriptReplaced?: (chatId: string) => void
   /**
    * Fired when a turn begins, so file tracking can snapshot the worktree before
    * the agent touches it. Paired with `onTurnEnded`.
@@ -387,9 +400,10 @@ export class EventStore {
 
   /**
    * Chat metadata derived from transcript entries (lastMessageAt, hasMessages,
-   * message previews) is applied in memory on append and only persisted when a
-   * snapshot compaction runs. Rebuild it from the transcript files on boot so
-   * restarts between compactions don't regress it.
+   * message previews) is normally applied in memory on append and persisted by
+   * snapshot compaction. Transcript replacements additionally persist an exact
+   * metadata event. Rebuild from the files on boot as a fallback for appends
+   * made after the latest snapshot or replacement event.
    *
    * Only the tail of each transcript is read, which is enough for the common
    * case and bounded regardless of how large a conversation grows — but a chat
@@ -485,7 +499,11 @@ export class EventStore {
           ...rest,
           unread: chat.unread ?? false,
           readAnchor: chat.readAnchor ?? null,
+          model: chat.model ?? null,
+          modelOptions: cloneModelOptions(chat.modelOptions),
           pendingForkSessionToken: chat.pendingForkSessionToken ?? null,
+          pendingForkResumeAt: chat.pendingForkResumeAt ?? null,
+          pendingForkUserPrompt: Boolean(chat.pendingForkUserPrompt),
           // Snapshots written before base blobs carry bare paths; they keep
           // their old "any dirty match counts" reading rather than being
           // guessed a base that could expire them wrongly.
@@ -740,10 +758,14 @@ export class EventStore {
           updatedAt: event.timestamp,
           unread: false,
           provider: null,
+          model: null,
+          modelOptions: null,
           planMode: false,
           autoPlan: false,
           sessionToken: null,
           pendingForkSessionToken: null,
+          pendingForkResumeAt: null,
+          pendingForkUserPrompt: false,
           hasMessages: false,
           lastTurnOutcome: null,
           // Forks carry the source's turn-end timestamp on the create event
@@ -812,6 +834,14 @@ export class EventStore {
         chat.updatedAt = event.timestamp
         break
       }
+      case "chat_model_settings_set": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (!chat) break
+        chat.model = event.model
+        chat.modelOptions = cloneModelOptions(event.modelOptions)
+        chat.updatedAt = event.timestamp
+        break
+      }
       case "chat_read_state_set": {
         const chat = this.state.chatsById.get(event.chatId)
         if (!chat) break
@@ -836,12 +866,23 @@ export class EventStore {
       case "chat_last_message_at_set": {
         const chat = this.state.chatsById.get(event.chatId)
         if (!chat) break
+        // Retain the legacy clock until a visible input changes it. Date-only
+        // events from older Kanna versions still invalidate saved integrity.
+        chat.promptHistoryLastMessageAt = event.promptHistoryUnchanged
+          ? (chat.promptHistoryLastMessageAt === undefined ? chat.lastMessageAt ?? null : chat.promptHistoryLastMessageAt)
+          : Math.max(chat.lastMessageAt ?? 0, event.at)
         // Exactly what `applyMessageMetadata` does for the prompt this event
         // stands in for, so a restart lands on the same state the live append
         // did — including `updatedAt`, which a user message legitimately moves.
         chat.lastMessageAt = Math.max(chat.lastMessageAt ?? 0, event.at)
         chat.hasMessages = true
         chat.updatedAt = Math.max(chat.updatedAt, event.at)
+        if (event.promptHistoryRevision) chat.promptHistoryRevision = event.promptHistoryRevision
+        break
+      }
+      case "codex_history_integrity_set": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (chat) chat.codexHistoryIntegrity = structuredClone(event.integrity)
         break
       }
       case "chat_files_touched": {
@@ -861,6 +902,22 @@ export class EventStore {
           delete chat.doneAt
         }
         chat.updatedAt = event.timestamp
+        break
+      }
+      case "chat_transcript_metadata_set": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (chat) {
+          if (event.promptHistoryRevision) chat.promptHistoryRevision = event.promptHistoryRevision
+          else delete chat.codexHistoryIntegrity
+        }
+        this.applyTranscriptMetadata(event.chatId, {
+          hasMessages: event.hasMessages,
+          lastMessageAt: event.lastMessageAt,
+          lastUserMessagePreview: event.lastUserMessagePreview,
+          lastAgentMessagePreview: event.lastAgentMessagePreview,
+          lastAgentMessagePreviewAt: event.lastAgentMessagePreviewAt,
+          lastAgentMessageAt: event.lastAgentMessageAt,
+        }, event.timestamp)
         break
       }
       case "message_appended": {
@@ -902,12 +959,19 @@ export class EventStore {
         if (!chat) break
         chat.updatedAt = event.timestamp
         chat.lastTurnStartedAt = event.timestamp
-        chat.turnCount = (chat.turnCount ?? 0) + 1
+        chat.turnCount = event.turnCount ?? (chat.turnCount ?? 0) + 1
         // Kept from the previous turn when this one didn't name a model, so a
         // resumed background turn doesn't blank what the chat last ran with.
         if (event.model) chat.lastModel = event.model
         // A new turn means the user re-engaged, so the chat is no longer "done".
         delete chat.doneAt
+        break
+      }
+      case "turn_count_restored": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (!chat) break
+        if (event.turnCount === null) delete chat.turnCount
+        else chat.turnCount = event.turnCount
         break
       }
       case "turn_finished": {
@@ -967,6 +1031,20 @@ export class EventStore {
         const chat = this.state.chatsById.get(event.chatId)
         if (!chat) break
         chat.pendingForkSessionToken = event.pendingForkSessionToken
+        chat.updatedAt = event.timestamp
+        break
+      }
+      case "pending_fork_resume_at_set": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (!chat) break
+        chat.pendingForkResumeAt = event.pendingForkResumeAt
+        chat.updatedAt = event.timestamp
+        break
+      }
+      case "pending_fork_user_prompt_set": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (!chat) break
+        chat.pendingForkUserPrompt = event.pendingForkUserPrompt
         chat.updatedAt = event.timestamp
         break
       }
@@ -1119,6 +1197,54 @@ export class EventStore {
 
   getTranscriptLength(chatId: string) {
     return this.getTranscriptEntries(chatId).length
+  }
+
+  private applyTranscriptMetadata(
+    chatId: string,
+    metadata: {
+      hasMessages: boolean
+      lastMessageAt: number | null
+      lastUserMessagePreview: string | null
+      lastAgentMessagePreview: string | null
+      lastAgentMessagePreviewAt?: number | null
+      lastAgentMessageAt?: number | null
+    },
+    timestamp: number
+  ) {
+    const chat = this.state.chatsById.get(chatId)
+    if (!chat) return
+    chat.hasMessages = metadata.hasMessages
+    chat.promptHistoryLastMessageAt = metadata.lastMessageAt
+    if (metadata.lastMessageAt === null) {
+      delete chat.lastMessageAt
+    } else {
+      chat.lastMessageAt = metadata.lastMessageAt
+    }
+    if (metadata.lastUserMessagePreview === null) {
+      delete chat.lastUserMessagePreview
+    } else {
+      chat.lastUserMessagePreview = metadata.lastUserMessagePreview
+    }
+    if (metadata.lastAgentMessagePreview === null) {
+      delete chat.lastAgentMessagePreview
+    } else {
+      chat.lastAgentMessagePreview = metadata.lastAgentMessagePreview
+    }
+    if (metadata.lastAgentMessagePreviewAt !== undefined) {
+      if (metadata.lastAgentMessagePreviewAt === null) {
+        delete chat.lastAgentMessagePreviewAt
+      } else {
+        chat.lastAgentMessagePreviewAt = metadata.lastAgentMessagePreviewAt
+      }
+    }
+    if (metadata.lastAgentMessageAt !== undefined) {
+      if (metadata.lastAgentMessageAt === null) {
+        delete chat.lastAgentMessageAt
+      } else {
+        chat.lastAgentMessageAt = metadata.lastAgentMessageAt
+      }
+    }
+    chat.updatedAt = Math.max(chat.updatedAt, timestamp)
   }
 
   private append<TEvent extends StoreEvent>(filePath: string, event: TEvent) {
@@ -1352,7 +1478,7 @@ export class EventStore {
     return write
   }
 
-  async createChat(projectId: string) {
+  async createChat(projectId: string, options: { title?: string } = {}) {
     const project = this.state.projectsById.get(projectId)
     if (!project || project.deletedAt) {
       throw new Error("Project not found")
@@ -1364,7 +1490,7 @@ export class EventStore {
       timestamp: Date.now(),
       chatId,
       projectId,
-      title: "New Chat",
+      title: options.title?.trim() || "New Chat",
     }
     await this.append(this.chatsLogPath, event)
     return this.state.chatsById.get(chatId)!
@@ -1378,10 +1504,22 @@ export class EventStore {
    * conversation whose tool calls all have their results, and the source keeps
    * running undisturbed.
    */
-  async forkChat(sourceChatId: string, options?: { atLastCompletedTurn?: boolean }) {
+  async forkChat(
+    sourceChatId: string,
+    options: {
+      atLastCompletedTurn?: boolean
+      transcriptEntries?: TranscriptEntry[]
+      pendingForkSessionToken?: string | null
+      pendingForkResumeAt?: string | null
+      pendingForkUserPrompt?: boolean
+    } = {}
+  ) {
     const sourceChat = this.requireChat(sourceChatId)
     const sourceSessionToken = sourceChat.sessionToken ?? sourceChat.pendingForkSessionToken ?? null
-    if (!sourceChat.provider || !sourceSessionToken) {
+    const pendingForkSessionToken = options.pendingForkSessionToken !== undefined
+      ? options.pendingForkSessionToken
+      : sourceSessionToken
+    if (!sourceChat.provider || (!sourceSessionToken && options.pendingForkSessionToken === undefined)) {
       throw new Error("Chat cannot be forked")
     }
 
@@ -1395,15 +1533,25 @@ export class EventStore {
     if (branchPoint === 0 && allEntries.length > 0) {
       throw new Error("Chat has no completed turn to fork from yet")
     }
-    const droppedRunningTurn = branchPoint < allEntries.length
+    const selectedEntries = options.transcriptEntries ?? allEntries.slice(0, branchPoint)
+    const droppedRunningTurn = selectedEntries.length < allEntries.length
 
     // A fork of an idle chat inherits these from the source record — same
     // conversation, so the same counts and previews. A fork taken mid-turn left
     // that turn behind, so its numbers come from the copied transcript instead.
-    const inherited = droppedRunningTurn
+    const inherited = options.transcriptEntries
+      ? {
+          turnCount: Math.max(
+            0,
+            selectedEntries.filter((entry) => entry.kind === "user_prompt").length
+              - (options.pendingForkUserPrompt ? 1 : 0)
+          ),
+          ...summarizeForkedTranscript(selectedEntries),
+        }
+      : droppedRunningTurn
       ? {
           turnCount: Math.max(0, (sourceChat.turnCount ?? 0) - 1),
-          ...summarizeForkedTranscript(allEntries.slice(0, branchPoint)),
+          ...summarizeForkedTranscript(selectedEntries),
         }
       : {
           turnCount: sourceChat.turnCount,
@@ -1439,19 +1587,28 @@ export class EventStore {
     await this.setChatProvider(chatId, sourceChat.provider)
     await this.setPlanMode(chatId, sourceChat.planMode)
     await this.setAutoPlan(chatId, sourceChat.autoPlan)
-    await this.setPendingForkSessionToken(chatId, sourceSessionToken)
+    await this.setChatModelSettings(chatId, {
+      model: sourceChat.model ?? null,
+      modelOptions: cloneModelOptions(sourceChat.modelOptions),
+    })
+    await this.setPendingForkSessionToken(chatId, pendingForkSessionToken)
+    await this.setPendingForkResumeAt(chatId, options.pendingForkResumeAt ?? null)
+    await this.setPendingForkUserPrompt(chatId, Boolean(options.pendingForkUserPrompt))
     if (sourceChat.contextRestoration) {
+      const restoration = sourceChat.contextRestoration
+      // A selected/completed prefix can end before an uncommitted reset in
+      // the source. That later reset does not clear the earlier fork's context.
+      const resetOutsidePrefix = (options.transcriptEntries || droppedRunningTurn)
+        && restoration.startInclusive !== undefined && restoration.startInclusive >= selectedEntries.length
       await this.setContextRestoration(chatId, {
-        ...sourceChat.contextRestoration, id: crypto.randomUUID(), endExclusive: branchPoint,
-        ...(options?.atLastCompletedTurn && sourceChat.contextRestoration.startInclusive !== undefined
-          && sourceChat.contextRestoration.startInclusive >= branchPoint ? { startInclusive: 0 } : {}),
+        ...restoration, id: crypto.randomUUID(), endExclusive: selectedEntries.length,
+        ...(resetOutsidePrefix ? { startInclusive: 0 } : {}),
       })
     }
 
     // The fork gets its own copy of any images, and its entries point at
     // that copy, so deleting the source later does not blank its screenshots.
-    const sourceEntries = allEntries
-      .slice(0, branchPoint)
+    const sourceEntries = selectedEntries
       .map((entry) => retargetEntryMediaUrls(entry, sourceChatId, chatId))
     if (sourceEntries.length > 0) {
       const transcriptPath = this.transcriptPath(chatId)
@@ -1745,6 +1902,22 @@ export class EventStore {
     await this.append(this.chatsLogPath, event)
   }
 
+  async setChatModelSettings(chatId: string, settings: { model: string | null; modelOptions: ModelOptions | null }) {
+    const chat = this.requireChat(chatId)
+    const model = settings.model?.trim() || null
+    const modelOptions = cloneModelOptions(settings.modelOptions)
+    if (chat.model === model && sameModelOptions(chat.modelOptions, modelOptions)) return
+    const event: ChatEvent = {
+      v: STORE_VERSION,
+      type: "chat_model_settings_set",
+      timestamp: Date.now(),
+      chatId,
+      model,
+      modelOptions,
+    }
+    await this.append(this.chatsLogPath, event)
+  }
+
   async setChatReadState(chatId: string, unread: boolean) {
     const chat = this.requireChat(chatId)
     if (chat.unread === unread) return
@@ -1873,6 +2046,11 @@ export class EventStore {
     return findTranscriptWindowStart(entries, { endExclusive: start, assistantMessages: options.assistantMessages })
   }
 
+  /** Revalidate a retained boundary against current rows without loading payloads. */
+  snapTranscriptWindowStart(chatId: string, start: number): number {
+    return snapToRowStart(this.getTranscriptEntries(chatId), start)
+  }
+
   /**
    * `_id` of the entry at an absolute index, or null when the index is out of
    * range or sits before the loaded window.
@@ -1936,7 +2114,9 @@ export class EventStore {
     // has to be logged, because boot only re-derives this from the transcript's
     // last 256 KB. See `recordLastMessageAt`.
     if (entry.kind === "user_prompt") {
-      await this.recordLastMessageAt(chatId, entry.createdAt)
+      const visible = !entry.hidden && !entry.parentToolUseId
+      await this.recordLastMessageAt(chatId, entry.createdAt,
+        visible ? crypto.randomUUID() : undefined, !visible)
     }
     const transcriptPath = this.transcriptPath(chatId)
     const write = this.enqueueWrite(async () => {
@@ -1964,6 +2144,76 @@ export class EventStore {
       }
     })
     return write
+  }
+
+  private createTranscriptMetadataEvent(chatId: string, entries: TranscriptEntry[]): ChatEvent {
+    let lastMessageAt: number | undefined
+    let lastAgentMessageAt: number | undefined
+    let lastAgentMessagePreviewAt: number | undefined
+    let lastUserMessagePreview: string | undefined
+    let lastAgentMessagePreview: string | undefined
+    for (const entry of entries) {
+      if (isAgentAuthoredEntry(entry)) lastAgentMessageAt = Math.max(lastAgentMessageAt ?? 0, entry.createdAt)
+      if (entry.kind === "user_prompt") {
+        lastMessageAt = Math.max(lastMessageAt ?? 0, entry.createdAt)
+        if (!entry.hidden) {
+          const preview = buildChatMessagePreview(entry.content)
+          if (preview) lastUserMessagePreview = preview
+        }
+      } else if (entry.kind === "assistant_text" && !entry.hidden && !entry.parentToolUseId) {
+        const preview = buildChatMessagePreview(entry.text)
+        if (preview) {
+          lastAgentMessagePreview = preview
+          lastAgentMessagePreviewAt = entry.createdAt
+        }
+      }
+    }
+
+    return {
+      v: STORE_VERSION,
+      type: "chat_transcript_metadata_set",
+      timestamp: Date.now(),
+      chatId,
+      hasMessages: entries.length > 0,
+      promptHistoryRevision: crypto.randomUUID(),
+      lastMessageAt: lastMessageAt ?? null,
+      lastAgentMessageAt: lastAgentMessageAt ?? null,
+      lastAgentMessagePreviewAt: lastAgentMessagePreviewAt ?? null,
+      lastUserMessagePreview: lastUserMessagePreview ?? null,
+      lastAgentMessagePreview: lastAgentMessagePreview ?? null,
+    }
+  }
+
+  async replaceTranscript(chatId: string, entries: TranscriptEntry[]) {
+    this.requireChat(chatId)
+    const transcriptPath = this.transcriptPath(chatId)
+    const tempPath = `${transcriptPath}.${crypto.randomUUID()}.tmp`
+    return this.enqueueWrite(async () => {
+      await this.ensureTranscriptsDir()
+      const inlineToolIds = new Set(entries.flatMap(entry =>
+        entry.kind === "tool_call" && INLINE_TOOL_KINDS.has(entry.tool.toolKind) ? [entry.tool.toolId] : []))
+      const headers: TranscriptEntry[] = []
+      for (const entry of entries) {
+        const stored = await externalizeEntryImages(entry, { dataDir: this.dataDir, chatId })
+        const { header, payload } = splitTranscriptEntry(stored, toolId => inlineToolIds.has(toolId))
+        if (payload) await appendFile(this.payloadSidecarPath(chatId), serializeTranscriptPayload(payload), "utf8")
+        headers.push(header)
+      }
+      const text = headers.map(entry => JSON.stringify(entry)).join("\n")
+      await writeFile(tempPath, text ? `${text}\n` : "", "utf8")
+      await rename(tempPath, transcriptPath)
+      const metadataEvent = this.createTranscriptMetadataEvent(chatId, entries)
+      // The transcript rename committed the replacement. Publish its headers,
+      // payload index and derived metadata even if the journal append fails.
+      this.dropTranscriptCaches(chatId)
+      this.setCachedTranscript(chatId, cloneTranscriptEntries(headers))
+      this.applyEvent(metadataEvent)
+      try {
+        await appendFile(this.chatsLogPath, `${JSON.stringify(metadataEvent)}\n`, "utf8")
+      } finally {
+        this.onTranscriptReplaced?.(chatId)
+      }
+    })
   }
 
   async enqueueMessage(chatId: string, message: Omit<QueuedChatMessage, "id" | "createdAt"> & Partial<Pick<QueuedChatMessage, "id" | "createdAt">>) {
@@ -2007,7 +2257,7 @@ export class EventStore {
   }
 
   /** `model` is what this turn runs with; omitted where the caller has none to name. */
-  async recordTurnStarted(chatId: string, model?: string) {
+  async recordTurnStarted(chatId: string, model?: string, options?: { turnCount?: number }) {
     this.requireChat(chatId)
     const event: TurnEvent = {
       v: STORE_VERSION,
@@ -2015,9 +2265,31 @@ export class EventStore {
       timestamp: Date.now(),
       chatId,
       ...(model ? { model } : {}),
+      ...(options?.turnCount !== undefined ? { turnCount: options.turnCount } : {}),
     }
     await this.append(this.turnsLogPath, event)
     this.onTurnStarted?.(chatId)
+  }
+
+  /** Restore an edit's count without recording a new turn or changing lifecycle metadata. */
+  async restoreTurnCount(chatId: string, turnCount: number | undefined) {
+    this.requireChat(chatId)
+    const event: TurnEvent = {
+      v: STORE_VERSION,
+      type: "turn_count_restored",
+      timestamp: Date.now(),
+      chatId,
+      turnCount: turnCount ?? null,
+    }
+    await this.append(this.turnsLogPath, event)
+  }
+
+  async setCodexHistoryIntegrity(chatId: string, integrity: CodexHistoryIntegrity) {
+    this.requireChat(chatId)
+    await this.append(this.chatsLogPath, {
+      v: STORE_VERSION, type: "codex_history_integrity_set", timestamp: Date.now(),
+      chatId, integrity,
+    })
   }
 
   /**
@@ -2032,19 +2304,21 @@ export class EventStore {
    * push the last prompt megabytes behind the tail window, and the chat comes
    * back invisible despite having a full conversation in it.
    *
-   * Only ever moves forward, and only writes when it actually moves, so
-   * replaying a prompt (or a fork inheriting one) adds nothing to the log.
+   * Recency only moves forward. New visible prompts also carry a history
+   * revision, even when their timestamp is older than the current recency.
    */
-  private async recordLastMessageAt(chatId: string, at: number | undefined) {
+  private async recordLastMessageAt(chatId: string, at: number | undefined, promptHistoryRevision?: string, promptHistoryUnchanged = false) {
     if (at == null) return
     const chat = this.state.chatsById.get(chatId)
-    if (!chat || (chat.lastMessageAt ?? 0) >= at) return
+    if (!chat || (!promptHistoryRevision && (chat.lastMessageAt ?? 0) >= at)) return
     const event: ChatEvent = {
       v: STORE_VERSION,
       type: "chat_last_message_at_set",
       timestamp: Date.now(),
       chatId,
       at,
+      ...(promptHistoryRevision ? { promptHistoryRevision } : {}),
+      ...(promptHistoryUnchanged ? { promptHistoryUnchanged: true as const } : {}),
     }
     await this.append(this.chatsLogPath, event)
   }
@@ -2153,8 +2427,8 @@ export class EventStore {
   }
 
   /** Header-only probe. Explicit clear starts a new recoverable context epoch. */
-  getContextBounds(chatId: string, endExclusive?: number) {
-    const entries = this.getTranscriptEntries(chatId).slice(0, endExclusive)
+  getContextBounds(chatId: string) {
+    const entries = this.getTranscriptEntries(chatId)
     let start = 0
     let hasConversation = false
     for (let index = 0; index < entries.length; index++) {
@@ -2195,6 +2469,32 @@ export class EventStore {
     await this.append(this.turnsLogPath, event)
   }
 
+  async setPendingForkResumeAt(chatId: string, pendingForkResumeAt: string | null) {
+    const chat = this.requireChat(chatId)
+    if ((chat.pendingForkResumeAt ?? null) === pendingForkResumeAt) return
+    const event: TurnEvent = {
+      v: STORE_VERSION,
+      type: "pending_fork_resume_at_set",
+      timestamp: Date.now(),
+      chatId,
+      pendingForkResumeAt,
+    }
+    await this.append(this.turnsLogPath, event)
+  }
+
+  async setPendingForkUserPrompt(chatId: string, pendingForkUserPrompt: boolean) {
+    const chat = this.requireChat(chatId)
+    if (Boolean(chat.pendingForkUserPrompt) === pendingForkUserPrompt) return
+    const event: TurnEvent = {
+      v: STORE_VERSION,
+      type: "pending_fork_user_prompt_set",
+      timestamp: Date.now(),
+      chatId,
+      pendingForkUserPrompt,
+    }
+    await this.append(this.turnsLogPath, event)
+  }
+
   getProject(projectId: string) {
     const project = this.state.projectsById.get(projectId)
     if (!project || project.deletedAt) return null
@@ -2231,6 +2531,11 @@ export class EventStore {
     return entries.map((entry) => entry.trimmed
       ? mergeTranscriptPayload({ ...entry }, payloads.get(entry._id))
       : { ...entry })
+  }
+
+  /** Prompt provenance and action labels do not need large tool payloads. */
+  getPromptHistoryEntries(chatId: string) {
+    return cloneTranscriptEntries(this.getTranscriptEntries(chatId))
   }
 
   getQueuedMessages(chatId: string) {
@@ -2354,7 +2659,7 @@ export class EventStore {
       projects: this.listProjects().map((project) => ({ ...project })),
       chats: [...this.state.chatsById.values()]
         .filter((chat) => !chat.deletedAt)
-        .map((chat) => ({ ...chat })),
+        .map((chat) => ({ ...chat, modelOptions: cloneModelOptions(chat.modelOptions) })),
       queuedMessages: [...this.state.queuedMessagesByChatId.entries()]
         .map(([chatId, entries]) => ({
           chatId,
@@ -2365,6 +2670,7 @@ export class EventStore {
         })),
     }
   }
+
 
   async compact() {
     const snapshot = this.createSnapshot()
@@ -2397,6 +2703,8 @@ export class EventStore {
       const payload = entries.map((entry) => JSON.stringify(entry)).join("\n")
       await writeFile(tempPath, payload ? `${payload}\n` : "", "utf8")
       await rename(tempPath, transcriptPath)
+      const metadataEvent = this.createTranscriptMetadataEvent(chatId, entries)
+      this.applyEvent(metadataEvent)
       if (logEveryChat || (index + 1) % 25 === 0 || index === messageSets.length - 1) {
         onProgress?.(`${LOG_PREFIX} transcript migration: ${index + 1}/${messageSets.length} chats`)
       }

@@ -258,12 +258,12 @@ export const MISSING_PI_CONNECTION_MESSAGE =
   "Pi needs a Model Registry connection. Add an API key under Settings → Providers → Model Registry (OpenRouter, OpenAI, or a custom OpenAI-compatible URL), or export OPENROUTER_API_KEY."
 
 export interface StartPiTurnArgs {
+  isCurrentTurn?: () => boolean
   customTools?: KannaToolHost
   chatId: string
   cwd: string
   content: string
   prepareContent?: PrepareHarnessContent
-  isCurrentTurn?: () => boolean
   /** Model id on the registry endpoint, e.g. "moonshotai/kimi-k2.6" or any arbitrary id. */
   model: string
   effort: PiReasoningEffort

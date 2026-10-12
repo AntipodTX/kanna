@@ -12,6 +12,7 @@ import type {
   SidebarProjectGroup,
   SubagentActivity,
 } from "../shared/types"
+import { cloneModelOptions } from "../shared/types"
 import type { WorkingTreeProbe } from "./diff-store"
 import type { ProjectRepoLabel } from "./worktree-probe"
 import type { ChatRecord, StoreState, TouchedFile } from "./events"
@@ -436,9 +437,16 @@ export function deriveChatSnapshot(
     status: deriveStatus(chat, activeStatuses.get(chat.id)),
     isDraining: drainingChatIds.has(chat.id),
     provider: chat.provider,
+    model: chat.model ?? null,
+    modelOptions: cloneModelOptions(chat.modelOptions),
     planMode: chat.planMode,
     autoPlan: chat.autoPlan,
     sessionToken: chat.sessionToken,
+    historyRevision: chat.promptHistoryRevision,
+    historyRepair: chat.codexHistoryIntegrity?.repair?.phase === "running" && !activeStatuses.has(chat.id)
+      ? { phase: "failed", message: "History check was interrupted. Retry the original action." }
+      : chat.codexHistoryIntegrity?.repair,
+    historyIntegrityRevision: chat.codexHistoryIntegrity ? JSON.stringify(chat.codexHistoryIntegrity) : undefined,
     ...(subagents?.length ? { subagents: [...subagents] } : {}),
   }
 

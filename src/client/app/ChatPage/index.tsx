@@ -1,3 +1,5 @@
+import type { CodexHistoryActionsSnapshot } from "../../../shared/protocol"
+import { getHistoryActionError, getHistoryRepairNotice } from "./historyActionError"
 import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type CSSProperties, type DragEvent, type ReactNode, type RefObject } from "react"
 import type { GroupImperativeHandle } from "react-resizable-panels"
 import { flushSync } from "react-dom"
@@ -70,6 +72,21 @@ export {
 /** Stable identity so a chat without a snapshot does not re-derive per render. */
 const EMPTY_TRANSCRIPT_ENTRIES: TranscriptEntry[] = []
 const EMPTY_SUBAGENTS: readonly SubagentActivity[] = []
+
+export function resolveTranscriptEditUserPromptControls(args: {
+  isProcessing: boolean
+  isDraining: boolean
+  handleEditUserPrompt: KannaState["handleEditUserPrompt"]
+  handleForkUserPrompt: KannaState["handleForkUserPrompt"]
+}) {
+  const isDisabled = args.isProcessing || args.isDraining
+  return {
+    onEditUserPrompt: args.handleEditUserPrompt,
+    isEditUserPromptDisabled: isDisabled,
+    onForkUserPrompt: args.handleForkUserPrompt,
+    isForkUserPromptDisabled: isDisabled,
+  }
+}
 
 /**
  * Types the empty-state line once each time the empty state appears. Not per
@@ -985,7 +1002,151 @@ export function ChatPage() {
     [state.socket, state.activeChatId]
   )
 
-  const transcriptRenderOptions = useMemo(() => ({ loadEntryDebugRaw }), [loadEntryDebugRaw])
+  const [historyActionState, setHistoryActionState] = useState<{
+    chatId: string | null
+    key: string | null
+    actions: CodexHistoryActionsSnapshot["actions"]
+    messages?: CodexHistoryActionsSnapshot["messages"]
+    gapId?: string
+    loading: boolean
+    recovering?: boolean
+    error: string | null
+  }>({ chatId: null, key: null, actions: {}, loading: false, error: null })
+  const historyContextKey = JSON.stringify([
+    state.activeChatId,
+    state.runtime?.provider,
+    state.runtime?.sessionToken,
+    state.runtime?.historyRevision,
+    state.isProcessing,
+    state.isDraining,
+  ])
+  const historyActionKey = JSON.stringify([historyContextKey, state.runtime?.historyIntegrityRevision])
+  const historyActionsCache = useRef(new Map<string, typeof historyActionState>())
+  const cacheHistoryActions = useCallback((chatId: string, snapshot: typeof historyActionState) => {
+    const cache = historyActionsCache.current
+    cache.delete(chatId)
+    cache.set(chatId, snapshot)
+    if (cache.size > 16) cache.delete(cache.keys().next().value!)
+  }, [])
+  const currentHistoryActionKey = useRef(historyActionKey)
+  currentHistoryActionKey.current = historyActionKey
+  const currentHistoryContextKey = useRef(historyContextKey)
+  currentHistoryContextKey.current = historyContextKey
+  const historyActionsCurrent = historyActionState.key === historyActionKey
+  useEffect(() => {
+    const chatId = state.activeChatId
+    if (
+      !chatId ||
+      state.runtime?.provider !== "codex" ||
+      state.isProcessing ||
+      state.isDraining
+    ) {
+      setHistoryActionState({
+        chatId,
+        key: historyActionKey,
+        actions: {},
+        loading: false,
+        error: null,
+      })
+      return
+    }
+    const cached = historyActionsCache.current.get(chatId)
+    if (cached?.key === historyActionKey) {
+      setHistoryActionState(cached)
+      return
+    }
+    let current = true
+    setHistoryActionState({
+      chatId,
+      key: historyActionKey,
+      actions: {},
+      loading: true,
+      error: null,
+    })
+    state.socket
+      .command<CodexHistoryActionsSnapshot>({
+        type: "chat.getHistoryActions",
+        chatId,
+      })
+      .then((result) => {
+        if (current) {
+          const next = {
+            chatId,
+            key: historyActionKey,
+            actions: result.actions,
+            messages: result.messages,
+            gapId: result.gap?.messageId,
+            loading: false,
+            error: getHistoryActionError(result),
+          }
+          cacheHistoryActions(chatId, next)
+          setHistoryActionState(next)
+        }
+      })
+      .catch((error) => {
+        if (current)
+          setHistoryActionState({
+            chatId,
+            key: historyActionKey,
+            actions: {},
+            loading: false,
+            error: error instanceof Error ? error.message : String(error),
+          })
+      })
+    return () => {
+      current = false
+    }
+  }, [cacheHistoryActions, historyActionKey, state.socket])
+  const recoverHistoryAction = useCallback(async (messageId?: string, retry = false) => {
+    const chatId = state.activeChatId
+    if (!chatId || state.isProcessing || state.isDraining) return false
+    const contextKey = historyContextKey
+    setHistoryActionState(previous => ({ ...previous, recovering: true, error: null }))
+    try {
+      const result = await state.socket.command<CodexHistoryActionsSnapshot>({
+        type: "chat.getHistoryActions", chatId, recover: true, messageId, retry,
+      })
+      if (currentHistoryContextKey.current !== contextKey) return false
+      const key = currentHistoryActionKey.current
+      const permitted = !messageId || Boolean(result.actions[messageId] && result.actions[messageId] !== "recover")
+      const next = {
+        chatId, key, actions: result.actions, messages: result.messages, gapId: result.gap?.messageId,
+        loading: false, recovering: false,
+        error: getHistoryActionError(result, messageId),
+      }
+      cacheHistoryActions(chatId, next)
+      setHistoryActionState(next)
+      return permitted
+    } catch (error) {
+      if (currentHistoryContextKey.current === contextKey) setHistoryActionState(previous => ({
+        ...previous, recovering: false, error: error instanceof Error ? error.message : String(error),
+      }))
+      return false
+    }
+  }, [cacheHistoryActions, historyContextKey, state.activeChatId, state.isProcessing, state.isDraining, state.socket])
+  const transcriptRenderOptions = useMemo(
+    () => ({
+      loadEntryDebugRaw,
+      resolveHistoryAction: recoverHistoryAction,
+      historyActions: historyActionsCurrent ? historyActionState.actions : {},
+      historyMessages: historyActionsCurrent ? historyActionState.messages ?? {} : {},
+      historyActionsRequired: state.runtime?.provider === "codex",
+      historyActionGapId: historyActionsCurrent ? historyActionState.gapId ?? null : null,
+      historyActionsLoading: historyActionsCurrent
+        ? historyActionState.loading
+        : state.runtime?.provider === "codex",
+      historyActionsError: historyActionsCurrent
+        ? historyActionState.error
+        : null,
+    }),
+    [
+      loadEntryDebugRaw,
+      recoverHistoryAction,
+      historyActionState,
+      historyActionsCurrent,
+      state.runtime?.provider,
+    ],
+  )
 
   // One cache per chat: entry ids are chat-scoped, and leaving a chat should
   // not keep its payloads resident.
@@ -1228,6 +1389,13 @@ export function ChatPage() {
     else setViewerWidth(Math.round(viewerWidth))
   }, [closeViewer, setViewerWidth, viewerDocked])
 
+  const transcriptEditUserPromptControls = resolveTranscriptEditUserPromptControls({
+    isProcessing: state.isProcessing,
+    isDraining: state.isDraining,
+    handleEditUserPrompt: state.handleEditUserPrompt,
+    handleForkUserPrompt: state.handleForkUserPrompt,
+  })
+
   const chatCard = (
     <Card
       ref={chatCardRef}
@@ -1239,6 +1407,12 @@ export function ChatPage() {
     >
       <CardContent className="flex flex-1 min-h-0 flex-col overflow-hidden p-0 relative">
         <ChatNavbarWash resetKey={state.activeChatId} opaqueBar={chatTabsEnabled} />
+        {state.runtime?.provider === "codex" && (state.runtime.historyRepair || (historyActionsCurrent && (historyActionState.error || historyActionState.recovering))) ? (
+          <div role="status" className="mt-[var(--chat-navbar-h,60px)] shrink-0 border-b border-border px-3 py-2 text-sm text-muted-foreground">
+            {getHistoryRepairNotice(state.runtime.historyRepair, historyActionsCurrent ? historyActionState.error : null,
+              historyActionsCurrent && Boolean(historyActionState.recovering))}
+          </div>
+        ) : null}
         <TranscriptRenderOptionsProvider value={transcriptRenderOptions}>
         <ToolPayloadProvider store={toolPayloadStore}>
         <ChatTranscriptViewport
@@ -1267,6 +1441,18 @@ export function ChatPage() {
           platform={state.localProjects?.machine.platform}
           onAskUserQuestionSubmit={state.handleAskUserQuestion}
           onExitPlanModeConfirm={state.handleExitPlanMode}
+          onEditUserPrompt={
+            state.runtime?.provider !== "claude" && state.runtime?.provider !== "codex"
+              ? undefined
+              : transcriptEditUserPromptControls.onEditUserPrompt
+          }
+          isEditUserPromptDisabled={transcriptEditUserPromptControls.isEditUserPromptDisabled}
+          onForkUserPrompt={
+            state.runtime?.provider !== "claude" && state.runtime?.provider !== "codex"
+              ? undefined
+              : transcriptEditUserPromptControls.onForkUserPrompt
+          }
+          isForkUserPromptDisabled={transcriptEditUserPromptControls.isForkUserPromptDisabled}
           showScrollButton={showScrollToBottom && state.messages.length > 0}
           onIsAtEndChange={onIsAtEndChange}
           readAnchorState={state.readAnchorState}
