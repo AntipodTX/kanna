@@ -32,7 +32,6 @@ function createDeps(entries: Array<Record<string, unknown>>) {
       findTranscriptWindowStart(typed, { endExclusive: entries.length, assistantMessages }),
     widenTranscriptWindowStart: (_chatId: string, current: number) => current,
     getSidebarProjectOrder: () => [],
-    pruneStaleEmptyChats: async () => [],
   }
   const agent = { getActiveStatuses: () => new Map(), getDrainingChatIds: () => new Set<string>() }
   const appSettings = {
