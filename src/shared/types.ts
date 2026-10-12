@@ -391,6 +391,16 @@ export type ModelOptions = Partial<{
   [K in AgentProvider]: Partial<ProviderModelOptionsByProvider[K]>
 }>
 
+export function cloneModelOptions(modelOptions: ModelOptions | null | undefined): ModelOptions | null {
+  if (!modelOptions) return null
+  return Object.fromEntries(
+    Object.entries(modelOptions).map(([provider, options]) => [
+      provider,
+      options ? { ...options } : options,
+    ])
+  ) as ModelOptions
+}
+
 export const DEFAULT_CLAUDE_MODEL_OPTIONS = {
   reasoningEffort: "high",
   contextWindow: "1m",
@@ -1673,6 +1683,9 @@ export interface TodoItem {
 interface TranscriptEntryBase {
   _id: string
   messageId?: string
+  /** Native Claude session containing messageId; updated with its UUID on a fork. */
+  claudeSessionToken?: string
+  claudeSidechain?: boolean
   createdAt: number
   hidden?: boolean
   debugRaw?: string
@@ -2465,6 +2478,11 @@ export interface WorkflowAgent {
   cached?: boolean
 }
 
+export interface HistoryRepairStatus {
+  phase: "running" | "done" | "failed"
+  message: string
+}
+
 export interface ChatRuntime {
   chatId: string
   projectId: string
@@ -2473,9 +2491,14 @@ export interface ChatRuntime {
   status: KannaStatus
   isDraining: boolean
   provider: AgentProvider | null
+  model: string | null
+  modelOptions: ModelOptions | null
   planMode: boolean
   autoPlan: boolean
   sessionToken: string | null
+  historyRevision?: string
+  historyIntegrityRevision?: string
+  historyRepair?: HistoryRepairStatus
   /**
    * The chat's task log: delegated work running now and the latest to have
    * finished, across turns, oldest first. Omitted when the chat has never

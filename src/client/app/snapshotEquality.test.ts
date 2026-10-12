@@ -16,6 +16,8 @@ function snapshot(startIndex: number, ids: string[], incremental?: boolean): Cha
       status: "idle",
       isDraining: false,
       provider: "claude",
+      model: null,
+      modelOptions: null,
       planMode: false,
       autoPlan: false,
       sessionToken: null,
@@ -222,6 +224,16 @@ describe("foldChatSnapshot providers", () => {
     const next = foldChatSnapshot(current, null, incoming)
     expect(next?.availableProviders[0]?.supportsPlanMode).toBe(true)
   })
+})
+
+test("history classification and progress changes reach the UI without transcript changes", () => {
+  for (const change of [
+    { historyRevision: "new" }, { historyIntegrityRevision: "new" },
+    { historyRepair: { phase: "running" as const, message: "Checking history" } },
+  ]) {
+    const current = snapshot(0, ["a"]), incoming = { ...current, runtime: { ...current.runtime, ...change } }
+    expect(foldChatSnapshot(current, null, incoming)).not.toBe(current)
+  }
 })
 
 describe("applyIncrementalChatSnapshot carried fields", () => {

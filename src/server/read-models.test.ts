@@ -329,10 +329,12 @@ describe("read models", () => {
       createdAt: 1,
       updatedAt: 1,
       unread: false,
-      provider: "claude",
-      planMode: true,
+      provider: "cursor",
+      model: "composer-2.5",
+      modelOptions: { cursor: { fastMode: true } },
+      planMode: false,
       autoPlan: false,
-      sessionToken: "session-1",
+      sessionToken: "cursor-session-1",
       lastTurnOutcome: null,
     })
     state.queuedMessagesByChatId.set("chat-1", [{
@@ -353,7 +355,12 @@ describe("read models", () => {
       "chat-1",
       () => ({ messages: [], startIndex: 0, readAnchor: null })
     )
-    expect(chat?.runtime.provider).toBe("claude")
+    expect(chat?.runtime).toMatchObject({
+      provider: "cursor",
+      model: "composer-2.5",
+      modelOptions: { cursor: { fastMode: true } },
+      planMode: false,
+    })
     expect(chat?.queuedMessages.map((message) => message.content)).toEqual(["follow up"])
     expect(chat?.availableProviders.length).toBeGreaterThan(1)
     expect(chat?.availableProviders.find((provider) => provider.id === "codex")?.models.map((model) => model.id)).toEqual([

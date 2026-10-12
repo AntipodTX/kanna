@@ -50,13 +50,33 @@ function isToolEntry(entry: TranscriptEntry) {
  */
 export function snapToRowStart(entries: readonly TranscriptEntry[], start: number): number {
   let cut = Math.max(0, Math.min(start, entries.length))
+  let parentIndices: Map<string, number[]> | undefined
   while (cut > 0) {
     const previous = entries[cut - 1]!
     const current = entries[cut]
     // A subagent's entries render inside the Agent row that spawned them,
     // so a cut among them would open the window on children with no parent.
     if (current?.parentToolUseId) {
-      cut -= 1
+      // Build only when ancestry is needed, and only for preceding headers.
+      // Keep duplicates so each decreasing cut can find its nearest parent.
+      if (!parentIndices) {
+        parentIndices = new Map<string, number[]>()
+        for (let index = 0; index < cut; index += 1) {
+          const parent = entries[index]!
+          if (parent.kind !== "tool_call") continue
+          const indices = parentIndices.get(parent.tool.toolId)
+          if (indices) indices.push(index)
+          else parentIndices.set(parent.tool.toolId, [index])
+        }
+      }
+      const indices = parentIndices.get(current.parentToolUseId)
+      // The cut only decreases: every obsolete index is popped at most once.
+      while (indices?.length && indices[indices.length - 1]! >= cut) indices.pop()
+      const parentIndex = indices?.[indices.length - 1] ?? -1
+      // Follow the actual parent, including nested ancestry, even when
+      // main-thread rows arrived between it and this child. Missing parents
+      // retain the existing backward walk rather than dropping held rows.
+      cut = parentIndex >= 0 ? parentIndex : cut - 1
       continue
     }
     if (current && isToolEntry(previous) && isToolEntry(current)) {
