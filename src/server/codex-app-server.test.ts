@@ -54,6 +54,261 @@ async function collectStream(stream: AsyncIterable<any>) {
   return items
 }
 
+for (const side of ["before", "after"] as const)
+  test(`saved ${side} boundary forks without reading either native history`, async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: {} })
+      else if (message.method === "thread/fork") child.writeServerMessage({ id: message.id, result: { thread: { id: "prepared" } } })
+      else if (message.method) child.writeServerMessage({ id: message.id, error: { code: -32601, message: "Unexpected native history read" } })
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    try {
+      const args = { cwd: "/repo", threadId: "source", model: "gpt-5.4" }
+      expect(await (side === "before"
+        ? manager.forkBeforeTurn({ ...args, beforeTurnId: "turn-a" })
+        : manager.forkAfterTurn({ ...args, afterTurnId: "turn-a" }))).toBe("prepared")
+      const requests = process.messages.filter((m: any) => m.id !== undefined) as any[]
+      expect(requests.map((m) => m.method)).toEqual(["initialize", "thread/fork"])
+      expect(requests[1].params).toMatchObject({ threadId: "source", includeTurns: false,
+        ...(side === "before" ? { beforeTurnId: "turn-a" } : { lastTurnId: "turn-a" }) })
+      expect(process.killed).toBe(true)
+    } finally { manager.stopAll() }
+  })
+
+function historyTestHarness(options: {
+  pages?: readonly unknown[]
+  listError?: { code: number; message: string }
+  revertError?: { code: number; message: string }
+  beforeListResponse?: () => void
+} = {}) {
+  let pageIndex = 0
+  const process = new FakeCodexProcess((message, child) => {
+    if (message.method === "initialize") {
+      child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+    } else if (message.method === "thread/start" || message.method === "thread/resume") {
+      child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1" } } })
+    } else if (message.method === "turn/start") {
+      child.writeServerMessage({ id: message.id, result: { turn: { id: "running", status: "inProgress", error: null } } })
+    } else if (message.method === "thread/turns/list") {
+      options.beforeListResponse?.()
+      child.writeServerMessage(options.listError
+        ? { id: message.id, error: options.listError }
+        : { id: message.id, result: options.pages && pageIndex < options.pages.length
+          ? options.pages[pageIndex++] : { data: [], nextCursor: null } })
+    } else if (message.method === "thread/revert") {
+      child.writeServerMessage(options.revertError
+        ? { id: message.id, error: options.revertError }
+        : { id: message.id, result: { thread: { id: "thread-1", turns: [] } } })
+    } else if (message.method === "thread/rollback") {
+      child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1", turns: [] } } })
+    }
+  })
+  const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+  const requests = (method: string) => process.messages.filter((message: any) => message.method === method) as Array<{ params: Record<string, unknown> }>
+  return { manager, process, requests }
+}
+
+function historyPage(ids: string[], nextCursor: string | null = null) {
+  return {
+    data: ids.map((id) => ({ id, status: "completed", itemsView: "summary", items: [{ type: "userMessage" }], error: null })),
+    nextCursor,
+    backwardsCursor: null,
+  }
+}
+
+describe("Codex history revert compatibility", () => {
+  test("counts user-bearing turns instead of compaction and other service turns", async () => {
+    const page = historyPage(["trailing-compact", "third", "service", "second", "middle-compact", "first"])
+    for (const turn of page.data) {
+      if (turn.id.includes("compact")) turn.items = [{ type: "contextCompaction" }]
+      if (turn.id === "service") turn.items = [{ type: "agentMessage" }]
+    }
+    const { manager, requests } = historyTestHarness({ pages: [page] })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 3 })
+    expect(requests("thread/turns/list")).toMatchObject([{ params: { itemsView: "summary" } }])
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: "first" } }])
+  })
+
+  test("continues through service-only pages to the only user message", async () => {
+    const servicePage = historyPage(["compact-2", "compact-1"], "older")
+    for (const turn of servicePage.data) turn.items = []
+    const { manager, requests } = historyTestHarness({ pages: [servicePage, historyPage(["first"])] })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })
+    expect(requests("thread/turns/list")).toMatchObject([
+      { params: { limit: 1 } }, { params: { limit: 1, cursor: "older" } },
+    ])
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: "first" } }])
+  })
+
+  test("does not count inline compaction as another user turn", async () => {
+    const page = historyPage(["second", "first"])
+    page.data[0]!.items.push({ type: "contextCompaction" })
+    const { manager, requests } = historyTestHarness({ pages: [page] })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 2 })
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: "first" } }])
+  })
+
+  test.each([
+    { name: "no user messages", items: [], itemsView: "summary" },
+    { name: "missing items", items: undefined, itemsView: "summary" },
+    { name: "items not loaded", items: [], itemsView: "notLoaded" },
+    { name: "invalid item", items: [null], itemsView: "summary" },
+  ])("refuses an uncertain user-message boundary: $name", async ({ items, itemsView }) => {
+    const { manager, requests } = historyTestHarness({ pages: [{ data: [{ id: "service", status: "completed", items, itemsView }] }] })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 }))
+      .rejects.toThrow("Cannot determine Codex rollback boundary")
+    expect(requests("thread/revert")).toEqual([])
+    expect(requests("thread/rollback")).toEqual([])
+  })
+
+  test.each([1, 3])("excludes the exact boundary when reverting %s turns", async (numTurns) => {
+    const { manager, process, requests } = historyTestHarness({ pages: [historyPage(["newest", "middle", "oldest"])] })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    await manager.rollbackThread({ chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", numTurns })
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: numTurns === 1 ? "newest" : "oldest" } }])
+    expect(requests("thread/rollback")).toEqual([])
+    expect(requests("thread/resume")).toEqual([])
+    expect(process.killed).toBe(false)
+    manager.stopSession("chat-1")
+  })
+
+  test("follows older pages in bounded batches before reverting", async () => {
+    const firstIds = Array.from({ length: 100 }, (_, index) => `turn-${102 - index}`)
+    const { manager, requests } = historyTestHarness({ pages: [
+      historyPage(firstIds, "page-two"), historyPage(["turn-2", "turn-1"]),
+    ] })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 102 })
+    expect(requests("thread/turns/list")).toMatchObject([
+      { params: { limit: 100, sortDirection: "desc", itemsView: "summary" } },
+      { params: { limit: 2, cursor: "page-two", sortDirection: "desc", itemsView: "summary" } },
+    ])
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: "turn-1" } }])
+  })
+
+  test.each([-32600, -32601])("uses legacy rollback when revert is explicitly unsupported (%s)", async (code) => {
+    const { manager, requests } = historyTestHarness({
+      pages: [historyPage(["turn-1"])],
+      revertError: { code, message: code === -32600 ? "Invalid request: unknown variant `thread/revert`" : "Method not found" },
+    })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })
+    expect(requests("thread/revert")).toHaveLength(1)
+    expect(requests("thread/rollback")).toMatchObject([{ params: { threadId: "thread-1", numTurns: 1 } }])
+  })
+
+  test("keeps the user-turn count for legacy rollback when only revert is unsupported", async () => {
+    const page = historyPage(["compact", "first"])
+    page.data[0]!.items = [{ type: "contextCompaction" }]
+    const { manager, requests } = historyTestHarness({
+      pages: [page], revertError: { code: -32601, message: "Method not found" },
+    })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: "first" } }])
+    expect(requests("thread/rollback")).toMatchObject([{ params: { numTurns: 1 } }])
+  })
+
+  test.each(["listError", "revertError"] as const)("does not fall back on an ordinary %s", async (field) => {
+    const { manager, process, requests } = historyTestHarness({
+      pages: [historyPage(["turn-1"])],
+      [field]: { code: -32603, message: "Disk write failed" },
+    })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })).rejects.toThrow("Disk write failed")
+    expect(requests("thread/rollback")).toEqual([])
+    expect(process.killed).toBe(true)
+  })
+
+  test("does not treat an unknown parameter variant as an unsupported method", async () => {
+    const { manager, requests } = historyTestHarness({ listError: { code: -32600, message: "unknown variant `notLoaded`" } })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })).rejects.toThrow("unknown variant `notLoaded`")
+    expect(requests("thread/rollback")).toEqual([])
+  })
+
+  test("does not retry legacy-format rejection with the removed rollback command", async () => {
+    const { manager, process, requests } = historyTestHarness({
+      pages: [historyPage(["turn-1"])],
+      revertError: { code: -32600, message: "thread/revert only supports paginated threads" },
+    })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 }))
+      .rejects.toThrow("thread/revert only supports paginated threads")
+    expect(requests("thread/revert")).toHaveLength(1)
+    expect(requests("thread/rollback")).toEqual([])
+    expect(process.killed).toBe(true)
+  })
+
+  test.each([undefined, "unknown"])("refuses an unrecognized turn status %s before reverting", async (status) => {
+    const { manager, requests } = historyTestHarness({ pages: [{ data: [{ id: "turn-1", status }] }] })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 }))
+      .rejects.toThrow("Cannot determine Codex rollback boundary")
+    expect(requests("thread/revert")).toEqual([])
+    expect(requests("thread/rollback")).toEqual([])
+  })
+
+  test.each([0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])("rejects invalid count %s before issuing any request", async (numTurns) => {
+    const { manager, process } = historyTestHarness()
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns })).rejects.toThrow("positive integer")
+    expect(process.messages).toEqual([])
+  })
+
+  test.each([
+    { name: "empty history", pages: [historyPage([])] },
+    { name: "insufficient history", pages: [historyPage(["turn-1"])] },
+    { name: "missing data", pages: [{}] },
+    { name: "null page", pages: [null] },
+    { name: "missing ID", pages: [{ data: [{}] }] },
+    { name: "blank ID", pages: [historyPage(["  "])] },
+    { name: "duplicate turn", pages: [historyPage(["turn-1", "turn-1"])] },
+    { name: "duplicate across pages", pages: [historyPage(["turn-1"], "older"), historyPage(["turn-1"])] },
+    { name: "repeated cursor", pages: [historyPage(["turn-3"], "older"), historyPage(["turn-2"], "older")] },
+  ])("refuses ambiguous boundaries: $name", async ({ pages }) => {
+    const { manager, process, requests } = historyTestHarness({ pages })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 3 })).rejects.toThrow("Cannot determine Codex rollback boundary")
+    expect(requests("thread/revert")).toEqual([])
+    expect(requests("thread/rollback")).toEqual([])
+    expect(process.killed).toBe(true)
+  })
+
+  test("refuses to revert a running turn returned by Codex", async () => {
+    const { manager, requests } = historyTestHarness({ pages: [{ data: [{ id: "turn-1", status: "inProgress" }] }] })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })).rejects.toThrow("while a turn is running")
+    expect(requests("thread/revert")).toEqual([])
+    expect(requests("thread/rollback")).toEqual([])
+  })
+
+  test("keeps the active-turn guard before reading or truncating history", async () => {
+    const { manager, requests } = historyTestHarness()
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    await manager.startTurn({ chatId: "chat-1", model: "gpt-5.4", content: "test", planMode: false, onToolRequest: async () => ({}) })
+    await expect(manager.rollbackThread({ chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })).rejects.toThrow("while a turn is running")
+    expect(requests("thread/turns/list")).toEqual([])
+    expect(requests("thread/revert")).toEqual([])
+    expect(requests("thread/rollback")).toEqual([])
+    manager.stopSession("chat-1")
+  })
+
+  test("refuses to revert when a turn starts while history is being read", async () => {
+    let startedTurn: ReturnType<CodexAppServerManager["startTurn"]> | undefined
+    const { manager, requests } = historyTestHarness({
+      pages: [historyPage(["turn-1"])],
+      beforeListResponse: () => {
+        startedTurn = manager.startTurn({
+          chatId: "chat-1", model: "gpt-5.4", content: "new turn", planMode: false,
+          onToolRequest: async () => ({}),
+        })
+      },
+    })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    try {
+      await expect(manager.rollbackThread({ chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 }))
+        .rejects.toThrow("while a turn is running")
+      await startedTurn
+      expect(requests("thread/turns/list")).toHaveLength(1)
+      expect(requests("thread/revert")).toEqual([])
+      expect(requests("thread/rollback")).toEqual([])
+    } finally {
+      manager.stopSession("chat-1")
+    }
+  })
+})
+
 describe("CodexAppServerManager", () => {
   test("initializes app-server and starts a fresh thread", async () => {
     const process = new FakeCodexProcess((message, child) => {
@@ -119,10 +374,11 @@ describe("CodexAppServerManager", () => {
       "thread/resume",
       "thread/start",
     ])
+    expect((process.messages[2] as any).params.persistExtendedHistory).toBe(true)
+    expect((process.messages[3] as any).params.persistExtendedHistory).toBe(true)
     const reused = await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: "thread-2" })
     expect(reused).toEqual({ sessionToken: "thread-2", resumeFellBack: false, startupOutcome: { kind: "reused" } })
     expect(process.messages.filter((message: any) => message.method === "thread/start")).toHaveLength(1)
-
   })
 
   // Regression coverage for the real-world "thread/resume failed: thread X
@@ -223,6 +479,147 @@ describe("CodexAppServerManager", () => {
       "initialized",
       "thread/fork",
     ])
+  })
+
+  test("rolls back an active app-server thread through the live session", async () => {
+    const processes: FakeCodexProcess[] = []
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => {
+        const process = new FakeCodexProcess((message, child) => {
+          if (message.method === "initialize") {
+            child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+          } else if (message.method === "thread/start") {
+            child.writeServerMessage({
+              id: message.id,
+              result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+            })
+          } else if (message.method === "thread/turns/list") {
+            child.writeServerMessage({ id: message.id, error: { code: -32601, message: "Method not found" } })
+          } else if (message.method === "thread/rollback") {
+            child.writeServerMessage({
+              id: message.id,
+              result: { thread: { id: "thread-1", turns: [] } },
+            })
+          }
+        })
+        processes.push(process)
+        return process as never
+      },
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    const thread = await manager.rollbackThread({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+      numTurns: 1,
+    })
+
+    expect(thread.id).toBe("thread-1")
+    expect(processes).toHaveLength(1)
+    expect(processes[0]?.messages.map((message: any) => message.method)).toEqual([
+      "initialize",
+      "initialized",
+      "thread/start",
+      "thread/turns/list",
+      "thread/rollback",
+    ])
+    const rollback = processes[0]?.messages.find((message: any) => message.method === "thread/rollback") as
+      | { method: "thread/rollback"; params: { threadId?: string; numTurns?: number } }
+      | undefined
+    expect(rollback?.params).toMatchObject({
+      threadId: "thread-1",
+      numTurns: 1,
+    })
+  })
+
+  test("resumes a stored thread before rolling back when no live session is available", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/resume") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "thread/turns/list") {
+        child.writeServerMessage({ id: message.id, error: { code: -32601, message: "Method not found" } })
+      } else if (message.method === "thread/rollback") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1", turns: [] } },
+        })
+      }
+    })
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    const thread = await manager.rollbackThread({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+      numTurns: 2,
+    })
+
+    expect(thread.id).toBe("thread-1")
+    expect(process.messages.map((message: any) => message.method)).toEqual([
+      "initialize",
+      "initialized",
+      "thread/resume",
+      "thread/turns/list",
+      "thread/rollback",
+    ])
+    expect((process.messages[0] as any).params.capabilities).toEqual({
+      experimentalApi: true,
+      requestAttestation: false,
+    })
+    expect((process.messages[2] as any).params).toMatchObject({
+      threadId: "thread-1",
+      cwd: "/tmp/project",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+      persistExtendedHistory: true,
+    })
+  })
+
+  test("reverts before the Nth newest turn when Codex has removed thread/rollback", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/resume") {
+        child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1" } } })
+      } else if (message.method === "thread/rollback") {
+        child.writeServerMessage({ id: message.id, error: {
+          code: -32600,
+          message: "Invalid request: unknown variant `thread/rollback`, expected one of `thread/revert`, `thread/turns/list`",
+        } })
+      } else if (message.method === "thread/turns/list") {
+        child.writeServerMessage({ id: message.id, result: {
+          data: historyPage(["turn-3", "turn-2"]).data,
+          nextCursor: "older-turns",
+          backwardsCursor: null,
+        } })
+      } else if (message.method === "thread/revert") {
+        child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1", turns: [] } } })
+      }
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+
+    expect(await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 2 }))
+      .toMatchObject({ id: "thread-1", turns: [] })
+    expect(process.messages.filter((message: any) => message.method === "thread/turns/list"))
+      .toMatchObject([{ params: { threadId: "thread-1", sortDirection: "desc", itemsView: "summary", limit: 2 } }])
+    expect(process.messages.filter((message: any) => message.method === "thread/revert"))
+      .toMatchObject([{ params: { threadId: "thread-1", beforeTurnId: "turn-2" } }])
+    expect(process.messages.some((message: any) => message.method === "thread/rollback")).toBe(false)
+    expect(process.killed).toBe(true)
   })
 
   test("maps fast mode and reasoning into app-server params", async () => {
@@ -2481,6 +2878,192 @@ describe("Codex shared tools", () => {
       }
     })
   }
+})
+
+
+describe("Codex exact prompt history", () => {
+  for (const terminal of [false, true])
+    test(`gap replay forks exactly after a confirmed ${terminal ? "terminal" : "earlier"} turn`, async () => {
+      const turn = (id: string, user = true) => ({ id, status: "completed", items: user
+        ? [{ type: "userMessage", content: [{ type: "text", text: id }] }]
+        : [{ type: "contextCompaction" }] })
+      const retained = [turn("a")]
+      const original = terminal ? retained : [...retained, turn("service", false), turn("c")]
+      const process = new FakeCodexProcess((message, child) => {
+        if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: {} })
+        if (message.method === "thread/read") child.writeServerMessage({ id: message.id,
+          result: { thread: { id: message.params.threadId, turns: message.params.threadId === "source" ? original : retained } } })
+        if (message.method === "thread/fork") child.writeServerMessage({ id: message.id, result: { thread: { id: "prepared" } } })
+      })
+      const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+      try {
+        expect(manager.forkAfterTurn).toBeDefined()
+        expect(await manager.forkAfterTurn({ cwd: "/repo", threadId: "source", afterTurnId: "a", model: "gpt-5.4" })).toBe("prepared")
+        expect(process.messages.filter((m: any) => m.method === "thread/fork"))
+          .toMatchObject([{ params: { threadId: "source", lastTurnId: "a" } }])
+        expect(process.messages.some((m: any) => m.method === "thread/rollback" || m.method === "thread/revert")).toBe(false)
+      } finally { manager.stopAll() }
+    })
+  test("legacy boundary verification never opens the provider journal", async () => {
+    const turn = (id: string) => ({ id, status: "completed", items: [
+      { type: "userMessage", content: [{ type: "text", text: id }] },
+    ] })
+    const process = new FakeCodexProcess((message, child) => {
+      const reply = (result: unknown) => child.writeServerMessage({ id: message.id, result })
+      if (message.method === "initialize") reply({})
+      if (message.method === "thread/fork") reply({ thread: { id: "replacement" } })
+      if (message.method === "thread/read") reply({ thread: {
+        id: message.params.threadId, path: "/provider-journal-must-not-be-opened.jsonl",
+        turns: message.params.threadId === "source" ? [turn("prior"), turn("target"), turn("later")] : [turn("prior")],
+      } })
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    try {
+      expect(await manager.forkBeforeTurn({ cwd: "/repo", threadId: "source", beforeTurnId: "target", model: "gpt-5.4" })).toBe("replacement")
+      expect(process.messages.some((message: any) => message.method === "thread/rollback")).toBe(false)
+    } finally { manager.stopAll() }
+  })
+  test("reads every paginated native user input including mid-turn messages", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize")
+        child.writeServerMessage({ id: message.id, result: {} })
+      if (message.method === "thread/read")
+        child.writeServerMessage({
+          id: message.id,
+          result: {
+            thread: { id: "source", historyMode: "paginated", turns: [] },
+          },
+        })
+      if (message.method === "thread/turns/list")
+        child.writeServerMessage({
+          id: message.id,
+          result: {
+            data: [{ id: "turn", status: "completed", items: [] }],
+            nextCursor: null,
+          },
+        })
+      if (message.method === "thread/items/list")
+        child.writeServerMessage({
+          id: message.id,
+          result: {
+            data: [
+              {
+                turnId: "turn",
+                item: {
+                  type: "userMessage",
+                  id: message.params.cursor ? "i2" : "i1",
+                  clientId: message.params.cursor ? "p2" : "p1",
+                  content: [
+                    {
+                      type: "text",
+                      text: message.params.cursor ? "Search" : "Catalogue",
+                    },
+                  ],
+                },
+              },
+            ],
+            nextCursor: message.params.cursor ? null : "next",
+          },
+        })
+    })
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+    const history = await manager.readPromptHistory({
+      cwd: "/tmp/project",
+      threadId: "source",
+    })
+    expect(history.inputs).toEqual([
+      { turnId: "turn", userIndex: 0, promptId: "p1", text: "Catalogue" },
+      { turnId: "turn", userIndex: 1, promptId: "p2", text: "Search" },
+    ])
+    expect(process.killed).toBe(true)
+  })
+  test("forks directly before an explicit native turn, leaving original untouched", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize")
+        child.writeServerMessage({ id: message.id, result: {} })
+      if (message.method === "thread/fork")
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "replacement", turns: [] } },
+        })
+      if (message.method === "thread/read")
+        child.writeServerMessage({
+          id: message.id,
+          result: {
+            thread: {
+              id: message.params.threadId,
+              turns:
+                message.params.threadId === "source"
+                  ? [
+                      {
+                        id: "target",
+                        status: "completed",
+                        items: [
+                          {
+                            type: "userMessage",
+                            id: "i1",
+                            content: [{ type: "text", text: "Search" }],
+                          },
+                        ],
+                      },
+                    ]
+                  : [],
+            },
+          },
+        })
+    })
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+    expect(
+      await manager.forkBeforeTurn({
+        cwd: "/tmp/project",
+        threadId: "source",
+        beforeTurnId: "target",
+        model: "gpt-5.4",
+      }),
+    ).toBe("replacement")
+    expect(
+      process.messages.filter((m: any) => m.method === "thread/fork"),
+    ).toMatchObject([
+      { params: { threadId: "source", beforeTurnId: "target" } },
+    ])
+    expect(
+      process.messages.some(
+        (m: any) =>
+          m.method === "thread/revert" || m.method === "thread/rollback",
+      ),
+    ).toBe(false)
+  })
+  test("delegates stale boundary validation to Codex and propagates its error", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: {} })
+      if (message.method === "thread/fork") child.writeServerMessage({ id: message.id,
+        error: { code: -32600, message: "beforeTurnId 'missing' was not found: invalid boundary" } })
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    try {
+      await expect(manager.forkBeforeTurn({ cwd: "/repo", threadId: "source", beforeTurnId: "missing", model: "gpt-5.4" })).rejects.toThrow("invalid boundary")
+      expect(process.messages.some((m: any) => m.method === "thread/fork")).toBe(true)
+      expect(process.messages.some((m: any) => m.method === "thread/read")).toBe(false)
+      expect(process.killed).toBe(true)
+    } finally { manager.stopAll() }
+  })
+
+  for (const id of ["source", "", undefined])
+    test(`rejects an invalid fork identity ${id ?? "missing"}`, async () => {
+      const process = new FakeCodexProcess((message, child) => {
+        if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: {} })
+        if (message.method === "thread/fork") child.writeServerMessage({ id: message.id, result: { thread: { id } } })
+      })
+      const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+      try {
+        await expect(manager.forkBeforeTurn({ cwd: "/repo", threadId: "source", beforeTurnId: "target", model: "gpt-5.4" })).rejects.toThrow("isolated")
+      } finally { manager.stopAll() }
+    })
+
 })
 
 test("Codex cancelled serialized startup retires its own process before a successor starts", async () => {
