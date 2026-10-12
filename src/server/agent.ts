@@ -2558,8 +2558,10 @@ export class AgentCoordinator {
 
   private async runClaudeSession(session: ClaudeSessionState) {
     const customToolEvents = new KannaToolEventFilter()
+    const isCurrentClaudeSession = () => this.claudeSessions.get(session.chatId) === session
     try {
       for await (const event of session.session.stream) {
+        if (!isCurrentClaudeSession()) break
         if (event.type === "session_token" && event.sessionToken) {
           session.sessionToken = event.sessionToken
           await this.store.setSessionToken(session.chatId, event.sessionToken)
@@ -2587,6 +2589,7 @@ export class AgentCoordinator {
           && completedPromptSeqs.every((seq) => session.cancelledPromptSeqs.has(seq))
         if (!isCancelledPromptErrorResult) {
           await this.store.appendMessage(session.chatId, event.entry)
+        if (!isCurrentClaudeSession()) break
         }
 
         // Background wakeups (Monitor, Cron*, ScheduleWakeup, RemoteTrigger)
