@@ -7,6 +7,7 @@
 
 ### Fixes
 
+- Keep all chats, including empty drafts and old archived conversations, until explicitly archived or deleted. No automatic chat cleanup runs at startup, on a timer, or when serving snapshots.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
