@@ -2,6 +2,13 @@ import { createContext, useContext, type ReactNode } from "react"
 import type { StandaloneTranscriptAttachmentMode } from "../../../shared/types"
 
 export interface TranscriptRenderOptions {
+  historyActions: Record<string, "ordinary" | "merge-turn" | "recover">
+  historyMessages: Record<string, "missing" | "unknown">
+  resolveHistoryAction: ((messageId: string) => Promise<boolean>) | null
+  historyActionsLoading: boolean
+  historyActionsError: string | null
+  historyActionsRequired: boolean
+  historyActionGapId: string | null
   readonly: boolean
   localLinkMode: "open" | "text"
   sourceOrigin: string | null
@@ -18,6 +25,13 @@ export interface TranscriptRenderOptions {
 }
 
 const DEFAULT_RENDER_OPTIONS: TranscriptRenderOptions = {
+  historyActions: {},
+  historyMessages: {},
+  resolveHistoryAction: null,
+  historyActionsLoading: false,
+  historyActionsError: null,
+  historyActionsRequired: false,
+  historyActionGapId: null,
   readonly: false,
   localLinkMode: "open",
   sourceOrigin: null,
