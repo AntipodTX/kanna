@@ -1,18 +1,18 @@
-import { CodexPromptHistory } from "./codex-prompt-history"
-import { EventStore } from "./event-store"
-import { afterAll, describe, expect, test } from "bun:test"
+import { describe, expect, test, afterAll } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { AgentCoordinator, startClaudeSession, buildAttachmentHintText, buildConcurrentAgentsNotice, buildClaudeSdkUserMessage, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, classifyClaudeBackgroundWorkState, createClaudeStopHook, type ClaudeBackgroundWorkState, resolveClaudeRuntimeOptions } from "./agent"
+import { AgentCoordinator, buildAttachmentHintText, buildConcurrentAgentsNotice, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, startClaudeSession, buildClaudeSdkUserMessage, classifyClaudeBackgroundWorkState, createClaudeStopHook, type ClaudeBackgroundWorkState, resolveClaudeRuntimeOptions } from "./agent"
 import type { HarnessTurn } from "./harness-types"
-import type { ContextRestoration } from "./events"
 import type { SubagentActivityUpdate } from "./background-tasks"
-import type { AgentProvider, ChatAttachment, TranscriptEntry } from "../shared/types"
+import type { ChatAttachment, TranscriptEntry, AgentProvider } from "../shared/types"
 import type { SessionArtifactStatus } from "./session-artifacts"
 import { timestamped } from "./transcript"
-import { getServerProviderCatalog } from "./provider-catalog"
 import { codexAsyncQuestionTool, parseCodexQuestionReplies } from "../shared/codex-questions"
+import { CodexPromptHistory } from "./codex-prompt-history"
+import { EventStore } from "./event-store"
+import type { ContextRestoration } from "./events"
+import { getServerProviderCatalog } from "./provider-catalog"
 
 
 
@@ -6910,7 +6910,6 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
       expect(starts).toBe(2)
     } finally { mapping.release(); await edit.catch(() => {}); events.close() }
   })
-
 
 
 })
