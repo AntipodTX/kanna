@@ -487,17 +487,7 @@ function KannaLayout() {
     <div className="relative flex h-[100dvh] min-h-[100dvh] overflow-hidden">
       {sidebarElement}
       <Outlet context={state} />
-      <StartupSyncProgressDialog
-        snapshot={visibleStartupSync}
-        onDismiss={() => setDismissedStartupSyncStartedAt(state.startupSync?.startedAt ?? null)}
-      />
-      {visibleStartupSync ? null : (
-        <>
-          <SetupWizard />
-          <CommandPalette state={state} />
-        </>
-      )}
-      {projectSearchProject ? (
+      {!visibleStartupSync && projectSearchProject ? (
         <ProjectChatSearchPopover
           key={projectSearchProject.groupKey}
           open
@@ -508,7 +498,16 @@ function KannaLayout() {
           onSelectResult={handleSelectProjectSearchResult}
         />
       ) : null}
-
+      <StartupSyncProgressDialog
+        snapshot={visibleStartupSync}
+        onDismiss={() => setDismissedStartupSyncStartedAt(state.startupSync?.startedAt ?? null)}
+      />
+      {visibleStartupSync ? null : (
+        <>
+          <SetupWizard />
+          <CommandPalette state={state} />
+        </>
+      )}
       <StandaloneShareDialog
         open={Boolean(state.standaloneShareUrl)}
         shareUrl={state.standaloneShareUrl ?? ""}
