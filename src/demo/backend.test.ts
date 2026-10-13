@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { ClientCommand, ServerEnvelope, SubscriptionTopic } from "../shared/protocol"
-import type { ChatDiffSnapshot, ChatSnapshot, SidebarData } from "../shared/types"
+import type { ChatDiffSnapshot, ChatSnapshot, SidebarData, StartupSyncSnapshot } from "../shared/types"
 import { DEMO_UNAVAILABLE_MESSAGE, DemoBackend, type DemoClock } from "./backend"
 import { createUnifiedPatch } from "./patch"
 import { DEMO_FEATURED_CHAT_ID } from "./scenario"
@@ -77,6 +77,21 @@ function findRow(sidebar: SidebarData, chatId: string) {
 }
 
 describe("DemoBackend", () => {
+  test("startup sync is disabled and idle so the demo does not block on native imports", () => {
+    const { subscribe, latest } = createHarness()
+    const snapshot = latest<StartupSyncSnapshot>(subscribe({ type: "startup-sync" }))
+
+    expect(snapshot).toEqual({
+      enabled: false,
+      mode: "session-sync",
+      status: "idle",
+      messages: [],
+      startedAt: null,
+      completedAt: null,
+      error: null,
+    } satisfies StartupSyncSnapshot)
+  })
+
   test("opens with a chat running, one waiting on the user, and one unread", () => {
     const { subscribe, latest } = createHarness()
     const sidebar = latest<SidebarData>(subscribe({ type: "sidebar", patches: true }))

@@ -6,6 +6,7 @@
 
 - Search chat contents across a project from a standalone floating panel available before selecting a chat, with archived-chat and tool filters, pagination, and exact-message navigation.
 - Search the complete current chat transcript from the widgets sidebar, with result snippets, exact-message navigation, and optional tool call and result matching.
+- Optional startup import of native Claude and Codex sessions with progress reporting.
 
 ### Fixes
 
@@ -67,6 +68,7 @@ That's it. Kanna opens in your browser at [`localhost:3210`](http://localhost:32
 - **Bundled Pi agent** — the [pi coding agent](https://github.com/badlogic/pi-mono) ships as a dependency and runs in-process through the Model Registry (Settings): point it at OpenRouter, OpenAI, or any custom OpenAI-compatible endpoint, pin fave models to the picker, and use any model id with standardized reasoning efforts — no local pi installation involved
 - **Project-first sidebar** — chats grouped under projects, with live status indicators (idle, running, waiting, failed)
 - **Drag-and-drop project ordering** — reorder project groups in the sidebar with persistent ordering
+- **Session import (beta)** — import native Claude and Codex CLI sessions into Kanna on startup
 - **Local project discovery** — auto-discovers projects from both Claude and Codex local history
 - **Rich transcript rendering** — hydrated tool calls, collapsible tool groups, plan mode dialogs, and interactive prompts with full result display
 - **Quick responses** — lightweight structured queries (e.g. title generation) via Haiku with automatic Codex fallback
@@ -86,6 +88,7 @@ Bun Server (HTTP + WS)
     ├── AgentCoordinator ─── multi-provider turn management
     ├── ProviderCatalog ─── provider/model/effort normalization
     ├── QuickResponseAdapter ─── structured queries with provider fallback
+    ├── SessionImport ─── opt-in native Claude/Codex session import
     ├── EventStore ─── JSONL persistence + snapshot compaction
     └── ReadModels ─── derived views (sidebar, chat, projects)
     ↕  stdio
@@ -111,11 +114,22 @@ kanna                  # start with defaults (localhost only)
 kanna --port 4000      # custom port
 kanna --no-open        # don't open browser
 kanna --password <secret>      # require a password before loading the app
+kanna --sync-sessions          # import native Claude and Codex sessions on startup (beta)
 kanna --share                # create a public quick tunnel + terminal QR
 kanna --cloudflared <token>  # run a named Cloudflare tunnel from a token
 ```
 
 Default URL: `http://localhost:3210`
+
+### Session import (beta)
+
+Native Claude/Codex session import is opt-in because it can be slow:
+
+```bash
+kanna --sync-sessions
+```
+
+At startup, Kanna imports non-empty native Claude and Codex CLI sessions for known projects into the local Kanna store. Provider history remains the source of truth: reconciliation reads Claude history and Codex thread data without editing the original conversation history. Deleted or hidden sessions stay hidden, and imported or reconciled sessions are never started automatically. The browser shows a blocking progress dialog during import and until its result is dismissed.
 
 ### Network access (Tailscale / LAN)
 
@@ -231,6 +245,8 @@ src/
 │   ├── cursor-cli.ts / pi-agent.ts  Cursor and Pi provider adapters
 │   ├── provider-catalog.ts  Provider/model/effort normalization
 │   ├── quick-response.ts    Structured queries with provider fallback
+│   ├── session-sync.ts      Native Claude/Codex session import
+│   ├── startup-sync.ts      Startup sync progress snapshots for the UI
 │   ├── ws-router.ts WebSocket command routing & snapshot subscriptions
 │   ├── skills.ts    Skill search/install/uninstall
 │   ├── event-store.ts  JSONL persistence, replay & compaction

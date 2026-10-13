@@ -5,7 +5,7 @@ import { homedir } from "node:os"
 import path from "node:path"
 import { getDataDir, LOG_PREFIX } from "../shared/branding"
 import { toMessagePreview } from "../shared/message-preview"
-import { buildTranscriptOutline, findTranscriptWindowStart } from "../shared/transcript-window"
+import { buildTranscriptOutline, findTranscriptWindowStart, snapToRowStart } from "../shared/transcript-window"
 import type { TranscriptOutlineEntry } from "../shared/types"
 import type { AgentProvider, QueuedChatMessage, ResolvedChatReadAnchor, TranscriptEntry } from "../shared/types"
 import { STORE_VERSION } from "../shared/types"
@@ -207,6 +207,10 @@ function summarizeForkedTranscript(entries: TranscriptEntry[]) {
   return summary
 }
 
+function providerSessionKey(provider: AgentProvider, sessionToken: string) {
+  return `${provider}:${sessionToken}`
+}
+
 function normalizeSidebarProjectOrder(value: unknown) {
   if (!Array.isArray(value)) {
     return []
@@ -255,32 +259,36 @@ function getReplayEventPriority(event: StoreEvent) {
       return 2
     case "message_appended":
       return 3
+    case "chat_transcript_metadata_set":
+      return 4
     case "queued_message_enqueued":
     case "queued_message_removed":
-      return 4
-    case "turn_started":
       return 5
+    case "turn_started":
+      return 6
     case "session_token_set":
-      return 6
+      return 7
     case "pending_fork_session_token_set":
-      return 6
+      return 7
     case "turn_cancelled":
     case "turn_resume_pending_set":
-      return 7
+      return 8
     case "turn_finished":
     case "turn_failed":
-      return 8
+      return 9
+    case "chat_synced":
+    case "provider_session_hidden":
     case "chat_read_state_set":
     case "chat_done_state_set":
     case "chat_read_anchor_set":
     case "chat_files_touched":
     case "chat_last_message_at_set":
-      return 9
+      return 10
     case "chat_pin_set":
     case "chat_deleted":
     case "chat_archived":
     case "chat_unarchived":
-      return 10
+      return 11
   }
 }
 
@@ -300,6 +308,23 @@ function getForkedChatTitle(title: string) {
   return trimmed.startsWith("Fork: ") ? trimmed : `Fork: ${trimmed}`
 }
 
+export interface TranscriptSyncProviderRecord {
+  providerKey: string
+  providerHash: string
+  matchKey: string
+}
+
+export interface TranscriptSyncState {
+  v: 1
+  /** Old hashes may have acknowledged metadata that reconciliation discarded. */
+  canonicalMetadataVersion?: 1
+  provider: AgentProvider
+  sessionToken: string
+  transcriptHash: string
+  canonicalHash: string
+  providerSequence: TranscriptSyncProviderRecord[]
+}
+
 export class EventStore {
   readonly dataDir: string
   readonly state: StoreState = createEmptyState()
@@ -315,6 +340,7 @@ export class EventStore {
   /** Written once `slimTranscripts` has swept this data dir. */
   private readonly slimMarkerPath: string
   private readonly sidebarProjectOrderPath: string
+  private readonly transcriptSyncDir: string
   private legacyMessagesByChatId = new Map<string, TranscriptEntry[]>()
   private legacySidebarProjectOrder: string[] = []
   private sidebarProjectOrder: string[] = []
@@ -337,6 +363,8 @@ export class EventStore {
    * which fires per streamed token.
    */
   onTurnEnded?: (chatId: string) => void
+  /** A provider reconciliation replaced rows rather than appending them. */
+  onTranscriptReplaced?: (chatId: string) => void
   /**
    * Fired when a turn begins, so file tracking can snapshot the worktree before
    * the agent touches it. Paired with `onTurnEnded`.
@@ -354,6 +382,7 @@ export class EventStore {
     this.transcriptsDir = path.join(this.dataDir, "transcripts")
     this.slimMarkerPath = path.join(this.dataDir, "transcripts-slim.json")
     this.sidebarProjectOrderPath = path.join(this.dataDir, SIDEBAR_PROJECT_ORDER_FILE)
+    this.transcriptSyncDir = path.join(this.dataDir, "transcript-sync")
   }
 
   private transcriptsDirReady = false
@@ -367,6 +396,7 @@ export class EventStore {
   async initialize() {
     await mkdir(this.dataDir, { recursive: true })
     await this.ensureTranscriptsDir()
+    await mkdir(this.transcriptSyncDir, { recursive: true })
     await this.ensureFile(this.projectsLogPath)
     await this.ensureFile(this.chatsLogPath)
     await this.ensureFile(this.messagesLogPath)
@@ -482,6 +512,7 @@ export class EventStore {
           unread: chat.unread ?? false,
           readAnchor: chat.readAnchor ?? null,
           pendingForkSessionToken: chat.pendingForkSessionToken ?? null,
+          hasLocalTitleOverride: chat.hasLocalTitleOverride ?? false,
           // Snapshots written before base blobs carry bare paths; they keep
           // their old "any dirty match counts" reading rather than being
           // guessed a base that could expire them wrongly.
@@ -508,6 +539,14 @@ export class EventStore {
           this.legacyMessagesByChatId.set(messageSet.chatId, cloneTranscriptEntries(messageSet.entries))
         }
       }
+      if (parsed.hiddenProviderSessions?.length) {
+        for (const hiddenSession of parsed.hiddenProviderSessions) {
+          this.state.hiddenProviderSessionsByKey.set(
+            providerSessionKey(hiddenSession.provider, hiddenSession.sessionToken),
+            { ...hiddenSession }
+          )
+        }
+      }
     } catch (error) {
       console.warn(`${LOG_PREFIX} Failed to load snapshot, resetting local history:`, error)
       await this.clearStorage()
@@ -520,6 +559,7 @@ export class EventStore {
     this.state.projectIdsByPath.clear()
     this.state.chatsById.clear()
     this.state.queuedMessagesByChatId.clear()
+    this.state.hiddenProviderSessionsByKey.clear()
     this.sidebarProjectOrder = []
     this.legacySidebarProjectOrder = []
     this.transcriptCache.clear()
@@ -697,12 +737,14 @@ export class EventStore {
     switch (event.type) {
       case "project_opened": {
         const localPath = resolveLocalPath(event.localPath)
+        const existingProject = this.state.projectsById.get(event.projectId)
         const project = {
           id: event.projectId,
           localPath,
           title: event.title,
           createdAt: event.timestamp,
           updatedAt: event.timestamp,
+          ...(existingProject?.sidebarTitle ? { sidebarTitle: existingProject.sidebarTitle } : {}),
         }
         this.state.projectsById.set(project.id, project)
         this.state.projectIdsByPath.set(localPath, project.id)
@@ -742,6 +784,7 @@ export class EventStore {
           pendingForkSessionToken: null,
           hasMessages: false,
           lastTurnOutcome: null,
+          hasLocalTitleOverride: false,
           // Forks carry the source's turn-end timestamp on the create event
           // (they have no turn events of their own to replay).
           ...(event.lastTurnEndedAt != null ? { lastTurnEndedAt: event.lastTurnEndedAt } : {}),
@@ -762,6 +805,9 @@ export class EventStore {
         if (!chat) break
         chat.title = event.title
         chat.updatedAt = event.timestamp
+        if (event.markTitleOverride ?? true) {
+          chat.hasLocalTitleOverride = true
+        }
         break
       }
       case "chat_deleted": {
@@ -857,6 +903,41 @@ export class EventStore {
           delete chat.doneAt
         }
         chat.updatedAt = event.timestamp
+        break
+      }
+      case "chat_synced": {
+        const chat = this.state.chatsById.get(event.chatId)
+        if (!chat) break
+        chat.provider = event.provider
+        chat.sessionToken = event.sessionToken
+        chat.externalUpdatedAt = event.externalUpdatedAt
+        if (!chat.hasLocalTitleOverride && event.title?.trim()) {
+          chat.title = event.title.trim()
+        }
+        chat.updatedAt = Math.max(chat.updatedAt, event.timestamp)
+        break
+      }
+      case "provider_session_hidden": {
+        if (!event.sessionToken.trim()) break
+        this.state.hiddenProviderSessionsByKey.set(
+          providerSessionKey(event.provider, event.sessionToken),
+          {
+            provider: event.provider,
+            sessionToken: event.sessionToken,
+            hiddenAt: event.timestamp,
+          }
+        )
+        break
+      }
+      case "chat_transcript_metadata_set": {
+        this.applyTranscriptMetadata(event.chatId, {
+          hasMessages: event.hasMessages,
+          lastMessageAt: event.lastMessageAt,
+          lastUserMessagePreview: event.lastUserMessagePreview,
+          lastAgentMessagePreview: event.lastAgentMessagePreview,
+          lastAgentMessageAt: event.lastAgentMessageAt,
+          lastAgentMessagePreviewAt: event.lastAgentMessagePreviewAt,
+        }, event.timestamp)
         break
       }
       case "message_appended": {
@@ -1107,6 +1188,43 @@ export class EventStore {
     return this.getTranscriptEntries(chatId).length
   }
 
+  private applyTranscriptMetadata(
+    chatId: string,
+    metadata: {
+      hasMessages: boolean
+      lastMessageAt: number | null
+      lastUserMessagePreview: string | null
+      lastAgentMessagePreview: string | null
+      lastAgentMessageAt?: number | null
+      lastAgentMessagePreviewAt?: number | null
+    },
+    timestamp: number
+  ) {
+    const chat = this.state.chatsById.get(chatId)
+    if (!chat) return
+    chat.hasMessages = metadata.hasMessages
+    if (metadata.lastMessageAt === null) {
+      delete chat.lastMessageAt
+    } else {
+      chat.lastMessageAt = metadata.lastMessageAt
+    }
+    if (metadata.lastUserMessagePreview === null) {
+      delete chat.lastUserMessagePreview
+    } else {
+      chat.lastUserMessagePreview = metadata.lastUserMessagePreview
+    }
+    if (metadata.lastAgentMessagePreview === null) {
+      delete chat.lastAgentMessagePreview
+    } else {
+      chat.lastAgentMessagePreview = metadata.lastAgentMessagePreview
+    }
+    if (metadata.lastAgentMessageAt === null) delete chat.lastAgentMessageAt
+    else if (metadata.lastAgentMessageAt !== undefined) chat.lastAgentMessageAt = metadata.lastAgentMessageAt
+    if (metadata.lastAgentMessagePreviewAt === null) delete chat.lastAgentMessagePreviewAt
+    else if (metadata.lastAgentMessagePreviewAt !== undefined) chat.lastAgentMessagePreviewAt = metadata.lastAgentMessagePreviewAt
+    chat.updatedAt = Math.max(chat.updatedAt, timestamp)
+  }
+
   private append<TEvent extends StoreEvent>(filePath: string, event: TEvent) {
     const payload = `${JSON.stringify(event)}\n`
     const write = this.enqueueWrite(async () => {
@@ -1167,6 +1285,7 @@ export class EventStore {
   private async removeTranscriptFiles(chatId: string) {
     await rm(this.transcriptPath(chatId), { force: true })
     await rm(this.payloadSidecarPath(chatId), { force: true })
+    await rm(this.transcriptSyncPath(chatId), { force: true })
     await removeTranscriptMedia(this.dataDir, chatId)
     this.dropTranscriptCaches(chatId)
   }
@@ -1234,6 +1353,10 @@ export class EventStore {
       this.dropTranscriptCaches(oldest)
       this.diagnostics?.record("transcript_cache_evictions")
     }
+  }
+
+  private transcriptSyncPath(chatId: string) {
+    return path.join(this.transcriptSyncDir, `${chatId}.json`)
   }
 
   private loadTranscriptFromDisk(chatId: string) {
@@ -1338,7 +1461,7 @@ export class EventStore {
     return write
   }
 
-  async createChat(projectId: string) {
+  async createChat(projectId: string, options: { title?: string } = {}) {
     const project = this.state.projectsById.get(projectId)
     if (!project || project.deletedAt) {
       throw new Error("Project not found")
@@ -1350,7 +1473,7 @@ export class EventStore {
       timestamp: Date.now(),
       chatId,
       projectId,
-      title: "New Chat",
+      title: options.title?.trim() || "New Chat",
     }
     await this.append(this.chatsLogPath, event)
     return this.state.chatsById.get(chatId)!
@@ -1477,7 +1600,7 @@ export class EventStore {
     return this.state.chatsById.get(chatId)!
   }
 
-  async renameChat(chatId: string, title: string) {
+  async renameChat(chatId: string, title: string, options: { markTitleOverride?: boolean } = {}) {
     const trimmed = title.trim()
     if (!trimmed) return
     const chat = this.requireChat(chatId)
@@ -1488,12 +1611,16 @@ export class EventStore {
       timestamp: Date.now(),
       chatId,
       title: trimmed,
+      markTitleOverride: options.markTitleOverride,
     }
     await this.append(this.chatsLogPath, event)
   }
 
   async deleteChat(chatId: string) {
-    this.requireChat(chatId)
+    const chat = this.requireChat(chatId)
+    if (chat.provider && chat.sessionToken?.trim()) {
+      await this.hideProviderSession(chat.provider, chat.sessionToken)
+    }
     const event: ChatEvent = {
       v: STORE_VERSION,
       type: "chat_deleted",
@@ -1566,6 +1693,9 @@ export class EventStore {
         continue
       }
 
+      if (chat.provider && chat.sessionToken?.trim()) {
+        await this.hideProviderSession(chat.provider, chat.sessionToken)
+      }
       const event: ChatEvent = {
         v: STORE_VERSION,
         type: "chat_deleted",
@@ -1669,6 +1799,9 @@ export class EventStore {
       const lastActivityAt = chat.lastMessageAt ?? chat.createdAt
       if (reference - lastActivityAt < maxAgeMs) continue
 
+      if (chat.provider && chat.sessionToken?.trim()) {
+        await this.hideProviderSession(chat.provider, chat.sessionToken)
+      }
       const event: ChatEvent = {
         v: STORE_VERSION,
         type: "chat_deleted",
@@ -1852,6 +1985,11 @@ export class EventStore {
     return findTranscriptWindowStart(entries, { endExclusive: start, assistantMessages: options.assistantMessages })
   }
 
+  /** Revalidate a retained boundary against current rows without loading payloads. */
+  snapTranscriptWindowStart(chatId: string, start: number): number {
+    return snapToRowStart(this.getTranscriptEntries(chatId), start)
+  }
+
   /**
    * `_id` of the entry at an absolute index, or null when the index is out of
    * range or sits before the loaded window.
@@ -1943,6 +2081,75 @@ export class EventStore {
       }
     })
     return write
+  }
+
+  private createTranscriptMetadataEvent(chatId: string, entries: TranscriptEntry[]): ChatEvent {
+    let lastMessageAt: number | undefined
+    let lastAgentMessageAt: number | undefined
+    let lastAgentMessagePreviewAt: number | undefined
+    let lastUserMessagePreview: string | undefined
+    let lastAgentMessagePreview: string | undefined
+    for (const entry of entries) {
+      if (isAgentAuthoredEntry(entry)) lastAgentMessageAt = Math.max(lastAgentMessageAt ?? 0, entry.createdAt)
+      if (entry.kind === "user_prompt") {
+        lastMessageAt = Math.max(lastMessageAt ?? 0, entry.createdAt)
+        if (!entry.hidden) {
+          const preview = buildChatMessagePreview(entry.content)
+          if (preview) lastUserMessagePreview = preview
+        }
+      } else if (entry.kind === "assistant_text" && !entry.hidden && !entry.parentToolUseId) {
+        const preview = buildChatMessagePreview(entry.text)
+        if (preview) {
+          lastAgentMessagePreview = preview
+          lastAgentMessagePreviewAt = entry.createdAt
+        }
+      }
+    }
+
+    return {
+      v: STORE_VERSION,
+      type: "chat_transcript_metadata_set",
+      timestamp: Date.now(),
+      chatId,
+      hasMessages: entries.length > 0,
+      lastMessageAt: lastMessageAt ?? null,
+      lastAgentMessageAt: lastAgentMessageAt ?? null,
+      lastAgentMessagePreviewAt: lastAgentMessagePreviewAt ?? null,
+      lastUserMessagePreview: lastUserMessagePreview ?? null,
+      lastAgentMessagePreview: lastAgentMessagePreview ?? null,
+    }
+  }
+
+  async replaceTranscript(chatId: string, entries: TranscriptEntry[]) {
+    this.requireChat(chatId)
+    const transcriptPath = this.transcriptPath(chatId)
+    const tempPath = `${transcriptPath}.${crypto.randomUUID()}.tmp`
+    return this.enqueueWrite(async () => {
+      await this.ensureTranscriptsDir()
+      const inlineToolIds = new Set(entries.flatMap(entry =>
+        entry.kind === "tool_call" && INLINE_TOOL_KINDS.has(entry.tool.toolKind) ? [entry.tool.toolId] : []))
+      const headers: TranscriptEntry[] = []
+      for (const entry of entries) {
+        const stored = await externalizeEntryImages(entry, { dataDir: this.dataDir, chatId })
+        const { header, payload } = splitTranscriptEntry(stored, toolId => inlineToolIds.has(toolId))
+        if (payload) await appendFile(this.payloadSidecarPath(chatId), serializeTranscriptPayload(payload), "utf8")
+        headers.push(header)
+      }
+      const text = headers.map(entry => JSON.stringify(entry)).join("\n")
+      await writeFile(tempPath, text ? `${text}\n` : "", "utf8")
+      await rename(tempPath, transcriptPath)
+      const metadataEvent = this.createTranscriptMetadataEvent(chatId, entries)
+      // The transcript rename committed the replacement. Publish its headers,
+      // payload index and derived metadata even if the journal append fails.
+      this.dropTranscriptCaches(chatId)
+      this.setCachedTranscript(chatId, cloneTranscriptEntries(headers))
+      this.applyEvent(metadataEvent)
+      try {
+        await appendFile(this.chatsLogPath, `${JSON.stringify(metadataEvent)}\n`, "utf8")
+      } finally {
+        this.onTranscriptReplaced?.(chatId)
+      }
+    })
   }
 
   async enqueueMessage(chatId: string, message: Omit<QueuedChatMessage, "id" | "createdAt"> & Partial<Pick<QueuedChatMessage, "id" | "createdAt">>) {
@@ -2124,6 +2331,20 @@ export class EventStore {
     await this.append(this.turnsLogPath, event)
   }
 
+  async hideProviderSession(provider: AgentProvider, sessionToken: string) {
+    if (!sessionToken.trim()) return
+    const key = providerSessionKey(provider, sessionToken)
+    if (this.state.hiddenProviderSessionsByKey.has(key)) return
+    const event: ChatEvent = {
+      v: STORE_VERSION,
+      type: "provider_session_hidden",
+      timestamp: Date.now(),
+      provider,
+      sessionToken,
+    }
+    await this.append(this.chatsLogPath, event)
+  }
+
   async setPendingForkSessionToken(chatId: string, pendingForkSessionToken: string | null) {
     const chat = this.requireChat(chatId)
     if ((chat.pendingForkSessionToken ?? null) === pendingForkSessionToken) return
@@ -2135,6 +2356,42 @@ export class EventStore {
       pendingForkSessionToken,
     }
     await this.append(this.turnsLogPath, event)
+  }
+
+  async syncChat(args: {
+    chatId: string
+    provider: AgentProvider
+    sessionToken: string
+    externalUpdatedAt: number
+    title?: string | null
+  }) {
+    const chat = this.state.chatsById.get(args.chatId)
+    if (!chat) {
+      throw new Error("Chat not found")
+    }
+
+    const normalizedTitle = args.title?.trim() || null
+    const shouldUpdateTitle = normalizedTitle && !chat.hasLocalTitleOverride && chat.title !== normalizedTitle
+    if (
+      chat.provider === args.provider
+      && chat.sessionToken === args.sessionToken
+      && chat.externalUpdatedAt === args.externalUpdatedAt
+      && !shouldUpdateTitle
+    ) {
+      return
+    }
+
+    const event: ChatEvent = {
+      v: STORE_VERSION,
+      type: "chat_synced",
+      timestamp: Date.now(),
+      chatId: args.chatId,
+      provider: args.provider,
+      sessionToken: args.sessionToken,
+      externalUpdatedAt: args.externalUpdatedAt,
+      title: normalizedTitle,
+    }
+    await this.append(this.chatsLogPath, event)
   }
 
   getProject(projectId: string) {
@@ -2256,6 +2513,54 @@ export class EventStore {
     return [...this.state.projectsById.values()].filter((project) => !project.deletedAt)
   }
 
+  getTranscriptSyncState(chatId: string) {
+    const statePath = this.transcriptSyncPath(chatId)
+    if (!existsSync(statePath)) {
+      return null
+    }
+
+    try {
+      const text = readFileSyncImmediate(statePath, "utf8")
+      if (!text.trim()) return null
+      return JSON.parse(text) as TranscriptSyncState
+    } catch {
+      return null
+    }
+  }
+
+  async setTranscriptSyncState(chatId: string, state: TranscriptSyncState) {
+    this.requireChat(chatId)
+    const syncPath = this.transcriptSyncPath(chatId)
+    const tempPath = `${syncPath}.${crypto.randomUUID()}.tmp`
+    const payload = JSON.stringify(state, null, 2)
+    return this.enqueueWrite(async () => {
+      await mkdir(this.transcriptSyncDir, { recursive: true })
+      await writeFile(tempPath, payload, "utf8")
+      await rename(tempPath, syncPath)
+    })
+  }
+
+  findChatByProviderSession(
+    provider: AgentProvider,
+    sessionToken: string,
+    options: { includeDeleted?: boolean } = {}
+  ) {
+    for (const chat of this.state.chatsById.values()) {
+      if (chat.provider !== provider || chat.sessionToken !== sessionToken) {
+        continue
+      }
+      if (chat.deletedAt && !options.includeDeleted) {
+        continue
+      }
+      return chat
+    }
+    return null
+  }
+
+  isProviderSessionHidden(provider: AgentProvider, sessionToken: string) {
+    return this.state.hiddenProviderSessionsByKey.has(providerSessionKey(provider, sessionToken))
+  }
+
   listChatsByProject(projectId: string) {
     return [...this.state.chatsById.values()]
       .filter((chat) => chat.projectId === projectId && !chat.deletedAt && !chat.archivedAt)
@@ -2305,6 +2610,8 @@ export class EventStore {
             attachments: [...entry.attachments],
           })),
         })),
+      hiddenProviderSessions: [...this.state.hiddenProviderSessionsByKey.values()]
+        .map((entry) => ({ ...entry })),
     }
   }
 
@@ -2339,6 +2646,8 @@ export class EventStore {
       const payload = entries.map((entry) => JSON.stringify(entry)).join("\n")
       await writeFile(tempPath, payload ? `${payload}\n` : "", "utf8")
       await rename(tempPath, transcriptPath)
+      const metadataEvent = this.createTranscriptMetadataEvent(chatId, entries)
+      this.applyEvent(metadataEvent)
       if (logEveryChat || (index + 1) % 25 === 0 || index === messageSets.length - 1) {
         onProgress?.(`${LOG_PREFIX} transcript migration: ${index + 1}/${messageSets.length} chats`)
       }
