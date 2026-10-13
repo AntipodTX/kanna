@@ -2421,6 +2421,11 @@ describe("AgentCoordinator codex integration", () => {
       store: store as never,
       onStateChange: () => {},
       codexManager: {
+        async readPromptHistory() {
+          return { inputs: store.messages.filter((e) => e.kind === "user_prompt").map((e, i) => ({
+            turnId: `native-${i}`, promptId: e._id, text: (e as { content: string }).content, userIndex: 0,
+          })) }
+        },
         async startSession() {
           return "thread-1"
         },
@@ -2524,6 +2529,11 @@ describe("AgentCoordinator codex integration", () => {
       store: store as never,
       onStateChange: () => {},
       codexManager: {
+        async readPromptHistory() {
+          return { inputs: store.messages.filter((e) => e.kind === "user_prompt").map((e, i) => ({
+            turnId: `native-${i}`, promptId: e._id, text: (e as { content: string }).content, userIndex: 0,
+          })) }
+        },
         async startSession() {
           return "thread-1"
         },
@@ -2591,6 +2601,11 @@ describe("AgentCoordinator codex integration", () => {
       store: store as never,
       onStateChange: () => {},
       codexManager: {
+        async readPromptHistory() {
+          return { inputs: store.messages.filter((e) => e.kind === "user_prompt").map((e, i) => ({
+            turnId: `native-${i}`, promptId: e._id, text: (e as { content: string }).content, userIndex: 0,
+          })) }
+        },
         async startSession() {
           return "thread-1"
         },
@@ -6329,6 +6344,7 @@ function createForkableFakeStore(
     async setContextRestoration(chatId: string, restoration: any) { (this.requireChat(chatId) as any).contextRestoration = restoration },
     async acknowledgeContextRestoration(chatId: string, id: string) { const chat = this.requireChat(chatId) as any; if (chat.contextRestoration?.id === id) chat.contextRestoration = null },
     getPromptHistoryEntries(chatId:string) {return this.getMessages(chatId)},
+    hasUserPrompt(chatId: string, id: string) { return this.getMessages(chatId).some(entry => entry.kind === "user_prompt" && entry._id === id) },
     getEntryIdAt(chatId:string,index:number) {return (messagesByChatId.get(chatId) ?? [])[index]?._id??null},
     async setChatProvider(chatId: string, nextProvider: "claude" | "codex") {
       this.requireChat(chatId).provider = nextProvider
