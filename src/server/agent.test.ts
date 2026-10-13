@@ -5128,6 +5128,57 @@ const readinessGate = () => {
 
     await waitFor(() => closeCalls.length > 0)
   })
+
+
+  test("a reserved Claude edit excludes background resume and idle close while its native mapping is pending", async () => {
+    const store = createFakeStore()
+    const events = new AsyncEventQueue<any>()
+    const mapping = readinessGate()
+    const mappingStarted = readinessGate()
+    const backgroundConsumed = readinessGate()
+    let backgroundState!: (state: "inactive") => void
+    let closes = 0
+    let starts = 0
+    let promptId: string | undefined
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      prepareClaudeSession: async (args) => { mappingStarted.release(); await mapping.ready;
+        return { sessionToken: "prepared-session", transcriptPrefix: args.transcriptPrefix } },
+      startClaudeSession: async (args) => {
+        starts++
+        backgroundState = args.onBackgroundWorkStateChange!
+        return { provider: "claude", stream: events, echoesPromptIds: true,
+          interrupt: async () => {}, close: () => { closes++ }, setModel: async () => {}, setPermissionMode: async () => {},
+          sendPrompt: async (_content, id) => { promptId = id },
+        }
+      },
+    })
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "first" })
+    events.push({ type: "session_token", sessionToken: "source-session" })
+    events.push({ type: "transcript", entry: timestamped({ kind: "assistant_text", text: "answer", messageId: "source-answer" }) })
+    events.push({ type: "transcript", promptIds: [promptId], entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) })
+    await waitFor(() => store.turnFinishedCount === 1)
+    const target = timestamped({ kind: "user_prompt", content: "second" })
+    store.messages.push(target)
+    const edit = coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: target._id, content: "edited" })
+    try {
+      await mappingStarted.ready
+      const queued = await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "queued" })
+      expect(queued).toMatchObject({ queued: true })
+      backgroundState("inactive")
+      expect((coordinator as any).isIdleSessionCloseEligible("chat-1")).toBe(false)
+      const append = store.appendMessage.bind(store)
+      store.appendMessage = async (chatId, entry) => { await append(chatId, entry); if (entry.kind === "status") backgroundConsumed.release() }
+      events.push({ type: "transcript", entry: timestamped({ kind: "assistant_text", text: "background wakeup" }) })
+      events.push({ type: "transcript", entry: timestamped({ kind: "status", status: "running" }) })
+      await backgroundConsumed.ready
+      expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+      expect(store.turnStartedCounts).toHaveLength(1)
+      expect(closes).toBe(0)
+      mapping.release()
+      await edit
+      expect(starts).toBe(2)
+    } finally { mapping.release(); await edit.catch(() => {}); events.close() }
+  })
 })
 
 describe("buildConcurrentAgentsNotice", () => {
