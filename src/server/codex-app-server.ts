@@ -40,17 +40,25 @@ import {
   type FileChangeRequestApprovalParams,
   type FileChangeRequestApprovalResponse,
   type InitializeParams,
+  type AgentMessageDeltaNotification,
   type ItemCompletedNotification,
   type ItemStartedNotification,
   type JsonRpcResponse,
   type McpToolCallItem,
-  type PlanDeltaNotification,
-  type ServerNotification,
-  type ServerRequest,
   type ModelListParams,
   type ModelListResponse,
+  type PlanDeltaNotification,
+  type RawResponseItemCompletedNotification,
+  type ServerNotification,
+  type ServerRequest,
   type SkillsListParams,
   type SkillsListResponse,
+  type Thread,
+  type ThreadListParams,
+  type ThreadListResponse,
+  type ThreadReadParams,
+  type ThreadReadResponse,
+  type ThreadSourceKind,
   type ThreadItem,
   type ThreadResumeParams,
   type ThreadResumeResponse,
@@ -104,6 +112,9 @@ interface PendingTurn {
   latestPlanSteps: TurnPlanStep[]
   latestPlanText: string | null
   planTextByItemId: Map<string, string>
+  agentMessageDeltaText: string
+  rawResponseText: string
+  emittedAssistantText: boolean
   todoSequence: number
   pendingWebSearchResultToolId: string | null
   /**
@@ -142,6 +153,19 @@ interface SessionContext {
   closed: boolean
 }
 
+function isActiveTurnNotification(
+  context: SessionContext,
+  pendingTurn: PendingTurn,
+  threadId?: string,
+  turnId?: string
+): boolean {
+  // Unscoped notifications, notably protocol-level errors, apply to the active turn.
+  if (!threadId && !turnId) return true
+  if (context.sessionToken && threadId && threadId !== context.sessionToken) return false
+  if (pendingTurn.turnId && turnId && turnId !== pendingTurn.turnId) return false
+  return true
+}
+
 export interface StartCodexSessionArgs {
   customTools?: KannaToolHost
   chatId: string
@@ -157,6 +181,7 @@ export interface StartCodexTurnArgs {
   model: string
   effort?: CodexReasoningEffort
   serviceTier?: ServiceTier
+  outputSchema?: Record<string, unknown>
   content: string
   /**
    * Skills the prompt names, resolved. Each one adds a structured
@@ -178,6 +203,7 @@ export interface GenerateStructuredArgs {
   model?: string
   effort?: CodexReasoningEffort
   serviceTier?: ServiceTier
+  outputSchema?: Record<string, unknown>
 }
 
 function codexSystemInitEntry(model: string): TranscriptEntry {
@@ -221,7 +247,7 @@ function errorDetail(error: CodexError): string {
 function formatCodexError(error: CodexError | null | undefined): string {
   if (!error) return ""
   const message = error.message?.trim() ?? ""
-  const detail = errorDetail(error)
+  const detail = [errorDetail(error), typeof error.additionalDetails === "string" ? error.additionalDetails.trim() : ""].filter(Boolean).join(": ")
   if (!detail || message.includes(detail)) return message
   return message ? `${message}: ${detail}` : detail
 }
@@ -249,12 +275,17 @@ function parseJsonLine(line: string): unknown | null {
   }
 }
 
-function isRecoverableResumeError(error: unknown): boolean {
+function isMissingThreadError(error: unknown): boolean {
   const message = errorMessage(error).toLowerCase()
-  if (!message.includes("thread/resume")) return false
   return ["not found", "missing thread", "no such thread", "unknown thread", "does not exist"].some((snippet) =>
     message.includes(snippet)
   )
+}
+
+function isRecoverableResumeError(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase()
+  if (!message.includes("thread/resume")) return false
+  return isMissingThreadError(error)
 }
 
 const MULTI_SELECT_HINT_PATTERN = /\b(all that apply|select all|choose all|pick all|select multiple|choose multiple|pick multiple|multiple selections?|multiple choice|more than one|one or more)\b/i
@@ -380,8 +411,25 @@ function dynamicToolPayload(value: Record<string, unknown> | unknown[] | string 
   return { value }
 }
 
+function userMessageText(item: Extract<ThreadItem, { type: "userMessage" }>): string {
+  return item.content
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text)
+    .join("\n")
+}
+
 function webSearchQuery(item: Extract<ThreadItem, { type: "webSearch" }>): string {
   return item.query || item.action?.query || item.action?.queries?.find((query) => typeof query === "string") || ""
+}
+
+function rawResponseMessageText(item: RawResponseItemCompletedNotification["item"]): string {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return ""
+  if (item.type !== "message" || !Array.isArray(item.content)) return ""
+
+  return item.content
+    .filter((contentItem) => contentItem?.type === "output_text" && typeof contentItem.text === "string")
+    .map((contentItem) => contentItem.text)
+    .join("")
 }
 
 function genericDynamicToolCall(toolId: string, toolName: string, input: Record<string, unknown>): TranscriptEntry {
@@ -755,6 +803,32 @@ function itemToToolResults(item: ThreadItem): TranscriptEntry[] {
   }
 }
 
+export function codexThreadItemToTranscriptEntries(item: ThreadItem): TranscriptEntry[] {
+  if (item.type === "userMessage") {
+    const content = userMessageText(item)
+    return content
+      ? [timestamped({
+          kind: "user_prompt",
+          content,
+        })]
+      : []
+  }
+
+  if (item.type === "agentMessage" && item.text.trim()) {
+    return [timestamped({
+      kind: "assistant_text",
+      text: item.text,
+    })]
+  }
+
+  const entries = itemToToolCalls(item)
+  const hasStatus = "status" in item && typeof item.status === "string"
+  if (!hasStatus || item.status !== "inProgress") {
+    entries.push(...itemToToolResults(item))
+  }
+  return entries
+}
+
 export class CodexAppServerManager {
   private readonly sessions = new Map<string, SessionContext>()
   private readonly spawnProcess: SpawnCodexAppServer
@@ -805,27 +879,75 @@ export class CodexAppServerManager {
    * missing). Throws on protocol errors, including "method not found" from a
    * codex older than model/list — callers keep the static catalog then.
    */
-  async listModels(probeCwd: string): Promise<CodexModelSummary[] | null> {
+  async listModels(args: { cwd: string }): Promise<CodexModelSummary[]>
+  async listModels(probeCwd: string): Promise<CodexModelSummary[] | null>
+  async listModels(args: string | { cwd: string }): Promise<CodexModelSummary[] | null> {
+    if (typeof args !== "string") {
+      return await this.withProbe(args.cwd, (context) => this.requestModelList(context, true)) ?? []
+    }
     for (const context of this.sessions.values()) {
       if (context.closed) continue
       return await this.requestModelList(context)
     }
-    return await this.withProbe(probeCwd, (context) => this.requestModelList(context))
+    return await this.withProbe(args, (context) => this.requestModelList(context))
   }
 
-  private async requestModelList(context: SessionContext): Promise<CodexModelSummary[]> {
+  private async requestModelList(context: SessionContext, explicitPageSize = false): Promise<CodexModelSummary[]> {
     const models: CodexModelSummary[] = []
     let cursor: string | null | undefined
     do {
       const response = await this.sendRequest<ModelListResponse>(
         context,
         "model/list",
-        (cursor ? { cursor } : {}) satisfies ModelListParams,
+        (explicitPageSize
+          ? { cursor: cursor ?? null, includeHidden: false, limit: 200 }
+          : cursor ? { cursor } : {}) satisfies ModelListParams,
       )
       models.push(...(response.data ?? []).filter((model) => !model.hidden))
       cursor = response.nextCursor
     } while (cursor)
     return models
+  }
+
+  /** List persisted Codex threads for one project without opening a chat session. */
+  async listThreads(args: { cwd: string }): Promise<Thread[]> {
+    const threads = await this.withProbe(args.cwd, async (context) => {
+      const result: Thread[] = []
+      let cursor: string | null = null
+      const sourceKinds: ThreadSourceKind[] = ["cli", "vscode", "exec", "appServer", "unknown"]
+
+      do {
+        const response: ThreadListResponse = await this.sendRequest<ThreadListResponse>(context, "thread/list", {
+          cursor,
+          limit: 200,
+          sortKey: "updated_at",
+          sourceKinds,
+          archived: false,
+          cwd: args.cwd,
+        } satisfies ThreadListParams)
+        result.push(...response.data)
+        cursor = response.nextCursor ?? null
+      } while (cursor)
+
+      return result
+    })
+    return threads ?? []
+  }
+
+  /** Read one persisted Codex thread, including all turns. */
+  async readThread(args: { cwd: string; threadId: string }): Promise<Thread | null> {
+    return await this.withProbe(args.cwd, async (context) => {
+      try {
+        const response = await this.sendRequest<ThreadReadResponse>(context, "thread/read", {
+          threadId: args.threadId,
+          includeTurns: true,
+        } satisfies ThreadReadParams)
+        return response.thread
+      } catch (error) {
+        if (isMissingThreadError(error)) return null
+        throw error
+      }
+    })
   }
 
   /**
@@ -926,7 +1048,7 @@ export class CodexAppServerManager {
         approvalPolicy: "never",
         sandbox: "danger-full-access",
         experimentalRawEvents: false,
-        persistExtendedHistory: false,
+        persistExtendedHistory: true,
         ...toolConfig,
       } satisfies ThreadStartParams
 
@@ -943,7 +1065,7 @@ export class CodexAppServerManager {
           serviceTier: args.serviceTier,
           approvalPolicy: "never",
           sandbox: "danger-full-access",
-          persistExtendedHistory: false,
+          persistExtendedHistory: true,
           ...toolConfig,
         } satisfies ThreadForkParams)
       } else if (args.sessionToken) {
@@ -955,7 +1077,7 @@ export class CodexAppServerManager {
             serviceTier: args.serviceTier,
             approvalPolicy: "never",
             sandbox: "danger-full-access",
-            persistExtendedHistory: false,
+            persistExtendedHistory: true,
             ...toolConfig,
           } satisfies ThreadResumeParams)
         } catch (error) {
@@ -1001,6 +1123,9 @@ export class CodexAppServerManager {
       latestPlanSteps: [],
       latestPlanText: null,
       planTextByItemId: new Map(),
+      agentMessageDeltaText: "",
+      rawResponseText: "",
+      emittedAssistantText: false,
       todoSequence: 0,
       pendingWebSearchResultToolId: null,
       retryCause: null,
@@ -1030,6 +1155,7 @@ export class CodexAppServerManager {
         model: args.model,
         effort: args.effort,
         serviceTier: args.serviceTier,
+        outputSchema: args.outputSchema,
         collaborationMode: {
           mode: args.planMode ? "plan" : "default",
           settings: {
@@ -1102,6 +1228,7 @@ export class CodexAppServerManager {
     let turn: HarnessTurn | null = null
     let assistantText = ""
     let resultText = ""
+    let errorText = ""
 
     try {
       await this.startSession({
@@ -1117,6 +1244,7 @@ export class CodexAppServerManager {
         model: args.model ?? "gpt-5.5",
         effort: args.effort,
         serviceTier: args.serviceTier ?? "fast",
+        outputSchema: args.outputSchema,
         content: args.prompt,
         planMode: false,
         onToolRequest: async () => ({}),
@@ -1127,9 +1255,17 @@ export class CodexAppServerManager {
         if (event.entry.kind === "assistant_text") {
           assistantText += assistantText ? `\n${event.entry.text}` : event.entry.text
         }
-        if (event.entry.kind === "result" && !event.entry.isError && event.entry.result.trim()) {
-          resultText = event.entry.result
+        if (event.entry.kind === "result") {
+          if (event.entry.isError) {
+            errorText = event.entry.result.trim() || "Codex structured generation failed"
+          } else if (event.entry.result.trim()) {
+            resultText = event.entry.result
+          }
         }
+      }
+
+      if (errorText) {
+        throw new Error(errorText)
       }
 
       const candidate = assistantText.trim() || resultText.trim()
@@ -1402,7 +1538,34 @@ export class CodexAppServerManager {
         this.handleItemStarted(pendingTurn, notification.params)
         return
       case "item/completed":
-        this.handleItemCompleted(pendingTurn, notification.params)
+        this.handleItemCompleted(
+          pendingTurn,
+          notification.params,
+          isActiveTurnNotification(
+            context,
+            pendingTurn,
+            notification.params.threadId,
+            notification.params.turnId
+          )
+        )
+        return
+      case "item/agentMessage/delta":
+        if (!isActiveTurnNotification(
+          context,
+          pendingTurn,
+          notification.params.threadId,
+          notification.params.turnId
+        )) return
+        this.handleAgentMessageDelta(pendingTurn, notification.params)
+        return
+      case "rawResponseItem/completed":
+        if (!isActiveTurnNotification(
+          context,
+          pendingTurn,
+          notification.params.threadId,
+          notification.params.turnId
+        )) return
+        this.handleRawResponseItemCompleted(pendingTurn, notification.params)
         return
       case "item/plan/delta":
         this.handlePlanDelta(pendingTurn, notification.params)
@@ -1454,8 +1617,15 @@ export class CodexAppServerManager {
     }
   }
 
-  private handleItemCompleted(pendingTurn: PendingTurn, notification: ItemCompletedNotification) {
+  private handleItemCompleted(
+    pendingTurn: PendingTurn,
+    notification: ItemCompletedNotification,
+    isActiveTurn: boolean
+  ) {
     if (notification.item.type === "agentMessage") {
+      if (isActiveTurn && notification.item.text.trim()) {
+        pendingTurn.emittedAssistantText = true
+      }
       pendingTurn.queue.push({
         type: "transcript",
         entry: timestamped({
@@ -1506,6 +1676,23 @@ export class CodexAppServerManager {
         pendingTurn.pendingWebSearchResultToolId = notification.item.id
       }
     }
+  }
+
+  private handleAgentMessageDelta(
+    pendingTurn: PendingTurn,
+    notification: AgentMessageDeltaNotification
+  ) {
+    if (!notification.delta) return
+    pendingTurn.agentMessageDeltaText += notification.delta
+  }
+
+  private handleRawResponseItemCompleted(
+    pendingTurn: PendingTurn,
+    notification: RawResponseItemCompletedNotification
+  ) {
+    const text = rawResponseMessageText(notification.item)
+    if (!text) return
+    pendingTurn.rawResponseText += text
   }
 
   private handlePlanUpdated(pendingTurn: PendingTurn, notification: TurnPlanUpdatedNotification) {
@@ -1597,6 +1784,18 @@ export class CodexAppServerManager {
         context.pendingTurn = null
         return
       }
+    }
+
+    const fallbackAssistantText = (pendingTurn.rawResponseText || pendingTurn.agentMessageDeltaText).trim()
+    if (!isCancelled && !isError && !pendingTurn.emittedAssistantText && fallbackAssistantText) {
+      pendingTurn.emittedAssistantText = true
+      pendingTurn.queue.push({
+        type: "transcript",
+        entry: timestamped({
+          kind: "assistant_text",
+          text: fallbackAssistantText,
+        }),
+      })
     }
 
     pendingTurn.resolved = true
