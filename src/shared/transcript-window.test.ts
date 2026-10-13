@@ -1,11 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { TranscriptEntry } from "./types"
-import {
-  buildTranscriptOutline,
-  findTranscriptWindowStart,
-  snapToRowStart,
-  trimTranscriptWindow,
-} from "./transcript-window"
+import { buildTranscriptOutline, findTranscriptWindowStart, snapToRowStart, trimTranscriptWindow } from "./transcript-window"
 
 let counter = 0
 function entry(kind: string, extra: Record<string, unknown> = {}): TranscriptEntry {

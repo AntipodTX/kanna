@@ -1,3 +1,4 @@
+import { CodexPromptHistory, classifyCodexPromptHistory, planCodexPromptHistory, planCodexGapReplay, type CodexPromptBinding, type CodexPromptRecovery } from "./codex-prompt-history"
 import {
   query,
   type BackgroundTaskSummary,
@@ -32,16 +33,16 @@ import type {
   TranscriptEntry,
 } from "../shared/types"
 import { normalizeToolCall } from "../shared/tools"
-import type { ClientCommand } from "../shared/protocol"
+import type { ClientCommand, CodexHistoryActionsSnapshot } from "../shared/protocol"
 import { AsyncQueue } from "./async-queue"
 import { resolveClaudeExecutable } from "./claude-executable"
 import { KannaToolRuntime, KannaToolEventFilter, type KannaToolHost } from "./kanna-tools"
 import { createClaudeKannaTools } from "./kanna-tool-adapters"
 import { EventStore } from "./event-store"
-import { STRUCTURED_RESULT_TOOL_KINDS, type ContextRestoration } from "./events"
+import { STRUCTURED_RESULT_TOOL_KINDS, type ChatRecord, type ContextRestoration } from "./events"
 import type { AnalyticsReporter } from "./analytics"
 import { NoopAnalyticsReporter } from "./analytics"
-import { CodexAppServerManager } from "./codex-app-server"
+import { CodexAppServerManager, isMissingCodexHistoryBoundary } from "./codex-app-server"
 import { CursorCliManager } from "./cursor-cli"
 import { fetchGrokAccountUsage, GrokCliManager } from "./grok-cli"
 import { PiAgentManager, resolvePiConnection } from "./pi-agent"
@@ -82,6 +83,7 @@ import { asNumber, asRecord } from "../shared/json"
 import { buildHandoffContext, buildHandoffMessageContent } from "./handoff"
 import { checkSessionArtifact, type SessionArtifactStatus } from "./session-artifacts"
 import { timestamped } from "./transcript"
+import { prepareClaudeTranscriptFork, type PreparedClaudeTranscriptFork } from "./claude-fork"
 import {
   findWorkflowOf,
   finishActivity,
@@ -254,6 +256,9 @@ interface ActiveTurn {
   chatId: string
   provider: AgentProvider
   turn: HarnessTurn | null
+  startupPending?: boolean
+  startupAbort?: AbortController
+  toolsReady?: Promise<void>
   claudePromptSeq?: number
   model: string
   effort?: string
@@ -265,9 +270,7 @@ interface ActiveTurn {
   postToolFollowUp: { content: string; planMode: boolean } | null
   hasFinalResult: boolean
   contextRestorationId?: string
-  startupPending?: boolean
-  startupAbort?: AbortController
-  toolsReady?: Promise<void>
+  claudeSourceSessionToken?: string | null
   cancelRequested: boolean
   cancelRecorded: boolean
 }
@@ -309,6 +312,10 @@ interface ClaudeSessionState {
   sessionToken: string | null
   accountInfoLoaded: boolean
   forceClosed: boolean
+  /** Native events become durable only after the replacement history commits. */
+  publicationReady: Promise<void>
+  releasePublication: () => void
+  streamFailure?: Error
   nextPromptSeq: number
   /** Prompts sent and not yet answered, oldest first. */
   pendingPrompts: Array<{ seq: number; id: string }>
@@ -358,6 +365,8 @@ interface AgentCoordinatorArgs {
     sessionToken: string | null
     forkSession: boolean
     customTools?: KannaToolHost
+    resumeSessionAt?: string
+    resetSession?: boolean
     onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
     onRateLimitEvent?: (info: ClaudeRateLimitInfoRaw) => void
     onSubagentActivity?: (update: SubagentActivityUpdate) => void
@@ -372,8 +381,25 @@ interface AgentCoordinatorArgs {
     provider: AgentProvider,
     query: { cwd: string; sessionToken: string | null | undefined }
   ) => SessionArtifactStatus
+
+  prepareClaudeSession?: (args: {
+    localPath: string
+    sessionToken: string
+    resumeSessionAt?: string
+    boundarySessionToken?: string | null
+    transcriptPrefix: TranscriptEntry[]
+  }) => Promise<string | PreparedClaudeTranscriptFork>
 }
 
+async function prepareClaudeSession(args: {
+  localPath: string
+  sessionToken: string
+  resumeSessionAt?: string
+  boundarySessionToken?: string | null
+  transcriptPrefix: TranscriptEntry[]
+}) {
+  return prepareClaudeTranscriptFork(args)
+}
 
 function isClaudeSteerLoggingEnabled() {
   return process.env.KANNA_LOG_CLAUDE_STEER === "1"
@@ -419,6 +445,16 @@ interface SendMessageOptions {
   autoPlan?: boolean
 }
 
+interface ProviderSettings {
+  model: string
+  effort?: string
+  serviceTier?: "fast"
+  planMode: boolean
+  autoPlan: boolean
+  chatModel: string
+  chatModelOptions: ModelOptions
+}
+
 function stringFromUnknown(value: unknown) {
   if (typeof value === "string") return value
   try {
@@ -462,6 +498,19 @@ export function buildConcurrentAgentsNotice(chats: ConcurrentProjectChat[]): str
     ...lines,
     "</system-message>",
   ].join("\n")
+}
+
+export function buildClaudeSdkUserMessage(content: string, promptId?: string): SDKUserMessage {
+  return {
+    type: "user",
+    message: {
+      role: "user",
+      content,
+    },
+    parent_tool_use_id: null,
+    session_id: "",
+    ...(promptId ? { uuid: promptId as SDKUserMessage["uuid"] } : {}),
+  }
 }
 
 function escapeXmlAttribute(value: string) {
@@ -517,6 +566,55 @@ export function formatQuestionAnswersFollowUp(questions: AskUserQuestionItem[], 
   return `Here are my answers to your questions:\n\n${lines.join("\n")}`
 }
 
+function countUserPrompts(entries: TranscriptEntry[]) {
+  return entries.filter((entry) => entry.kind === "user_prompt").length
+}
+
+function parseClaudeDebugRecord(entry: TranscriptEntry) {
+  if (!entry.debugRaw) return null
+  try {
+    const raw = JSON.parse(entry.debugRaw) as unknown
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null
+    return raw as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+function hasClaudeSidechainMetadata(entry: TranscriptEntry) {
+  if (entry.parentToolUseId || entry.claudeSidechain) return true
+  const record = parseClaudeDebugRecord(entry)
+  if (!record) return false
+  if (typeof record.parent_tool_use_id === "string" && record.parent_tool_use_id.length > 0) return true
+  if (record.isSidechain === true) return true
+  if (typeof record.subagent_type === "string" && record.subagent_type.length > 0) return true
+  return false
+}
+
+function getClaudeDebugSessionToken(entry: TranscriptEntry) {
+  if (entry.claudeSessionToken) return entry.claudeSessionToken
+  const record = parseClaudeDebugRecord(entry)
+  if (!record) return null
+  if (typeof record.session_id === "string" && record.session_id.length > 0) return record.session_id
+  if (typeof record.sessionId === "string" && record.sessionId.length > 0) return record.sessionId
+  return null
+}
+
+function findPreviousClaudeResumePoint(entries: TranscriptEntry[], beforeIndex: number) {
+  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+    const entry = entries[index]
+    if (!entry?.messageId) continue
+    if (entry.kind === "assistant_text" || entry.kind === "tool_call") {
+      if (hasClaudeSidechainMetadata(entry)) continue
+      return {
+        messageId: entry.messageId,
+        sessionToken: getClaudeDebugSessionToken(entry),
+      }
+    }
+  }
+  return null
+}
+
 function discardedToolResult(
   tool: NormalizedToolCall & { toolKind: "ask_user_question" | "exit_plan_mode" | "codex_approval" }
 ) {
@@ -537,6 +635,10 @@ function discardedToolResult(
   return {
     discarded: true,
   }
+}
+
+function combineUserPromptContent(first: string, second: string) {
+  return [first.trim(), second.trim()].filter(Boolean).join("\n\n")
 }
 
 export function normalizeClaudeUsageSnapshot(
@@ -631,14 +733,23 @@ export function normalizeClaudeStreamMessage(
   }
 ): TranscriptEntry[] {
   const entries = normalizeClaudeStreamMessageEntries(message, options)
-  // Subagent (sidechain) messages arrive on the same iterator as the main
-  // thread, told apart only by this id. Stamp it on everything the message
-  // produced so readers can fold the subagent's work under its Agent row.
+  // Subagent messages share the main iterator. Keep their real parent when
+  // supplied, plus a sidechain marker when native metadata identifies a child
+  // without a parent id; resume boundaries must exclude both forms.
   const parentToolUseId = typeof message?.parent_tool_use_id === "string" && message.parent_tool_use_id
     ? message.parent_tool_use_id
     : undefined
-  if (!parentToolUseId) return entries
-  return entries.map((entry) => ({ ...entry, parentToolUseId }))
+  const claudeSessionToken = typeof message?.session_id === "string" && message.session_id
+    ? message.session_id
+    : typeof message?.sessionId === "string" && message.sessionId ? message.sessionId : undefined
+  const claudeSidechain = message?.isSidechain === true
+    || (typeof message?.subagent_type === "string" && message.subagent_type.length > 0)
+  return entries.map((entry) => ({
+    ...entry,
+    ...(parentToolUseId ? { parentToolUseId } : {}),
+    ...(claudeSessionToken ? { claudeSessionToken } : {}),
+    ...(claudeSidechain ? { claudeSidechain: true } : {}),
+  }))
 }
 
 function normalizeClaudeStreamMessageEntries(
@@ -963,6 +1074,8 @@ export async function startClaudeSession(args: {
   sessionToken: string | null
   forkSession: boolean
   customTools?: KannaToolHost
+  resumeSessionAt?: string
+  resetSession?: boolean
   onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
   onRateLimitEvent?: (info: ClaudeRateLimitInfoRaw) => void
   /**
@@ -1044,6 +1157,7 @@ export async function startClaudeSession(args: {
       model: args.model,
       effort: getServerClaudeRuntimeEffort(args.model, args.effort),
       resume: args.sessionToken ?? undefined,
+      resumeSessionAt: args.resumeSessionAt,
       forkSession: args.forkSession,
       permissionMode: args.planMode ? "plan" : "acceptEdits",
       canUseTool,
@@ -1096,6 +1210,7 @@ export async function startClaudeSession(args: {
     // A readable version passed the minimum-version gate, and every CLI from
     // that version on echoes prompt ids. An override wrapper reports none.
     echoesPromptIds: claudeExecutable.version !== null,
+    waitUntilReady: async () => { await nativeStartup },
     stream: createClaudeHarnessStream(q, {
       onCommandsChanged: (commands) => {
         commandsRef.current = commands
@@ -1136,16 +1251,7 @@ export async function startClaudeSession(args: {
       if (promptQueueClosed) {
         throw new Error("Cannot push to a closed queue")
       }
-      promptQueue.push({
-        type: "user",
-        message: {
-          role: "user",
-          content,
-        },
-        parent_tool_use_id: null,
-        session_id: args.sessionToken ?? "",
-        ...(promptId ? { uuid: promptId as SDKUserMessage["uuid"] } : {}),
-      })
+      promptQueue.push(buildClaudeSdkUserMessage(content, promptId))
     },
     setModel: async (model: string) => {
       await q.setModel(model)
@@ -1171,6 +1277,7 @@ export class AgentCoordinator {
   private readonly onStateChange: (chatId?: string, options?: { immediate?: boolean }) => void
   private readonly analytics: AnalyticsReporter
   private readonly codexManager: CodexAppServerManager
+  private readonly codexPromptHistory: CodexPromptHistory
   private readonly cursorManager: CursorCliManager
   private readonly grokManager: GrokCliManager
   private readonly piManager: PiAgentManager
@@ -1187,9 +1294,20 @@ export class AgentCoordinator {
   private cursorModelCatalogApplied = false
   private grokModelCatalogApplied = false
   private codexModelCatalogRefresh: Promise<void> | null = null
+  private readonly codexHistoryChecks = new Map<string, symbol>()
+  private readonly cancelledCodexHistoryChecks = new Set<symbol>()
   private readonly startingClaudeTurns = new Map<string, symbol>()
   private readonly claudeReadinessCommits = new Map<string, Promise<void>>()
   readonly activeTurns = new Map<string, ActiveTurn>()
+  private readonly historyOperations = new Map<string, {
+    cancelled: boolean; snapshot: string; sessionToken: string | null
+    turnCount: number | undefined
+    sourceSessionToken: string | null; pendingForkSessionToken: string | null
+    pendingForkResumeAt: string | null; pendingForkUserPrompt: boolean
+    codexHistoryIntegrity?: import("./events").CodexHistoryIntegrity
+    codexPrompts?: Record<string, CodexPromptBinding>
+    turn?: HarnessTurn; publicationStarted?: boolean; publicationCommitted?: boolean
+  }>()
   readonly drainingStreams = new Map<string, { turn: HarnessTurn }>()
   /**
    * Delegated work per chat, keyed by the provider's agent id: a log that
@@ -1217,9 +1335,25 @@ export class AgentCoordinator {
   private readonly codexSteerCompletions = new Map<string, Promise<string | undefined>>()
   private readonly pendingCodexSteers = new Map<string, Set<string>>()
   private readonly cancelingChats = new Set<string>()
+  private readonly preparedClaudeEditSessions = new Map<string, {
+    sourceSessionToken: string
+    resumeSessionAt: string
+    sessionToken: string
+    transcriptPrefix: TranscriptEntry[]
+  }>()
 
   constructor(args: AgentCoordinatorArgs) {
     this.store = args.store
+    this.codexPromptHistory = new CodexPromptHistory(args.store.dataDir, (chatId, binding) => {
+      const key = this.codexIntegrityKey(chatId)
+      const owner = this.activeTurns.get(chatId)
+      return async () => {
+        const chat = this.store.requireChat(chatId)
+        if (this.codexIntegrityKey(chatId) !== key || this.activeTurns.get(chatId) !== owner
+          || owner?.cancelRequested || (chat.sessionToken ?? chat.pendingForkSessionToken) !== binding.sessionToken) return
+        await this.saveCodexIntegrity(chatId)
+      }
+    })
     this.onStateChange = args.onStateChange
     this.analytics = args.analytics ?? NoopAnalyticsReporter
     this.codexManager = args.codexManager ?? new CodexAppServerManager()
@@ -1232,6 +1366,9 @@ export class AgentCoordinator {
         preferredProvider,
         useConfiguredProvider: false,
       }))
+    this.prepareClaudeSessionFn = args.prepareClaudeSession
+      ?? (args.startClaudeSession ? async ({ sessionToken }) => sessionToken : prepareClaudeSession)
+
     this.startClaudeSessionFn = args.startClaudeSession ?? startClaudeSession
     this.checkSessionArtifactFn = args.checkSessionArtifact ?? checkSessionArtifact
   }
@@ -1315,28 +1452,26 @@ export class AgentCoordinator {
   }
 
   dispose() {
+    for (const reservation of this.codexHistoryChecks.values()) this.cancelledCodexHistoryChecks.add(reservation)
+    for (const operation of this.historyOperations.values()) operation.cancelled = true
     this.startingClaudeTurns.clear()
-    for (const active of this.activeTurns.values()) if (active.provider === "codex") {
-      active.cancelRequested = true
-      active.customTools?.abort()
-      this.activeTurns.delete(active.chatId)
-    }
-    for (const session of this.claudeSessions.values()) {
-      session.forceClosed = true
-      session.session.close()
-    }
-    for (const stream of this.drainingStreams.values()) stream.turn.close()
-    this.claudeSessions.clear()
     for (const chatId of [...this.idleSessionTimers.keys()]) {
       this.clearIdleSessionTimer(chatId)
     }
     for (const [chatId, active] of this.activeTurns) {
-      if (!active.startupPending && !active.contextRestorationId) continue
+      if (active.provider !== "codex" && !active.startupPending && !active.contextRestorationId) continue
       active.cancelRequested = true
       active.startupAbort?.abort()
       active.customTools?.abort()
       this.activeTurns.delete(chatId)
     }
+    for (const session of this.claudeSessions.values()) {
+      session.forceClosed = true
+      session.releasePublication()
+      session.session.close()
+    }
+    this.claudeSessions.clear()
+    for (const stream of this.drainingStreams.values()) stream.turn.close()
     this.drainingStreams.clear()
     this.codexManager.stopAll()
     this.piManager.dispose()
@@ -1363,6 +1498,8 @@ export class AgentCoordinator {
 
   getActiveStatuses() {
     const statuses = new Map<string, KannaStatus>()
+    for (const chatId of this.historyOperations.keys()) statuses.set(chatId, "starting")
+    for (const chatId of this.codexHistoryChecks.keys()) statuses.set(chatId, "starting")
     for (const [chatId, turn] of this.activeTurns.entries()) {
       statuses.set(chatId, turn.status)
     }
@@ -1651,9 +1788,13 @@ export class AgentCoordinator {
 
   async closeChat(chatId: string) {
     this.clearIdleSessionTimer(chatId)
+    const checking = this.codexHistoryChecks.get(chatId)
+    if (checking) this.cancelledCodexHistoryChecks.add(checking)
+    const historyOperation = this.historyOperations.get(chatId)
+    if (historyOperation) historyOperation.cancelled = true
     this.startingClaudeTurns.delete(chatId)
     const startup = this.activeTurns.get(chatId)
-    if (startup && (startup.startupPending || startup.contextRestorationId)) {
+    if (startup && (startup.provider === "codex" || startup.startupPending || startup.contextRestorationId)) {
       startup.cancelRequested = true
       startup.startupAbort?.abort()
       startup.customTools?.abort()
@@ -1669,8 +1810,9 @@ export class AgentCoordinator {
     const claudeSession = this.claudeSessions.get(chatId)
     if (claudeSession) {
       claudeSession.forceClosed = true
-      claudeSession.session.close()
       this.claudeSessions.delete(chatId)
+      claudeSession.releasePublication()
+      claudeSession.session.close()
     }
     this.piManager.closeChat(chatId)
     this.codexManager.stopSession(chatId)
@@ -1730,61 +1872,98 @@ export class AgentCoordinator {
     return options.provider ?? currentProvider ?? "claude"
   }
 
-  private getProviderSettings(provider: AgentProvider, options: SendMessageOptions) {
+  private getProviderSettings(
+    provider: AgentProvider,
+    options: SendMessageOptions,
+    chat?: Pick<ChatRecord, "provider" | "model" | "modelOptions" | "planMode" | "autoPlan"> | null
+  ): ProviderSettings {
     const catalog = getServerProviderCatalog(provider)
+    const persistedModelSettings = chat?.provider === provider ? chat : undefined
+    const requestedModel = options.model ?? persistedModelSettings?.model ?? undefined
+    const requestedModelOptions = options.modelOptions
+    const persistedModelOptions = persistedModelSettings?.modelOptions ?? undefined
+    const requestedPlanMode = options.planMode ?? chat?.planMode ?? false
+    const requestedAutoPlan = options.autoPlan ?? chat?.autoPlan ?? false
     if (provider === "claude") {
-      const model = normalizeServerModel(provider, options.model)
-      const modelOptions = normalizeClaudeModelOptions(model, options.modelOptions, options.effort)
+      const model = normalizeServerModel(provider, requestedModel)
+      const modelOptions = normalizeClaudeModelOptions(
+        model,
+        requestedModelOptions,
+        options.effort,
+        persistedModelOptions,
+      )
       return {
         model: resolveClaudeApiModelId(model, modelOptions.contextWindow),
         effort: modelOptions.reasoningEffort,
         serviceTier: serviceTierFromModelOptions(modelOptions),
-        planMode: catalog.supportsPlanMode ? Boolean(options.planMode) : false,
-        autoPlan: catalog.supportsAutoPlanMode ? Boolean(options.autoPlan) : false,
+        planMode: catalog.supportsPlanMode ? Boolean(requestedPlanMode) : false,
+        autoPlan: catalog.supportsAutoPlanMode ? Boolean(requestedAutoPlan) : false,
+        chatModel: model,
+        chatModelOptions: { claude: { ...modelOptions } },
       }
     }
 
     if (provider === "cursor") {
-      const modelOptions = normalizeCursorModelOptions(options.modelOptions)
+      const model = normalizeServerModel(provider, requestedModel)
+      const modelOptions = normalizeCursorModelOptions(requestedModelOptions, persistedModelOptions)
       return {
-        model: cursorModelIdForOptions(normalizeServerModel(provider, options.model), modelOptions),
+        model: cursorModelIdForOptions(model, modelOptions),
         effort: undefined,
         serviceTier: undefined,
         planMode: false,
         autoPlan: false,
+        chatModel: model,
+        chatModelOptions: { cursor: { ...modelOptions } },
       }
     }
 
     if (provider === "grok") {
-      const modelOptions = normalizeGrokModelOptions(options.modelOptions, options.effort)
+      const model = normalizeServerModel(provider, requestedModel)
+      const modelOptions = normalizeGrokModelOptions(
+        requestedModelOptions,
+        options.effort,
+        persistedModelOptions,
+      )
       return {
-        model: normalizeServerModel(provider, options.model),
+        model,
         effort: modelOptions.reasoningEffort,
         serviceTier: undefined,
-        planMode: catalog.supportsPlanMode ? Boolean(options.planMode) : false,
+        planMode: catalog.supportsPlanMode ? Boolean(requestedPlanMode) : false,
         autoPlan: false,
+        chatModel: model,
+        chatModelOptions: { grok: { ...modelOptions } },
       }
     }
 
     if (provider === "pi") {
-      const modelOptions = normalizePiModelOptions(options.modelOptions, options.effort)
+      const model = normalizeServerModel(provider, requestedModel)
+      const modelOptions = normalizePiModelOptions(requestedModelOptions, options.effort, persistedModelOptions)
       return {
-        model: normalizeServerModel(provider, options.model),
+        model,
         effort: modelOptions.reasoningEffort,
         serviceTier: undefined,
         planMode: false,
         autoPlan: false,
+        chatModel: model,
+        chatModelOptions: { pi: { ...modelOptions } },
       }
     }
 
-    const model = normalizeServerModel(provider, options.model)
-    const modelOptions = normalizeCodexModelOptions(model, options.modelOptions, options.effort)
+    const model = normalizeServerModel(provider, requestedModel)
+    const modelOptions = normalizeCodexModelOptions(
+      model,
+      requestedModelOptions,
+      options.effort,
+      persistedModelOptions,
+    )
     return {
       model,
       effort: modelOptions.reasoningEffort,
       serviceTier: serviceTierFromModelOptions(modelOptions),
-      planMode: catalog.supportsPlanMode ? Boolean(options.planMode) : false,
-      autoPlan: catalog.supportsAutoPlanMode ? Boolean(options.autoPlan) : false,
+      planMode: catalog.supportsPlanMode ? Boolean(requestedPlanMode) : false,
+      autoPlan: catalog.supportsAutoPlanMode ? Boolean(requestedAutoPlan) : false,
+      chatModel: model,
+      chatModelOptions: { codex: { ...modelOptions } },
     }
   }
 
@@ -1844,12 +2023,14 @@ export class AgentCoordinator {
       const alreadyPersisted = this.store.getMessages(chatId).some((entry) => (
         entry.kind === "user_prompt" && entry._id === queuedMessage.id
       ))
+      if (provider === "codex")
+      await this.assertCodexHistoryReady(chatId)
       await this.store.removeQueuedMessage(chatId, queuedMessage.id)
       if (alreadyPersisted) {
         this.emitStateChange(chatId)
         return
       }
-      const settings = this.getProviderSettings(provider, queuedMessage)
+      const settings = this.getProviderSettings(provider, queuedMessage, chat)
       await this.startTurnForChat({
         chatId,
         provider,
@@ -1860,6 +2041,7 @@ export class AgentCoordinator {
         serviceTier: settings.serviceTier,
         planMode: settings.planMode,
         autoPlan: settings.autoPlan,
+        modelSettings: { model: settings.chatModel, modelOptions: settings.chatModelOptions },
         appendUserPrompt: true,
         steered: options?.steered,
         startupReservation,
@@ -1899,11 +2081,17 @@ export class AgentCoordinator {
   }
 
   /** Retire every cached provider owner before intentionally starting fresh. */
-  private async retireProviderContext(chatId: string, clearTokens: boolean, writeOwned: <T>(operation: () => Promise<T>) => Promise<T>) {
+  private async retireProviderContext(
+    chatId: string, clearTokens: boolean, isCurrentTurn: () => boolean,
+    writeOwned: <T>(operation: () => Promise<T>) => Promise<T>,
+  ) {
+    if (!isCurrentTurn()) return
     const claudeSession = this.claudeSessions.get(chatId)
     if (claudeSession) {
-      claudeSession.session.close()
+      claudeSession.forceClosed = true
       this.claudeSessions.delete(chatId)
+      claudeSession.releasePublication()
+      claudeSession.session.close()
     }
     this.codexManager.stopSession(chatId)
     this.piManager.closeChat(chatId)
@@ -1952,6 +2140,9 @@ export class AgentCoordinator {
     }
   }
 
+  
+  
+
   private async interruptAndCloseTurn(turn: HarnessTurn | null) {
     if (!turn) return
     try {
@@ -1979,94 +2170,9 @@ export class AgentCoordinator {
     }
   }
 
-  private async prepareProviderContext(args: {
-    previousProvider: AgentProvider | null
-    chatId: string
-    provider: AgentProvider
-    cwd: string
-    model: string
-    serviceTier?: "fast"
-    effort?: string
-    autoPlan: boolean
-    sessionToken?: string | null
-    pendingForkSessionToken?: string | null
-    forkSession?: boolean
-    resetSession?: boolean
-    initialEndExclusive: number
-    restorationEntries?: readonly TranscriptEntry[]
-    clearTokens?: boolean
-    awaitOwned: <T>(operation: () => Promise<T>) => Promise<T>
-    writeOwned: <T>(operation: () => Promise<T>) => Promise<T>
-    appendBoundary?: (entry: TranscriptEntry) => Promise<void>
-  }) {
-    const chat = this.store.requireChat(args.chatId)
-    const initialBounds = this.store.getContextBounds(args.chatId, args.initialEndExclusive)
-    const endExclusive = args.restorationEntries?.length ?? args.initialEndExclusive
-    const hasConversation = args.restorationEntries
-      ? args.restorationEntries.some(entry => ["user_prompt", "assistant_text", "tool_call", "tool_result"].includes(entry.kind))
-      : initialBounds.hasConversation
-    let restoration = chat.contextRestoration ?? null
-    if (restoration) {
-      restoration = { ...restoration, id: crypto.randomUUID(), provider: args.provider,
-        reason: restoration.provider !== args.provider
-          ? restoration.fromProvider === args.provider ? "session_restore" : "provider_switch" : restoration.reason,
-        endExclusive }
-      await args.writeOwned(() => this.store.setContextRestoration(args.chatId, restoration))
-    }
-    const ensureRestoration = async (reason: ContextRestoration["reason"], fromProvider: AgentProvider) => {
-      if (!hasConversation) return
-      if (!restoration || restoration.provider !== args.provider) {
-        restoration = { id: crypto.randomUUID(), provider: args.provider, fromProvider, reason, endExclusive }
-        await args.writeOwned(() => this.store.setContextRestoration(args.chatId, restoration))
-      }
-    }
-    const switchingProvider = args.previousProvider !== null && args.previousProvider !== args.provider
-    if (switchingProvider) await ensureRestoration("provider_switch", args.previousProvider!)
-    let forceFreshContext = switchingProvider || restoration?.provider === args.provider
-    const prepareStartup = async () => {
-      const missingArtifact = !switchingProvider && args.previousProvider !== null && await args.awaitOwned(() => this.hasMissingProviderArtifact({
-        chatId: args.chatId, provider: args.provider, cwd: args.cwd, model: args.model,
-        serviceTier: args.serviceTier, effort: args.effort, autoPlan: args.autoPlan,
-        forkSession: args.forkSession ?? Boolean(chat.pendingForkSessionToken), resetSession: args.resetSession,
-        sessionToken: args.sessionToken !== undefined ? args.sessionToken : chat.pendingForkSessionToken ?? chat.sessionToken,
-        pendingForkSessionToken: null,
-      }))
-      if (missingArtifact) await ensureRestoration("session_restore", args.provider)
-      forceFreshContext = switchingProvider || missingArtifact || restoration?.provider === args.provider
-      if (forceFreshContext) await this.retireProviderContext(args.chatId, args.clearTokens ?? true, args.writeOwned)
-    }
-    let existingMessagesCache: ReturnType<typeof this.store.getMessages> | null = null
-    return {
-      get forceFreshContext() { return forceFreshContext },
-      prepareStartup,
-      restorationId: (): string | undefined => restoration?.id,
-      prepareContent: async (content: string, outcome: HarnessStartupOutcome) => {
-        if (outcome.kind === "fresh"
-          || (args.provider === "cursor" && (forceFreshContext || !chat.sessionToken))
-          || (args.provider === "grok" && (forceFreshContext || !(chat.pendingForkSessionToken ?? chat.sessionToken)))) {
-          await ensureRestoration("session_restore", args.provider)
-        }
-        const appendBoundary = args.appendBoundary ?? ((entry: TranscriptEntry) => args.writeOwned(() => this.store.appendMessage(args.chatId, entry)))
-        if (restoration) {
-          const entries = args.restorationEntries ?? (hasConversation
-            ? (existingMessagesCache ??= this.store.getMessages(args.chatId)).slice(0, restoration.endExclusive) : [])
-          let contextStart = args.restorationEntries && (restoration.startInclusive ?? 0) > entries.length
-            ? 0 : restoration.startInclusive ?? 0
-          entries.forEach((entry, index) => { if (entry.kind === "context_cleared") contextStart = Math.max(contextStart, index + 1) })
-          const context = buildHandoffContext({ entries: entries.slice(contextStart), fromProvider: restoration.fromProvider,
-            toProvider: args.provider, reason: restoration.reason === "session_restore" ? "session_restore" : undefined,
-            transcriptPath: contextStart === 0 && !args.restorationEntries ? this.store.getTranscriptPath(args.chatId) : undefined })
-          if (context || restoration.reason !== "explicit_reset") await appendBoundary(
-            timestamped(restoration.reason === "provider_switch"
-              ? { kind: "handoff_boundary", fromProvider: restoration.fromProvider, toProvider: args.provider, ...(context ? { stats: context.stats } : {}) }
-              : { kind: "session_restored", provider: args.provider, ...(context ? { stats: context.stats } : {}) }))
-          return { content: context ? buildHandoffMessageContent(context.text, content) : content, restored: Boolean(context) }
-        }
-        if (switchingProvider) await appendBoundary(timestamped({ kind: "handoff_boundary", fromProvider: args.previousProvider!, toProvider: args.provider }))
-        return { content, restored: false }
-      },
-    }
-  }
+  
+
+  
 
   private async startTurnForChat(args: {
     chatId: string
@@ -2078,27 +2184,33 @@ export class AgentCoordinator {
     serviceTier?: "fast"
     planMode: boolean
     autoPlan: boolean
+    modelSettings?: {
+      model: string
+      modelOptions: ModelOptions
+    }
     appendUserPrompt: boolean
     steered?: boolean
     sessionToken?: string | null
     pendingForkSessionToken?: string | null
     forkSession?: boolean
+    resumeSessionAt?: string | null
     resetSession?: boolean
-    /** A caller may restrict restoration to an admissible local prefix. */
-    restorationEntries?: readonly TranscriptEntry[]
+    replaceTranscriptPrefix?: TranscriptEntry[]
     onProviderReady?: (isCurrentTurn: () => boolean, outcome: HarnessStartupOutcome) => Promise<void>
     startupReservation?: symbol
+    expectedCodexSessionToken?: string
   }) {
     if (args.startupReservation) {
       if (this.startingClaudeTurns.get(args.chatId) !== args.startupReservation) throw new Error("Chat startup reservation was replaced")
       return await this.startReservedTurnForChat(args)
     }
     if (this.startingClaudeTurns.has(args.chatId)) throw new Error("Chat is already starting")
-    return await this.withClaudeStartupReservation(args.chatId, reservation =>
-      this.startReservedTurnForChat({ ...args, startupReservation: reservation }))
+    return await this.withClaudeStartupReservation(args.chatId, reservation => this.startReservedTurnForChat({ ...args, startupReservation: reservation }))
   }
 
   private async startReservedTurnForChat(args: Parameters<AgentCoordinator["startTurnForChat"]>[0]) {
+    const pendingCommit = this.claudeReadinessCommits.get(args.chatId)
+    if (pendingCommit) await pendingCommit
     this.clearIdleSessionTimer(args.chatId)
     if (args.startupReservation && this.startingClaudeTurns.get(args.chatId) !== args.startupReservation) return
     const chat = this.store.requireChat(args.chatId)
@@ -2108,6 +2220,9 @@ export class AgentCoordinator {
       draining.turn.close()
       this.drainingStreams.delete(args.chatId)
     }
+
+    // Own preparation as well as input. All providers can now await durable
+    // restoration or a native load before returning a turn handle.
     const active: ActiveTurn = {
       chatId: args.chatId, provider: args.provider, turn: null,
       model: args.model, effort: args.effort, serviceTier: args.serviceTier,
@@ -2127,12 +2242,12 @@ export class AgentCoordinator {
       assertCurrent()
       return result
     }
-    // Native loading does not hold this drain. Only writes already in flight
-    // must finish before a successor can read or change the durable state.
+    // Drain an already-started local write before a successor can read or
+    // replace that state. Native startup itself does not hold this drain.
     const writeOwned = async <T>(operation: () => Promise<T>): Promise<T> => {
       assertCurrent()
       let release!: () => void
-      const commit = new Promise<void>(resolve => { release = resolve })
+      const commit = new Promise<void>((resolve) => { release = resolve })
       const ownsDrain = !this.claudeReadinessCommits.has(args.chatId)
       if (ownsDrain) this.claudeReadinessCommits.set(args.chatId, commit)
       try { return await awaitOwned(operation) } finally {
@@ -2140,71 +2255,74 @@ export class AgentCoordinator {
         release()
       }
     }
-    let markToolsReady!: () => void
-    const toolsReady = new Promise<void>(resolve => { markToolsReady = resolve })
-    active.toolsReady = toolsReady
-    let turn: HarnessTurn | undefined
-    let createdClaudeSession = false
-    let contentPrepared = false
 
+    const deferPromptWriteUntilProviderReady = Boolean(args.replaceTranscriptPrefix)
     const previousProvider = chat.provider
+    const originalSessionToken = chat.sessionToken
+    let initialBounds: ReturnType<EventStore["getContextBounds"]>
+    let deferredSource: { entries: TranscriptEntry[]; sessionToken: typeof chat.sessionToken;
+      turnCount: number | undefined;
+      pendingForkSessionToken: string | null; pendingForkResumeAt: string | null; pendingForkUserPrompt: boolean } | null = null
+    let restoration = chat.contextRestoration ?? null
+    let shouldClearPendingForkUserPrompt = Boolean(chat.pendingForkUserPrompt)
+    let shouldClearPendingForkSessionToken = false
+    const clearPendingForkUserPrompt = async () => {
+      if (!shouldClearPendingForkUserPrompt) return
+      await writeOwned(() => this.store.setPendingForkUserPrompt(args.chatId, false))
+      shouldClearPendingForkUserPrompt = false
+    }
+    const clearPendingForkSessionToken = async () => {
+      if (!shouldClearPendingForkSessionToken) return
+      await writeOwned(() => this.store.setPendingForkSessionToken(args.chatId, null))
+      shouldClearPendingForkSessionToken = false
+    }
+    const ensureRestoration = async (reason: ContextRestoration["reason"], fromProvider: AgentProvider) => {
+      assertCurrent()
+      const hasConversation = args.replaceTranscriptPrefix
+        ? args.replaceTranscriptPrefix.some(entry => ["user_prompt", "assistant_text", "tool_call", "tool_result"].includes(entry.kind))
+        : initialBounds.hasConversation
+      if (!hasConversation) return
+      if (!restoration || restoration.provider !== args.provider) {
+        restoration = { id: crypto.randomUUID(), provider: args.provider, fromProvider, reason,
+          endExclusive: args.replaceTranscriptPrefix?.length ?? initialBounds.endExclusive }
+        await writeOwned(() => this.store.setContextRestoration(args.chatId, restoration))
+      }
+      active.contextRestorationId = restoration.id
+    }
 
     let userPromptEntry: TranscriptEntry | null = null
     let userPromptWritten = false
+    let nativePromptBoundary: string | null | undefined
     let turnStartedRecorded = false
     const writeUserPrompt = async () => {
       if (!args.appendUserPrompt || userPromptWritten) return
-      userPromptEntry ??= timestamped({ kind: "user_prompt", content: args.content,
-        attachments: args.attachments, steered: args.steered }, Date.now())
-      await writeOwned(() => this.store.appendMessage(args.chatId, userPromptEntry!))
+      assertCurrent()
+      userPromptEntry ??= timestamped({ kind: "user_prompt", content: args.content, attachments: args.attachments, steered: args.steered }, Date.now())
+      nativePromptBoundary = args.replaceTranscriptPrefix
+        ? args.replaceTranscriptPrefix.at(-1)?._id ?? null
+        : this.store.getEntryIdAt(args.chatId, this.store.getTranscriptLength(args.chatId) - 1)
+      await writeOwned(() => args.replaceTranscriptPrefix
+        ? this.store.replaceTranscript(args.chatId, [...args.replaceTranscriptPrefix, userPromptEntry!])
+        : this.store.appendMessage(args.chatId, userPromptEntry!))
       userPromptWritten = true
     }
     const recordTurnStarted = async () => {
       if (turnStartedRecorded) return
-      await writeOwned(() => this.store.recordTurnStarted(args.chatId, args.model))
+      const replacementTurnCount = args.replaceTranscriptPrefix ? countUserPrompts(args.replaceTranscriptPrefix) + 1 : undefined
+      await writeOwned(() => this.store.recordTurnStarted(args.chatId, args.model,
+        replacementTurnCount === undefined ? undefined : { turnCount: replacementTurnCount }))
       turnStartedRecorded = true
     }
 
-    try {
-      const previousProvider = chat.provider
-      const initialBounds = this.store.getContextBounds(args.chatId)
-      const project = this.store.getProject(chat.projectId)
-      if (!project) throw new Error("Project not found")
-      const context = await awaitOwned(() => this.prepareProviderContext({
-        previousProvider, chatId: args.chatId, provider: args.provider, cwd: project.localPath,
-        model: args.model, serviceTier: args.serviceTier, effort: args.effort, autoPlan: args.autoPlan,
-        sessionToken: args.sessionToken, pendingForkSessionToken: args.pendingForkSessionToken,
-        forkSession: args.forkSession, resetSession: args.resetSession,
-        initialEndExclusive: initialBounds.endExclusive, restorationEntries: args.restorationEntries,
-        awaitOwned, writeOwned,
-      }))
-      active.contextRestorationId = context.restorationId()
-      if (chat.provider !== args.provider) await writeOwned(() => this.store.setChatProvider(args.chatId, args.provider))
-      await writeOwned(() => this.store.setPlanMode(args.chatId, args.planMode))
-      await writeOwned(() => this.store.setAutoPlan(args.chatId, args.autoPlan))
-      const shouldGenerateTitle = args.appendUserPrompt && chat.title === "New Chat" && initialBounds.endExclusive === 0
-      const optimisticTitle = shouldGenerateTitle ? fallbackTitleFromMessage(args.content) : null
-      if (optimisticTitle) await writeOwned(() => this.store.renameChat(args.chatId, optimisticTitle, { markTitleOverride: false }))
-      await awaitOwned(context.prepareStartup)
-      active.contextRestorationId = context.restorationId()
-      const forceFreshContext = context.forceFreshContext
-      assertCurrent()
-    if (shouldGenerateTitle) {
-      void this.generateTitleInBackground(
-        args.chatId,
-        args.content,
-        project.localPath,
-        optimisticTitle ?? "New Chat",
-        args.provider
-      )
-    }
-
-      let claudeNativeSessionId: string | undefined
-      const ownsNativeToolSession = () => args.provider !== "claude"
+    let markToolsReady!: () => void
+    const toolsReady = new Promise<void>((resolve) => { markToolsReady = resolve })
+    active.toolsReady = toolsReady
+    let claudeNativeSessionId: string | undefined
+    const ownsNativeToolSession = () => args.provider !== "claude"
       || (claudeNativeSessionId ? this.claudeSessions.get(args.chatId)?.id === claudeNativeSessionId : isCurrentTurn())
-      const ownsToolRequest = (owner: ActiveTurn) => !owner.cancelRequested
+    const ownsToolRequest = (owner: ActiveTurn) => !owner.cancelRequested
       && owner.provider === args.provider && this.activeTurns.get(args.chatId) === owner && ownsNativeToolSession()
-      const onToolRequest = async (request: HarnessToolRequest) => {
+    const onToolRequest = async (request: HarnessToolRequest) => {
       // Claude's native query retains its callbacks across user turns.
       const owner = args.provider === "claude" ? this.activeTurns.get(args.chatId) : active
       if (!owner || !ownsToolRequest(owner)) throw staleStartup
@@ -2212,61 +2330,178 @@ export class AgentCoordinator {
       if (!ownsToolRequest(owner)) throw staleStartup
       return this.requestToolInput(args.chatId, request)
     }
-      const customTools: KannaToolHost = {
-        execute: async (name, input, signal) => {
-          await toolsReady
-          const owner = this.activeTurns.get(args.chatId)
-          if (!owner || !ownsToolRequest(owner)) return { content: [{ type: "text", text: "Chat turn ended" }], isError: true }
-          await owner.toolsReady
-          if (!ownsToolRequest(owner)) return { content: [{ type: "text", text: "Chat turn ended" }], isError: true }
-          owner.customTools ??= new KannaToolRuntime({
-            chatId: args.chatId, cwd: project.localPath, dataDir: this.store.dataDir,
-            emit: async entry => {
-              if (!ownsToolRequest(owner)) throw staleStartup
-              await this.store.appendMessage(args.chatId, entry)
-              if (ownsToolRequest(owner)) this.emitStateChange(args.chatId)
-            },
-            requestInput: (request, callSignal) => {
-              if (!ownsToolRequest(owner)) throw staleStartup
-              return this.requestToolInput(args.chatId, request, callSignal)
-            },
-          })
-          return owner.customTools.execute(name, input, signal)
-        },
+    const customTools: KannaToolHost = {
+      execute: async (name, input, signal) => {
+        await toolsReady
+        const owner = this.activeTurns.get(args.chatId)
+        if (!owner || !ownsToolRequest(owner)) return { content: [{ type: "text", text: "Chat turn ended" }], isError: true }
+        await owner.toolsReady
+        if (!ownsToolRequest(owner)) return { content: [{ type: "text", text: "Chat turn ended" }], isError: true }
+        owner.customTools ??= new KannaToolRuntime({
+          chatId: args.chatId, cwd: this.store.getProject(chat.projectId)!.localPath, dataDir: this.store.dataDir,
+          emit: async (entry) => {
+            if (!ownsToolRequest(owner)) throw staleStartup
+            await this.store.appendMessage(args.chatId, entry)
+            if (ownsToolRequest(owner)) this.emitStateChange(args.chatId)
+          },
+          requestInput: (request, callSignal) => {
+            if (!ownsToolRequest(owner)) throw staleStartup
+            return this.requestToolInput(args.chatId, request, callSignal)
+          },
+        })
+        return owner.customTools.execute(name, input, signal)
+      },
+    }
+
+    let turn: HarnessTurn | undefined
+    let createdClaudeSession = false
+    let releaseClaudePublication = () => {}
+    let getClaudeStartupFailure: () => Error | undefined = () => undefined
+    let releaseReadinessCommit: (() => void) | undefined
+    let readinessCommit: Promise<void> | undefined
+    let deferredHistoryWritten = false
+    let saveCodexHistory: (() => Promise<void>) | undefined
+    let acceptedCodexSessionToken: string | undefined
+    let contentPrepared = false
+    const actualStartup: { outcome: HarnessStartupOutcome } = { outcome: { kind: "unknown", reason: "provider did not prepare an input" } }
+    const assertClaudeStartupAlive = () => { const failure = getClaudeStartupFailure(); if (failure) throw failure }
+    const stopStaleStartup = async () => {
+      markToolsReady()
+      if (createdClaudeSession && turn) await this.interruptAndCloseTurn(turn)
+      else if (args.provider === "codex" && turn) {
+        void turn.interrupt().catch(() => {})
+        turn.close()
+        if (this.activeTurns.get(args.chatId) === active || !this.activeTurns.has(args.chatId)) this.codexManager.stopSession(args.chatId)
+        const operation = this.historyOperations.get(args.chatId)
+        if (operation?.turn === turn) operation.turn = undefined
+      } else if (args.provider !== "claude" && turn) await this.interruptAndCloseTurn(turn)
+    }
+
+    try {
+      initialBounds = this.store.getContextBounds(args.chatId)
+      if (args.provider === "codex" && (previousProvider === "codex" || restoration?.provider === "codex") && !args.replaceTranscriptPrefix)
+        await awaitOwned(() => this.assertCodexHistoryReady(args.chatId, active))
+      if (args.provider === "codex" && !deferPromptWriteUntilProviderReady) {
+        if (chat.provider !== args.provider) await writeOwned(() => this.store.setChatProvider(args.chatId, args.provider))
+        this.emitStateChange(args.chatId, { immediate: true })
       }
+      if (args.provider === "claude" && deferPromptWriteUntilProviderReady) {
+        deferredSource = { entries: this.store.getMessages(args.chatId), sessionToken: chat.sessionToken,
+          turnCount: chat.turnCount,
+          pendingForkSessionToken: chat.pendingForkSessionToken ?? null, pendingForkResumeAt: chat.pendingForkResumeAt ?? null,
+          pendingForkUserPrompt: chat.pendingForkUserPrompt ?? false }
+      }
+      if (restoration) {
+        restoration = { ...restoration, id: crypto.randomUUID(), provider: args.provider,
+          reason: restoration.provider !== args.provider
+            ? restoration.fromProvider === args.provider ? "session_restore" : "provider_switch" : restoration.reason,
+          endExclusive: args.replaceTranscriptPrefix?.length ?? initialBounds.endExclusive }
+        await writeOwned(() => this.store.setContextRestoration(args.chatId, restoration))
+        active.contextRestorationId = restoration.id
+      }
+      const switchingProvider = previousProvider !== null && previousProvider !== args.provider
+      if (switchingProvider) await ensureRestoration("provider_switch", previousProvider)
+      if (chat.provider !== args.provider) await writeOwned(() => this.store.setChatProvider(args.chatId, args.provider))
+      if (!deferPromptWriteUntilProviderReady) await clearPendingForkUserPrompt()
+      await writeOwned(() => this.store.setPlanMode(args.chatId, args.planMode))
+      await writeOwned(() => this.store.setAutoPlan(args.chatId, args.autoPlan))
+      if (args.modelSettings) await writeOwned(() => this.store.setChatModelSettings(args.chatId, args.modelSettings!))
+
+      const shouldGenerateTitle = args.appendUserPrompt && chat.title === "New Chat" && initialBounds.endExclusive === 0
+      const optimisticTitle = shouldGenerateTitle ? fallbackTitleFromMessage(args.content) : null
+      if (optimisticTitle) await writeOwned(() => this.store.renameChat(args.chatId, optimisticTitle, { markTitleOverride: false }))
+      const project = this.store.getProject(chat.projectId)
+      if (!project) throw new Error("Project not found")
+      const appendContextBoundary = async (entry: TranscriptEntry) => {
+        if (deferPromptWriteUntilProviderReady && args.replaceTranscriptPrefix) {
+          args.replaceTranscriptPrefix = [...args.replaceTranscriptPrefix, entry]
+        } else if (args.provider === "codex" && userPromptWritten && !deferPromptWriteUntilProviderReady) {
+          const prefix = this.store.getMessages(args.chatId).slice(0, initialBounds.endExclusive)
+          await writeOwned(() => this.store.replaceTranscript(args.chatId, [...prefix, entry, userPromptEntry!]))
+          nativePromptBoundary = entry._id
+        } else await writeOwned(() => this.store.appendMessage(args.chatId, entry))
+      }
+      const missingArtifact = !switchingProvider && previousProvider !== null && await awaitOwned(() => this.hasMissingProviderArtifact({
+        chatId: args.chatId, provider: args.provider, cwd: project.localPath, model: args.model,
+        serviceTier: args.serviceTier, effort: args.effort, autoPlan: args.autoPlan,
+        forkSession: args.forkSession ?? Boolean(chat.pendingForkSessionToken), resetSession: args.resetSession,
+        sessionToken: args.sessionToken !== undefined ? args.sessionToken : chat.pendingForkSessionToken ?? chat.sessionToken,
+        pendingForkSessionToken: null,
+      }))
+      if (missingArtifact) await ensureRestoration("session_restore", args.provider)
+      const forceFreshContext = switchingProvider || missingArtifact || restoration?.provider === args.provider
+      if (forceFreshContext) await this.retireProviderContext(args.chatId, !deferPromptWriteUntilProviderReady, isCurrentTurn, writeOwned)
+      assertCurrent()
+      if (shouldGenerateTitle) void this.generateTitleInBackground(args.chatId, args.content, project.localPath, optimisticTitle ?? "New Chat", args.provider)
+
       const skills = await awaitOwned(() => this.resolvePromptSkills(args.provider, args.chatId, args.content))
       let wireContent = args.steered ? buildSteeredMessageContent(args.content) : args.content
       if (args.provider !== "codex" && skills.length > 0) wireContent = appendSystemMessageBlock(wireContent, buildSkillSystemMessage(skills))
       const concurrentAgentsNotice = buildConcurrentAgentsNotice(this.collectConcurrentProjectChats(args.chatId, project.localPath))
       if (concurrentAgentsNotice) wireContent = appendSystemMessageBlock(wireContent, concurrentAgentsNotice)
-      const actualStartup: { outcome: HarnessStartupOutcome } = { outcome: { kind: "unknown", reason: "provider did not prepare an input" } }
+      let existingMessagesCache: ReturnType<typeof this.store.getMessages> | null = null
       const prepareWireContent = async (outcome: HarnessStartupOutcome) => {
         assertCurrent()
         if (contentPrepared) return wireContent
         actualStartup.outcome = outcome
-        const prepared = await awaitOwned(() => context.prepareContent(wireContent, outcome))
-        wireContent = prepared.content
-        active.contextRestorationId = context.restorationId()
+        if (outcome.kind === "fresh") await ensureRestoration("session_restore", args.provider)
+        if (restoration) {
+          assertCurrent()
+          const entries = args.replaceTranscriptPrefix ?? (initialBounds.hasConversation
+            ? (existingMessagesCache ??= this.store.getMessages(args.chatId)).slice(0, restoration.endExclusive) : [])
+          let contextStart = args.replaceTranscriptPrefix && (restoration.startInclusive ?? 0) > entries.length
+            ? 0 : restoration.startInclusive ?? 0
+          entries.forEach((entry, index) => { if (entry.kind === "context_cleared") contextStart = Math.max(contextStart, index + 1) })
+          const context = buildHandoffContext({ entries: entries.slice(contextStart), fromProvider: restoration.fromProvider,
+            toProvider: args.provider, reason: restoration.reason === "session_restore" ? "session_restore" : undefined,
+            transcriptPath: contextStart === 0 && !args.replaceTranscriptPrefix ? this.store.getTranscriptPath(args.chatId) : undefined })
+          if (context || restoration.reason !== "explicit_reset") await appendContextBoundary(
+            timestamped(restoration!.reason === "provider_switch"
+              ? { kind: "handoff_boundary", fromProvider: restoration!.fromProvider, toProvider: args.provider, ...(context ? { stats: context.stats } : {}) }
+              : { kind: "session_restored", provider: args.provider, ...(context ? { stats: context.stats } : {}) }))
+          if (context) wireContent = buildHandoffMessageContent(context.text, wireContent)
+        } else if (args.provider === "codex" && args.replaceTranscriptPrefix) {
+          const prefix = args.replaceTranscriptPrefix
+          const marker = prefix.at(-1)
+          if ((marker?.kind === "handoff_boundary" && marker.toProvider === "codex")
+            || (marker?.kind === "session_restored" && marker.provider === "codex")) {
+            // Cutting its first native turn also removes that turn's wire-only
+            // context. Replay the verified local prefix into the isolated fork.
+            let contextStart = 0
+            prefix.forEach((entry, index) => { if (entry.kind === "context_cleared") contextStart = index + 1 })
+            const context = buildHandoffContext({ entries: prefix.slice(contextStart),
+              fromProvider: marker.kind === "handoff_boundary" ? marker.fromProvider : marker.provider,
+              toProvider: "codex", ...(marker.kind === "session_restored" ? { reason: "session_restore" as const } : {}) })
+            if (context) wireContent = buildHandoffMessageContent(context.text, wireContent)
+          }
+        } else if (switchingProvider) await appendContextBoundary(
+          timestamped({ kind: "handoff_boundary", fromProvider: previousProvider!, toProvider: args.provider }))
         contentPrepared = true
-        await writeUserPrompt()
-        await recordTurnStarted()
+        active.contextRestorationId = restoration?.id
+        if (!deferPromptWriteUntilProviderReady && args.provider !== "codex") { await writeUserPrompt(); await recordTurnStarted() }
+        assertCurrent()
         return wireContent
       }
-      let shouldClearPendingForkSessionToken = false
+
       if (args.provider === "claude") {
+        active.claudeSourceSessionToken = forceFreshContext ? null : args.sessionToken !== undefined ? args.sessionToken : chat.pendingForkSessionToken ?? chat.sessionToken
         const startedTurn = await this.startClaudeTurn({ chatId: args.chatId, localPath: project.localPath,
           model: args.model, effort: args.effort, serviceTier: args.serviceTier, planMode: args.planMode, autoPlan: args.autoPlan,
-          sessionToken: forceFreshContext ? null : args.sessionToken !== undefined ? args.sessionToken : chat.pendingForkSessionToken ?? chat.sessionToken,
-          forkSession: forceFreshContext ? false : args.forkSession ?? Boolean(chat.pendingForkSessionToken),
-          resetSession: forceFreshContext || args.resetSession, onToolRequest, customTools, isCurrentTurn })
+          sessionToken: active.claudeSourceSessionToken ?? null, forkSession: forceFreshContext ? false : args.forkSession ?? Boolean(chat.pendingForkSessionToken),
+          resumeSessionAt: forceFreshContext ? undefined : args.resumeSessionAt !== undefined ? args.resumeSessionAt ?? undefined : chat.pendingForkResumeAt ?? undefined,
+          resetSession: forceFreshContext || args.resetSession, deferPublication: deferPromptWriteUntilProviderReady,
+          onToolRequest, customTools, isCurrentTurn })
         if (!startedTurn) return
         turn = startedTurn
-        createdClaudeSession = startedTurn.createdSession
         claudeNativeSessionId = this.claudeSessions.get(args.chatId)?.id
+        createdClaudeSession = startedTurn.createdSession
+        releaseClaudePublication = startedTurn.releasePublication
+        getClaudeStartupFailure = startedTurn.getStartupFailure
         active.turn = turn
         assertCurrent()
         await prepareWireContent(turn.startupOutcome ?? { kind: "unknown", reason: "Claude SDK has no pre-input resume acknowledgement" })
       } else if (args.provider === "cursor") {
+        if (forceFreshContext || !chat.sessionToken) await ensureRestoration("session_restore", args.provider)
         await prepareWireContent({ kind: "unknown", reason: "Cursor print CLI has no pre-input load acknowledgement" })
         void this.refreshCursorModelCatalog()
         turn = await this.cursorManager.startTurn({ cwd: project.localPath, customTools, content: buildPromptText(wireContent, args.attachments),
@@ -2274,6 +2509,7 @@ export class AgentCoordinator {
         active.turn = turn
         assertCurrent()
       } else if (args.provider === "grok") {
+        if (forceFreshContext || !(chat.pendingForkSessionToken ?? chat.sessionToken)) await ensureRestoration("session_restore", args.provider)
         await prepareWireContent({ kind: "unknown", reason: "Grok print CLI has no pre-input load acknowledgement" })
         void this.refreshGrokModelCatalog()
         turn = await this.grokManager.startTurn({ cwd: project.localPath, content: buildPromptText(wireContent, args.attachments), model: args.model,
@@ -2285,7 +2521,7 @@ export class AgentCoordinator {
         const connection = await awaitOwned(() => this.resolvePiConnection())
         turn = await this.piManager.startTurn({ chatId: args.chatId, cwd: project.localPath, customTools,
           content: buildPromptText(wireContent, args.attachments),
-          prepareContent: async outcome => buildPromptText(await prepareWireContent(outcome), args.attachments),
+          prepareContent: async (outcome) => buildPromptText(await prepareWireContent(outcome), args.attachments),
           isCurrentTurn, model: args.model, effort: normalizePiModelOptions(undefined, args.effort).reasoningEffort,
           sessionToken: forceFreshContext ? null : chat.pendingForkSessionToken ?? chat.sessionToken,
           forkSession: forceFreshContext ? false : Boolean(chat.pendingForkSessionToken), connection })
@@ -2294,27 +2530,119 @@ export class AgentCoordinator {
       } else {
         const pendingForkSessionToken = forceFreshContext ? null : args.pendingForkSessionToken !== undefined ? args.pendingForkSessionToken : chat.pendingForkSessionToken
         const started = await this.codexManager.startSession({ chatId: args.chatId, cwd: project.localPath, customTools,
-          model: args.model, serviceTier: args.serviceTier,
-          sessionToken: forceFreshContext ? null : args.sessionToken !== undefined ? args.sessionToken : chat.sessionToken,
+          model: args.model, serviceTier: args.serviceTier, sessionToken: forceFreshContext ? null : args.sessionToken !== undefined ? args.sessionToken : chat.sessionToken,
           pendingForkSessionToken, isCurrentTurn, signal: active.startupAbort?.signal })
         assertCurrent()
+        const classifiedToken = chat.sessionToken ?? chat.pendingForkSessionToken
+        const requiresClassifiedResume = Boolean(!args.replaceTranscriptPrefix && classifiedToken
+          && chat.codexHistoryIntegrity?.segments?.[classifiedToken]?.gap)
+        const expectedToken = args.expectedCodexSessionToken ?? (requiresClassifiedResume
+          ? classifiedToken : undefined)
+        const acceptedPendingFork = !args.expectedCodexSessionToken && pendingForkSessionToken === expectedToken
+          && started?.startupOutcome?.kind === "forked" && Boolean(started.sessionToken)
+        if (expectedToken && (started?.resumeFellBack || (!acceptedPendingFork && started?.sessionToken !== expectedToken)
+          || started.startupOutcome?.kind === "fresh")) {
+          throw new Error(args.expectedCodexSessionToken
+            ? "Codex could not resume the prepared edit session"
+            : "Codex could not resume this chat. Its retained local history was not resent.")
+        }
         await prepareWireContent(started?.startupOutcome ?? (started?.resumeFellBack ? { kind: "fresh" } : { kind: "unknown", reason: "adapter did not report actual startup" }))
-        shouldClearPendingForkSessionToken = Boolean(pendingForkSessionToken && started?.sessionToken)
+        if (pendingForkSessionToken && started?.sessionToken) shouldClearPendingForkSessionToken = true
         void this.refreshCodexModelCatalog()
+        const nativeBoundary = args.replaceTranscriptPrefix
+          ? args.replaceTranscriptPrefix.at(-1)?._id ?? null
+          : nativePromptBoundary !== undefined ? nativePromptBoundary
+            : this.store.getEntryIdAt(args.chatId, this.store.getTranscriptLength(args.chatId) - 1)
+        if (args.appendUserPrompt) userPromptEntry ??= timestamped({
+          kind: "user_prompt", content: args.content, attachments: args.attachments, steered: args.steered,
+        })
         turn = await this.codexManager.startTurn({ chatId: args.chatId, content: buildPromptText(wireContent, args.attachments),
+          clientUserMessageId: userPromptEntry?._id,
           isCurrentTurn, signal: active.startupAbort?.signal,
-          skills: skills.flatMap(skill => skill.path ? [{ name: skill.name, path: skill.path }] : []), model: args.model,
+          skills: skills.flatMap((skill) => skill.path ? [{ name: skill.name, path: skill.path }] : []), model: args.model,
           effort: args.effort as CodexReasoningEffort | undefined, serviceTier: args.serviceTier, planMode: args.planMode, onToolRequest })
         active.turn = turn
+        acceptedCodexSessionToken = started?.sessionToken
+        if (!deferPromptWriteUntilProviderReady) {
+          await writeUserPrompt()
+          await recordTurnStarted()
+          if (started?.sessionToken) await writeOwned(() => this.store.setSessionToken(args.chatId, started.sessionToken))
+        }
+        const historyOperation = this.historyOperations.get(args.chatId)
+        if (historyOperation) historyOperation.turn = turn
         assertCurrent()
+        if (turn.providerTurnId && started?.sessionToken) {
+          const turnId = turn.providerTurnId
+          saveCodexHistory = async () => {
+            try {
+              // A pending fork starts another native session containing the
+              // same prefix. Move its saved boundaries after input acceptance.
+              if (pendingForkSessionToken && pendingForkSessionToken !== started.sessionToken
+                && started.startupOutcome?.kind === "forked") {
+                await awaitOwned(() => this.codexPromptHistory.rebindSession(args.chatId,
+                  pendingForkSessionToken, started.sessionToken))
+                await awaitOwned(() => this.retainCodexClassification(args.chatId, chat.codexHistoryIntegrity,
+                  pendingForkSessionToken, started.sessionToken, this.store.getPromptHistoryEntries(args.chatId)))
+              }
+              await awaitOwned(() => this.codexPromptHistory.recordTurn(args.chatId, started.sessionToken,
+                turnId, nativeBoundary))
+              if (userPromptEntry) await awaitOwned(() => this.codexPromptHistory.recordPrompt(args.chatId,
+                userPromptEntry!._id, { sessionToken: started.sessionToken, turnId,
+                  mergeTurn: false, boundaryEntryId: nativeBoundary }))
+              if (!userPromptEntry) await awaitOwned(() => this.saveCodexIntegrity(args.chatId))
+            } catch (error) {
+              if (isCurrentTurn()) await awaitOwned(() => this.recordCodexHistoryFailure(args.chatId, error))
+              throw error
+            }
+          }
+          if (!deferPromptWriteUntilProviderReady) await saveCodexHistory()
+        }
       }
+
       if (!contentPrepared) await prepareWireContent(turn.startupOutcome ?? { kind: "unknown", reason: "provider did not prepare an input" })
-      if (shouldClearPendingForkSessionToken) await writeOwned(() => this.store.setPendingForkSessionToken(args.chatId, null))
+      if (args.provider === "claude" && deferPromptWriteUntilProviderReady) {
+        readinessCommit = new Promise<void>((resolve) => { releaseReadinessCommit = resolve })
+        this.claudeReadinessCommits.set(args.chatId, readinessCommit)
+      }
+      if (deferPromptWriteUntilProviderReady) {
+        this.assertHistoryOperation(args.chatId)
+        const historyOperation = this.historyOperations.get(args.chatId)
+        if (historyOperation) {
+          historyOperation.codexHistoryIntegrity = structuredClone(chat.codexHistoryIntegrity)
+          if (args.provider === "codex")
+            historyOperation.codexPrompts = (await this.codexPromptHistory.read(args.chatId)).prompts
+          this.assertHistoryOperation(args.chatId)
+          historyOperation.publicationStarted = true
+        }
+        await writeUserPrompt()
+        deferredHistoryWritten = true
+        assertClaudeStartupAlive()
+        await clearPendingForkUserPrompt()
+        assertClaudeStartupAlive()
+        await clearPendingForkSessionToken()
+        assertClaudeStartupAlive()
+        await recordTurnStarted()
+        assertClaudeStartupAlive()
+        this.assertHistoryOperation(args.chatId)
+        if (args.provider === "codex") {
+          if (!acceptedCodexSessionToken) throw new Error("Accepted Codex edit has no session token")
+          await writeOwned(() => this.store.setSessionToken(args.chatId, acceptedCodexSessionToken!))
+          this.assertHistoryOperation(args.chatId)
+        }
+        if (historyOperation) historyOperation.publicationCommitted = true
+      } else await clearPendingForkSessionToken()
+      if (args.provider !== "codex" && deferPromptWriteUntilProviderReady && (forceFreshContext || actualStartup.outcome.kind === "fresh") && chat.sessionToken === originalSessionToken) {
+        await writeOwned(() => this.store.setSessionToken(args.chatId, this.claudeSessions.get(args.chatId)?.sessionToken ?? null))
+        await writeOwned(() => this.store.setPendingForkSessionToken(args.chatId, null))
+      }
       await awaitOwned(async () => { await args.onProviderReady?.(isCurrentTurn, actualStartup.outcome) })
+      if (deferPromptWriteUntilProviderReady) await saveCodexHistory?.()
+      assertClaudeStartupAlive()
+      releaseClaudePublication()
       active.startupPending = false
       active.startupAbort = undefined
       markToolsReady()
-      if (turn.getAccountInfo) void turn.getAccountInfo().then(async accountInfo => {
+      if (turn.getAccountInfo) void turn.getAccountInfo().then(async (accountInfo) => {
         if (!accountInfo || !isCurrentTurn()) return
         if (args.provider === "claude") {
           const session = this.claudeSessions.get(args.chatId)
@@ -2347,17 +2675,33 @@ export class AgentCoordinator {
       const stillCurrent = isCurrentTurn()
       markToolsReady()
       try {
-        if (stillCurrent && !contentPrepared) { await writeUserPrompt(); await recordTurnStarted() }
+        if (stillCurrent && deferredSource && deferredHistoryWritten && getClaudeStartupFailure()) {
+          const source = deferredSource
+          await writeOwned(async () => {
+            await this.store.replaceTranscript(args.chatId, source.entries)
+            await this.store.restoreTurnCount(args.chatId, source.turnCount)
+          })
+          await writeOwned(() => this.store.setSessionToken(args.chatId, source.sessionToken))
+          await writeOwned(() => this.store.setPendingForkSessionToken(args.chatId, source.pendingForkSessionToken))
+          await writeOwned(() => this.store.setPendingForkResumeAt(args.chatId, source.pendingForkResumeAt))
+          await writeOwned(() => this.store.setPendingForkUserPrompt(args.chatId, source.pendingForkUserPrompt))
+        } else if (stillCurrent && args.provider !== "codex" && !deferPromptWriteUntilProviderReady && !contentPrepared) {
+          await writeUserPrompt()
+          await recordTurnStarted()
+        }
       } finally {
         if (this.activeTurns.get(args.chatId) === active) {
           active.customTools?.abort()
           this.activeTurns.delete(args.chatId)
           this.emitStateChange(args.chatId)
         }
-        if (turn && (args.provider !== "claude" || createdClaudeSession)) await this.interruptAndCloseTurn(turn)
+        await stopStaleStartup()
       }
       if (!stillCurrent || error === staleStartup) return
       throw error
+    } finally {
+      if (readinessCommit && this.claudeReadinessCommits.get(args.chatId) === readinessCommit) this.claudeReadinessCommits.delete(args.chatId)
+      releaseReadinessCommit?.()
     }
   }
 
@@ -2371,14 +2715,16 @@ export class AgentCoordinator {
     autoPlan: boolean
     sessionToken: string | null
     forkSession: boolean
-    resetSession?: boolean
-    isCurrentTurn: () => boolean
     customTools?: KannaToolHost
+    resumeSessionAt?: string
+    resetSession?: boolean
+    deferPublication?: boolean
     onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
-  }): Promise<(HarnessTurn & { createdSession: boolean }) | null> {
+    isCurrentTurn: () => boolean
+  }): Promise<(HarnessTurn & { createdSession: boolean; releasePublication: () => void; getStartupFailure: () => Error | undefined }) | null> {
     let session = this.claudeSessions.get(args.chatId)
-    let startupOutcome: HarnessStartupOutcome = { kind: "reused" }
     let createdSession = false
+    let startupOutcome: HarnessStartupOutcome = { kind: "reused" }
 
     // autoPlan changes the SDK's `tools` allowlist, which is fixed at query()
     // time — unlike planMode (setPermissionMode) it can only be applied by
@@ -2394,8 +2740,9 @@ export class AgentCoordinator {
     ) {
       if (session) {
         session.forceClosed = true
-        session.session.close()
         this.claudeSessions.delete(args.chatId)
+        session.releasePublication()
+        session.session.close()
       }
 
       const sessionInstanceId = crypto.randomUUID()
@@ -2409,8 +2756,22 @@ export class AgentCoordinator {
         autoPlan: args.autoPlan,
         sessionToken: args.sessionToken,
         forkSession: args.forkSession,
-        onToolRequest: args.onToolRequest,
-        customTools: args.customTools,
+        resumeSessionAt: args.resumeSessionAt,
+        resetSession: args.resetSession,
+        onToolRequest: (request) => {
+          if (!args.isCurrentTurn() && this.claudeSessions.get(args.chatId)?.id !== sessionInstanceId) {
+            return Promise.reject(new Error("Claude session was cancelled or replaced"))
+          }
+          return args.onToolRequest(request)
+        },
+        customTools: args.customTools ? {
+          execute: (name, input, signal) => {
+            if (!args.isCurrentTurn() && this.claudeSessions.get(args.chatId)?.id !== sessionInstanceId) {
+              return Promise.resolve({ content: [{ type: "text", text: "Chat turn ended" }], isError: true })
+            }
+            return args.customTools!.execute(name, input, signal)
+          },
+        } : undefined,
         onRateLimitEvent: (info) => this.onClaudeRateLimit?.(info),
         onSubagentActivity: (update) => this.applySubagentActivity(args.chatId, update),
         onBackgroundWorkStateChange: (state) => {
@@ -2418,18 +2779,24 @@ export class AgentCoordinator {
           this.updateClaudeBackgroundWorkState(args.chatId, sessionInstanceId, state)
         },
       })
-      if (!args.isCurrentTurn()) { started.close(); return null }
+      if (args.isCurrentTurn && !args.isCurrentTurn()) { started.close(); return null }
       try {
-        startupOutcome = started.waitForStartupOutcome
-          ? await started.waitForStartupOutcome()
-          : (await started.waitUntilReady?.(), started.startupOutcome ?? { kind: "unknown", reason: "Claude adapter did not report native startup" })
+        if (started.waitForStartupOutcome) startupOutcome = await started.waitForStartupOutcome()
+        else {
+          await started.waitUntilReady?.()
+          startupOutcome = started.startupOutcome ?? { kind: "unknown", reason: "Claude adapter has no verified startup outcome" }
+        }
       } catch (error) {
         started.close()
+        if (!args.isCurrentTurn()) return null
         throw error
       }
-      if (!args.isCurrentTurn()) { started.close(); return null }
+      if (args.isCurrentTurn && !args.isCurrentTurn()) { started.close(); return null }
       this.refreshClaudeModelCatalog(started)
 
+      let releasePublication!: () => void
+      const publicationReady = new Promise<void>((resolve) => { releasePublication = resolve })
+      if (!args.deferPublication) releasePublication()
       session = {
         id: sessionInstanceId,
         chatId: args.chatId,
@@ -2441,6 +2808,8 @@ export class AgentCoordinator {
         serviceTier: args.serviceTier,
         planMode: args.planMode,
         autoPlan: args.autoPlan,
+        publicationReady,
+        releasePublication,
         sessionToken: args.sessionToken,
         accountInfoLoaded: false,
         forceClosed: false,
@@ -2468,26 +2837,52 @@ export class AgentCoordinator {
       }
     }
 
-    if (!args.isCurrentTurn()) return null
+    let retiredUnsentSession = false
+    const retireUnsentSession = () => {
+      if (!createdSession || session.nextPromptSeq !== 0 || retiredUnsentSession) return
+      retiredUnsentSession = true
+      session.forceClosed = true
+      if (this.claudeSessions.get(args.chatId) === session) this.claudeSessions.delete(args.chatId)
+      session.releasePublication()
+      session.session.close()
+    }
     return {
       provider: "claude",
       createdSession,
       startupOutcome,
+      releasePublication: session.releasePublication,
+      getStartupFailure: () => session.streamFailure,
       stream: {
         async *[Symbol.asyncIterator]() {},
       },
       getAccountInfo: session.session.getAccountInfo,
-      interrupt: session.session.interrupt,
+      interrupt: async () => {
+        // Remove an unsent startup before waiting for interrupt: a successor
+        // must create its own native session instead of reusing this handle.
+        retireUnsentSession()
+        await session.session.interrupt()
+      },
       close: () => {
-        if (!createdSession || session.nextPromptSeq !== 0) return
-        if (this.claudeSessions.get(args.chatId) === session) this.claudeSessions.delete(args.chatId)
-        session.session.close()
+        // Cancellation can land after registration but before the turn wrapper
+        // reaches its owner. A new session with no submitted prompt must close;
+        // ordinary cancellation of a reused session keeps its native context.
+        retireUnsentSession()
       },
     }
   }
 
   async send(command: Extract<ClientCommand, { type: "chat.send" }>) {
+    const chatId = command.chatId
+    if (chatId && this.claudeReadinessCommits.has(chatId)
+      && !this.activeTurns.has(chatId) && !this.startingClaudeTurns.has(chatId)) {
+      return await this.withClaudeStartupReservation(chatId, reservation => this.sendWhenHistoryReady(command, reservation))
+    }
+    return await this.sendWhenHistoryReady(command)
+  }
+
+  private async sendWhenHistoryReady(command: Extract<ClientCommand, { type: "chat.send" }>, startupReservation?: symbol) {
     let chatId = command.chatId
+    if (chatId && (this.historyOperations.has(chatId) || this.codexHistoryChecks.has(chatId))) throw new Error("Chat history is being prepared; retry after it finishes")
 
     const requestedNewChatCommand = command.provider === "codex"
       ? parseCodexSlashCommand(command.content)
@@ -2529,7 +2924,7 @@ export class AgentCoordinator {
       this.emitStateChange(chatId)
       return { chatId }
     }
-    if (this.activeTurns.has(chatId) || this.hasPendingCodexSteer(chatId) || this.startingClaudeTurns.has(chatId)) {
+    if (this.activeTurns.has(chatId) || this.hasPendingCodexSteer(chatId) || (this.startingClaudeTurns.has(chatId) && this.startingClaudeTurns.get(chatId) !== startupReservation)) {
       this.analytics.track("message_sent")
       const queuedMessage = await this.enqueueMessage(chatId, command.content, command.attachments ?? [], {
         provider: command.provider,
@@ -2542,23 +2937,659 @@ export class AgentCoordinator {
       return { chatId, queuedMessageId: queuedMessage.id, queued: true as const }
     }
 
-    const settings = this.getProviderSettings(provider, command)
-    this.analytics.track("message_sent")
-    await this.startTurnForChat({
-      chatId,
-      provider,
-      content: command.content,
-      attachments: command.attachments ?? [],
-      model: settings.model,
-      effort: settings.effort,
-      serviceTier: settings.serviceTier,
-      planMode: settings.planMode,
-      autoPlan: settings.autoPlan,
-      appendUserPrompt: true,
-    })
+    const settings = this.getProviderSettings(provider, command, chat)
+    const sendIdle = async (startupReservation?: symbol) => {
+      const isCurrentReservation = () => !startupReservation || this.startingClaudeTurns.get(chatId) === startupReservation
+      if (!isCurrentReservation()) return { chatId }
+      const hasPendingForkUserPrompt = Boolean(chat.pendingForkUserPrompt)
+        && (chat.provider === "claude" || chat.provider === "codex")
+      const messages = (!chat.sessionToken && hasPendingForkUserPrompt) || (provider === "claude" && chat.pendingForkSessionToken)
+        ? this.store.getMessages(chatId) : []
+      const lastMessage = messages.at(-1)
+      const pendingForkUserPrompt = hasPendingForkUserPrompt && !chat.sessionToken && lastMessage?.kind === "user_prompt"
+        ? lastMessage
+        : null
+      const content = pendingForkUserPrompt
+        ? combineUserPromptContent(pendingForkUserPrompt.content, command.content)
+        : command.content
+      const attachments = pendingForkUserPrompt
+        ? [...(pendingForkUserPrompt.attachments ?? []), ...(command.attachments ?? [])]
+        : command.attachments ?? []
+      let replaceTranscriptPrefix = pendingForkUserPrompt ? messages.slice(0, -1) : undefined
+      if (pendingForkUserPrompt && provider === "codex") await this.assertCodexHistoryReady(chatId)
+      let preparedClaudeFork: PreparedClaudeTranscriptFork | undefined
+      if (provider === "claude" && chat.pendingForkSessionToken) {
+        const project = this.store.getProject(chat.projectId)
+        if (!project) throw new Error("Project not found")
+        const prepared = await this.prepareClaudeSessionFn({
+          localPath: project.localPath,
+          sessionToken: chat.pendingForkSessionToken,
+          resumeSessionAt: chat.pendingForkResumeAt ?? undefined,
+          transcriptPrefix: replaceTranscriptPrefix ?? messages,
+        })
+        if (!isCurrentReservation()) return { chatId }
+        if (typeof prepared !== "string") {
+          preparedClaudeFork = prepared
+          replaceTranscriptPrefix = prepared.transcriptPrefix
+        }
+      }
+      this.analytics.track("message_sent")
+      await this.startTurnForChat({
+        chatId,
+        provider,
+        content,
+        attachments,
+        model: settings.model,
+        effort: settings.effort,
+        serviceTier: settings.serviceTier,
+        planMode: settings.planMode,
+        autoPlan: settings.autoPlan,
+        modelSettings: {
+          model: settings.chatModel,
+          modelOptions: settings.chatModelOptions,
+        },
+        appendUserPrompt: true,
+        startupReservation,
+        replaceTranscriptPrefix,
+        ...(preparedClaudeFork ? {
+          sessionToken: preparedClaudeFork.sessionToken,
+          forkSession: false,
+          resumeSessionAt: null,
+          onProviderReady: async (isCurrentTurn, outcome) => {
+            if (!isCurrentTurn() || outcome.kind === "fresh") return
+            await this.store.setSessionToken(chatId, preparedClaudeFork!.sessionToken)
+            if (!isCurrentTurn()) return
+            await this.store.setPendingForkSessionToken(chatId, null)
+            if (!isCurrentTurn()) return
+            await this.store.setPendingForkResumeAt(chatId, null)
+          },
+        } : {}),
+      })
 
 
-    return { chatId }
+      return { chatId }
+    }
+    if (startupReservation) return await sendIdle(startupReservation)
+    return provider === "claude"
+      ? await this.withClaudeStartupReservation(chatId, sendIdle)
+      : await sendIdle()
+  }
+
+  private codexIntegrityKey(chatId: string) {
+    const chat = this.store.requireChat(chatId)
+    return JSON.stringify([
+      chat.provider, chat.sessionToken ?? chat.pendingForkSessionToken ?? null,
+      chat.promptHistoryRevision ?? null,
+      chat.promptHistoryLastMessageAt === undefined ? chat.lastMessageAt ?? null : chat.promptHistoryLastMessageAt,
+      Boolean(chat.pendingForkUserPrompt),
+      "contextRestoration" in chat ? chat.contextRestoration : null,
+    ])
+  }
+
+  private async saveCodexIntegrity(chatId: string, gap?: CodexPromptRecovery["gap"], detail: {
+    messages?: CodexHistoryActionsSnapshot["messages"]; invalidated?: boolean; repair?: import("../shared/types").HistoryRepairStatus;
+    classification?: { sessionToken: string; ids: string[] }
+  } = {}) {
+    const chat = this.store.requireChat(chatId)
+    const segments = { ...chat.codexHistoryIntegrity?.segments }
+    const { classification, ...state } = detail
+    if (classification) {
+      segments[classification.sessionToken] = { ids: classification.ids,
+        ...(gap ? { gap } : {}), ...(state.messages ? { messages: state.messages } : {}),
+        ...(state.invalidated ? { invalidated: true } : {}) }
+    } else if (!gap && !state.invalidated) {
+      const token = chat.sessionToken ?? chat.pendingForkSessionToken
+      const classified = token ? segments[token] : undefined
+      if (classified && !classified.invalidated) {
+        const messages = Object.fromEntries(Object.entries(classified.messages ?? {})
+          .filter(([id]) => this.store.hasUserPrompt(chatId, id)))
+        gap = classified.gap && this.store.hasUserPrompt(chatId, classified.gap.messageId)
+          ? classified.gap : undefined
+        if (Object.keys(messages).length || gap) {
+          state.messages = messages
+          segments[token!] = { ...classified, messages, gap }
+        } else if (token) delete segments[token]
+      } else if (token) delete segments[token]
+    }
+    await this.store.setCodexHistoryIntegrity(chatId, { key: this.codexIntegrityKey(chatId),
+      ...(gap ? { gap } : {}), ...(Object.keys(segments).length ? { segments } : {}), ...state })
+    this.emitStateChange(chatId)
+  }
+
+  private async retainCodexClassification(chatId: string, source: import("./events").CodexHistoryIntegrity | undefined,
+    sourceToken: string, targetToken: string, prefix: TranscriptEntry[]) {
+    if (!source?.segments) return
+    const ids = new Set(prefix.map(entry => entry._id))
+    const segments: NonNullable<typeof source.segments> = {}
+    for (const [token, segment] of Object.entries(source.segments)) {
+      const retained = segment.ids.filter(id => ids.has(id))
+      if (!retained.length) continue
+      segments[token === sourceToken ? targetToken : token] = {
+        ...segment, ids: retained,
+        messages: Object.fromEntries(Object.entries(segment.messages ?? {}).filter(([id]) => ids.has(id))),
+        gap: segment.gap && ids.has(segment.gap.messageId) ? segment.gap : undefined,
+      }
+    }
+    const current = segments[targetToken]
+    await this.store.setCodexHistoryIntegrity(chatId, { ...source, key: this.codexIntegrityKey(chatId),
+      segments, messages: current?.messages, gap: current?.gap, invalidated: current?.invalidated })
+  }
+
+  private async codexHistoryBindings(chatId: string, options: {
+    recover?: boolean; messageId?: string; retry?: boolean; force?: boolean; sessionToken?: string
+  } = {}, owner?: ActiveTurn) {
+    const chat = this.store.requireChat(chatId)
+    const currentSessionToken = chat.sessionToken ?? chat.pendingForkSessionToken ?? null
+    const entries = this.store.getPromptHistoryEntries(chatId), key = this.codexIntegrityKey(chatId)
+    const records = await this.codexPromptHistory.read(chatId)
+    const previousIntegrity = chat.codexHistoryIntegrity
+    const requestedSession = options.sessionToken ?? (options.messageId
+      ? records.prompts[options.messageId]?.sessionToken ?? Object.entries(previousIntegrity?.segments ?? {}).find(([, segment]) => segment.ids.includes(options.messageId!))?.[0]
+      : undefined)
+    const historical = Boolean(requestedSession && requestedSession !== currentSessionToken)
+    const sessionToken = historical ? requestedSession! : currentSessionToken
+    let start = 0, end = entries.length
+    for (let i = 0; i < entries.length; i++)
+      if (["handoff_boundary", "session_restored", "context_cleared"].includes(entries[i]!.kind)) start = i + 1
+    const restoration = chat.contextRestoration
+    if (restoration?.provider === "codex" && restoration.startInclusive !== undefined)
+      start = Math.max(start, restoration.startInclusive)
+    if (restoration?.provider === "codex" && restoration.reason === "provider_switch" && restoration.fromProvider !== "codex")
+      start = Math.max(start, restoration.endExclusive)
+    if (historical && options.messageId) {
+      const target = entries.findIndex(entry => entry._id === options.messageId)
+      if (target < 0) throw new Error("User message not found")
+      start = 0
+      for (let i = 0; i < target; i++)
+        if (["handoff_boundary", "session_restored", "context_cleared"].includes(entries[i]!.kind)) start = i + 1
+      const next = entries.findIndex((entry, i) => i > target && ["handoff_boundary", "session_restored", "context_cleared"].includes(entry.kind))
+      if (next >= 0) end = next
+    }
+    // Retain the marker so the first recovered turn preserves older local context.
+    const marker = start > 0 && ["handoff_boundary", "session_restored", "context_cleared"].includes(entries[start - 1]?.kind ?? "")
+    let segment = entries.slice(marker ? start - 1 : start, end)
+    if (chat.pendingForkUserPrompt && !historical) {
+      let draft = -1
+      for (let i = segment.length - 1; i >= 0; i--) if (segment[i]!.kind === "user_prompt") { draft = i; break }
+      if (draft >= 0) segment = segment.slice(0, draft)
+    }
+    const prompts = segment.filter((entry) => entry.kind === "user_prompt" && !entry.hidden && !entry.parentToolUseId)
+    const assertStable = () => {
+      const current = this.store.requireChat(chatId)
+      if ((current.sessionToken ?? current.pendingForkSessionToken ?? null) !== currentSessionToken
+        || this.codexIntegrityKey(chatId) !== key || (this.activeTurns.has(chatId) && this.activeTurns.get(chatId) !== owner) || owner?.cancelRequested)
+        throw new Error("Chat changed while recovering Codex history; retry the action")
+    }
+    const integrity = historical ? previousIntegrity?.segments?.[sessionToken!]
+      : previousIntegrity?.key === key ? previousIntegrity : undefined
+    const publish = async (gap: CodexPromptRecovery["gap"], detail: {
+      messages?: CodexHistoryActionsSnapshot["messages"]; invalidated?: boolean; repair?: import("../shared/types").HistoryRepairStatus
+    } = {}) => {
+      if (!historical) return this.saveCodexIntegrity(chatId, gap, { ...detail,
+        ...(sessionToken ? { classification: { sessionToken, ids: prompts.map(entry => entry._id) } } : {}) })
+      const current = this.store.requireChat(chatId).codexHistoryIntegrity
+      const { repair, ...state } = detail
+      await this.store.setCodexHistoryIntegrity(chatId, { ...current, key: current?.key ?? "", repair,
+        segments: { ...current?.segments, [sessionToken!]: { ids: prompts.map(entry => entry._id), ...state, ...(gap ? { gap } : {}) } } })
+      this.emitStateChange(chatId)
+    }
+    const force = options.force || integrity?.invalidated
+    if (force) for (const prompt of prompts) delete records.prompts[prompt._id]
+    const savedPrefix: Record<string, CodexPromptBinding> = {}
+    let missing: typeof prompts[number] | undefined
+    for (const prompt of prompts) {
+      const binding = records.prompts[prompt._id]
+      if (!sessionToken || binding?.sessionToken !== sessionToken) {
+        if (integrity?.messages?.[prompt._id] === "missing") continue
+        missing = prompt; break
+      }
+      savedPrefix[prompt._id] = binding
+    }
+    const savedGap = integrity?.gap && prompts.some(prompt => prompt._id === integrity.gap!.messageId)
+      ? integrity.gap : undefined
+    let recovered: CodexPromptRecovery = { bindings: savedPrefix, ...(savedGap ? { gap: savedGap } : {}) }
+    // A confirmed earlier target never depends on unknown later inputs.
+    const targetConfirmed = Boolean(options.messageId && (savedPrefix[options.messageId]
+      || (!prompts.some(prompt => prompt._id === options.messageId) && records.prompts[options.messageId])))
+    const recover = options.recover && missing && (force || (!targetConfirmed
+      && (!integrity?.messages || !integrity.messages[missing._id])))
+    let messages = integrity?.messages
+    if (recover) {
+      if (this.codexHistoryChecks.has(chatId)) throw new Error("Codex history check is already running")
+      const reservation = Symbol(chatId)
+      this.codexHistoryChecks.set(chatId, reservation)
+      const assertCheck = () => {
+        assertStable()
+        if (this.cancelledCodexHistoryChecks.has(reservation)) throw new Error("Codex history check was cancelled")
+      }
+      try {
+        await publish(savedGap, { messages, ...(force ? { invalidated: true } : {}),
+          repair: { phase: "running", message: "Checking message correspondence with Codex…" } })
+        this.emitStateChange(chatId, { immediate: true })
+        assertCheck()
+        if (force) {
+          await this.codexPromptHistory.remember(chatId, {}, prompts.map(entry => entry._id))
+          assertCheck()
+        }
+        if (!sessionToken) {
+          recovered.gap = { messageId: missing!._id,
+            error: "Cannot recover Codex prompt boundary: this message has no accepted Codex session" }
+          messages = Object.fromEntries(prompts.map(entry => [entry._id, "missing" as const]))
+        } else {
+          // Only a successful API snapshot establishes absence. Request errors
+          // preserve good bindings and do not classify any input as missing.
+          const native = await this.codexManager.readPromptHistory({ cwd: this.store.getProject(chat.projectId)!.localPath, threadId: sessionToken })
+          const classified = classifyCodexPromptHistory(segment, sessionToken, native.inputs, records.prompts, records.turns)
+          recovered = classified
+          messages = classified.messages
+        }
+        assertCheck()
+        await this.codexPromptHistory.remember(chatId, recovered.bindings, prompts.map(entry => entry._id))
+        assertCheck()
+        await publish(recovered.gap, { messages,
+          repair: { phase: "done", message: recovered.gap
+            ? "History checked. Unsynchronized messages are marked and retained."
+            : "History checked. Message correspondence is restored." } })
+        assertCheck()
+      } catch (error) {
+        // Never publish a checkpoint for a changed context or cancelled action.
+        assertCheck()
+        await publish(savedGap, { messages: integrity?.messages, ...(force ? { invalidated: true } : {}),
+          repair: { phase: "failed", message: `History check failed: ${error instanceof Error ? error.message : String(error)}` } })
+        throw error
+      } finally {
+        this.codexHistoryChecks.delete(chatId)
+        this.cancelledCodexHistoryChecks.delete(reservation)
+        this.emitStateChange(chatId, { immediate: true })
+      }
+    } else if (options.recover && !missing) {
+      await publish(recovered.gap, { messages })
+    }
+    assertStable()
+    const bindings = { ...records.prompts }
+    for (const prompt of prompts) delete bindings[prompt._id]
+    Object.assign(bindings, recovered.bindings)
+    for (const binding of Object.values(bindings)) {
+      const turn = records.turns[`${binding.sessionToken}:${binding.turnId}`]
+      if (turn) binding.boundaryEntryId = turn.boundaryEntryId
+    }
+    const unresolved = prompts.filter((entry) => !recovered.bindings[entry._id]
+      && !messages?.[entry._id]).map((entry) => entry._id)
+    const currentIntegrity = this.store.requireChat(chatId).codexHistoryIntegrity
+    const allMessages: NonNullable<CodexHistoryActionsSnapshot["messages"]> = Object.assign({},
+      ...Object.values(currentIntegrity?.segments ?? {}).map(value => value.messages ?? {}),
+      currentIntegrity?.key === key ? currentIntegrity.messages ?? {} : {}, messages ?? {})
+    const visibleIds = new Set(entries.map(entry => entry._id))
+    for (const id of Object.keys(allMessages)) if (!visibleIds.has(id)) delete allMessages[id]
+    return { bindings, gap: recovered.gap, sessionToken, entries, unresolved, messages: allMessages }
+  }
+
+  private async assertCodexHistoryReady(chatId: string, owner?: ActiveTurn) {
+    const chat = this.store.requireChat(chatId)
+    if (chat.provider !== "codex" && chat.contextRestoration?.provider !== "codex") return
+    const integrity = chat.codexHistoryIntegrity
+    if (integrity?.key === this.codexIntegrityKey(chatId) && !integrity.invalidated && (!integrity.gap || integrity.messages !== undefined) && (!integrity.repair || integrity.repair.phase === "done")) {
+      return
+    }
+    if (this.store.getTranscriptLength(chatId) === 0) {
+      await this.saveCodexIntegrity(chatId)
+      return
+    }
+    await this.codexHistoryBindings(chatId, { recover: true }, owner)
+  }
+
+  private codexFreshReplayBoundary(chatId: string) {
+    const restoration = this.store.requireChat(chatId).contextRestoration
+    if (restoration?.provider !== "codex") return undefined
+    if (restoration.reason === "explicit_reset") return restoration.startInclusive
+    if (restoration.reason === "provider_switch" && restoration.fromProvider !== "codex")
+      return restoration.endExclusive
+    return undefined
+  }
+
+  private async prepareCodexHistoryPlan(chatId: string, messageId: string, plan: { sessionToken: string; beforeTurnId?: string; afterTurnId?: string }, cwd: string, settings: ProviderSettings) {
+    try {
+      if (plan.beforeTurnId) return await this.codexManager.forkBeforeTurn({ cwd, threadId: plan.sessionToken,
+        beforeTurnId: plan.beforeTurnId, model: settings.model, serviceTier: settings.serviceTier })
+      if (plan.afterTurnId) return await this.codexManager.forkAfterTurn({ cwd, threadId: plan.sessionToken,
+        afterTurnId: plan.afterTurnId, model: settings.model, serviceTier: settings.serviceTier })
+      return null
+    } catch (error) {
+      if (!isMissingCodexHistoryBoundary(error)) throw error
+      await this.codexHistoryBindings(chatId, { recover: true, force: true, sessionToken: plan.sessionToken, messageId })
+      // The action was prepared against stale bindings. Do not retry that plan
+      // or publish its transcript; let the user review the marked messages.
+      throw new Error("History checked after Codex rejected a saved boundary. Retry the edit or fork using the updated message correspondence.")
+    }
+  }
+
+  async getHistoryActions(chatId: string, options: { recover?: boolean; messageId?: string; retry?: boolean } = {}): Promise<CodexHistoryActionsSnapshot> {
+    const chat = this.store.requireChat(chatId)
+    if (chat.provider !== "codex" || this.activeTurns.has(chatId)
+      || this.drainingStreams.has(chatId) || this.historyOperations.has(chatId) || this.codexHistoryChecks.has(chatId)) return { actions: {} }
+    const key = this.codexIntegrityKey(chatId)
+    const token = chat.sessionToken ?? chat.pendingForkSessionToken ?? null
+    const recovered = await this.codexHistoryBindings(chatId, options)
+    const current = this.store.requireChat(chatId)
+    if (current.provider !== "codex" || (current.sessionToken ?? current.pendingForkSessionToken ?? null) !== token
+      || this.codexIntegrityKey(chatId) !== key || this.activeTurns.has(chatId)
+      || this.historyOperations.has(chatId))
+      throw new Error("Chat changed while recovering Codex history; retry the action")
+    const entries = recovered.entries
+    const actions: CodexHistoryActionsSnapshot["actions"] = {}
+    for (const entry of entries) if (entry.kind === "user_prompt" && !entry.hidden && !entry.parentToolUseId) {
+      const binding = recovered.bindings[entry._id]
+      if (binding) actions[entry._id] = binding.mergeTurn ? "merge-turn" : "ordinary"
+    }
+    for (const id of recovered.unresolved) actions[id] = "recover"
+    for (const [sessionToken, segment] of Object.entries(current.codexHistoryIntegrity?.segments ?? {})) {
+      if (segment.invalidated) for (const id of segment.ids) actions[id] = "recover"
+      if (!segment.gap || segment.invalidated) continue
+      try {
+        const plan = planCodexGapReplay(entries, segment.gap.messageId, sessionToken, { bindings: recovered.bindings, gap: segment.gap })
+        actions[segment.gap.messageId] = plan.merged ? "merge-turn" : "ordinary"
+      } catch { /* Unconfirmed context boundaries remain blocked. */ }
+    }
+    const currentGap = current.codexHistoryIntegrity?.key === key ? current.codexHistoryIntegrity.gap : undefined
+    const gaps = [currentGap, recovered.gap].filter((gap): gap is NonNullable<typeof gap> => Boolean(gap))
+    for (const gap of gaps) {
+      try {
+        const plan = planCodexGapReplay(entries, gap.messageId, gap === currentGap ? token ?? "" : recovered.sessionToken ?? "",
+          { bindings: recovered.bindings, gap }, undefined, this.codexFreshReplayBoundary(chatId))
+        actions[gap.messageId] = plan.merged ? "merge-turn" : "ordinary"
+      } catch { /* The gap remains visible when its boundary cannot be replayed safely. */ }
+    }
+    if (chat.pendingForkUserPrompt && !recovered.gap) {
+      const draft = entries.slice().reverse().find((entry) => entry.kind === "user_prompt")
+      if (draft) actions[draft._id] = "ordinary"
+    }
+    const gap = currentGap ?? recovered.gap
+    return { actions, ...(gap ? { gap } : {}), ...(recovered.messages ? { messages: recovered.messages } : {}) }
+  }
+
+  private assertHistoryOperation(chatId: string) {
+    const operation = this.historyOperations.get(chatId)
+    if (!operation) return
+    const chat = this.store.requireChat(chatId)
+    if (
+      operation.cancelled ||
+      (!operation.publicationStarted &&
+        (operation.sessionToken !==
+          (chat.sessionToken ?? chat.pendingForkSessionToken ?? null) ||
+          operation.snapshot !==
+            JSON.stringify(this.store.getMessages(chatId))))
+    ) {
+      throw new Error(
+        "Chat changed or history operation was cancelled; retry the action",
+      )
+    }
+  }
+
+  private async withHistoryOperation<T>(
+    chatId: string,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    if (
+      this.historyOperations.has(chatId) || this.codexHistoryChecks.has(chatId) ||
+      this.activeTurns.has(chatId) ||
+      this.drainingStreams.has(chatId)
+    ) {
+      throw new Error("Chat must be idle before changing history")
+    }
+    const chat = this.store.requireChat(chatId)
+    const operation = {
+      cancelled: false,
+      snapshot: JSON.stringify(this.store.getMessages(chatId)),
+      turnCount: chat.turnCount,
+      sessionToken: chat.sessionToken ?? chat.pendingForkSessionToken ?? null,
+      sourceSessionToken: chat.sessionToken ?? null,
+      pendingForkSessionToken: chat.pendingForkSessionToken ?? null,
+      pendingForkResumeAt: chat.pendingForkResumeAt ?? null,
+      pendingForkUserPrompt: Boolean(chat.pendingForkUserPrompt),
+      codexHistoryIntegrity: undefined as import("./events").CodexHistoryIntegrity | undefined,
+      codexPrompts: undefined as Record<string, CodexPromptBinding> | undefined,
+      publicationStarted: false,
+      publicationCommitted: false,
+      turn: undefined as HarnessTurn | undefined,
+    }
+    this.historyOperations.set(chatId, operation)
+    this.emitStateChange(chatId)
+    try {
+      const result = await action()
+      this.assertHistoryOperation(chatId)
+      return result
+    } catch (error) {
+      if (
+        operation.publicationStarted && (!operation.publicationCommitted || operation.cancelled) &&
+        this.historyOperations.get(chatId) === operation &&
+        this.store.getChat(chatId)
+      ) {
+        void operation.turn?.interrupt().catch(() => {})
+        this.codexManager.stopSession(chatId)
+        // The reservation excludes successor sends while an already-issued
+        // transcript write settles. Restore its original source before release.
+        await this.store.replaceTranscript(
+          chatId,
+          JSON.parse(operation.snapshot),
+        )
+        await this.store.restoreTurnCount(chatId, operation.turnCount)
+        await this.store.setSessionToken(chatId, operation.sourceSessionToken)
+        await this.store.setPendingForkSessionToken(
+          chatId,
+          operation.pendingForkSessionToken,
+        )
+        await this.store.setPendingForkResumeAt(
+          chatId,
+          operation.pendingForkResumeAt,
+        )
+        await this.store.setPendingForkUserPrompt(
+          chatId,
+          operation.pendingForkUserPrompt,
+        )
+        if (operation.codexPrompts) await this.codexPromptHistory.remember(chatId, operation.codexPrompts)
+        if (operation.codexHistoryIntegrity)
+          await this.store.setCodexHistoryIntegrity(chatId, { ...operation.codexHistoryIntegrity, key: this.codexIntegrityKey(chatId) })
+      }
+      throw error
+    } finally {
+      if (this.historyOperations.get(chatId) === operation)
+        this.historyOperations.delete(chatId)
+      this.emitStateChange(chatId)
+    }
+  }
+
+  async editUserPrompt(command: Extract<ClientCommand, { type: "chat.editUserPrompt" }>) {
+    if (this.store.requireChat(command.chatId).provider === "codex") {
+      return this.withHistoryOperation(command.chatId, () => this.performEditUserPrompt(command))
+    }
+    return this.performEditUserPrompt(command)
+  }
+
+  private async performEditUserPrompt(command: Extract<ClientCommand, { type: "chat.editUserPrompt" }>) {
+    let content = command.content.trim()
+    if (!content) {
+      throw new Error("Message cannot be empty")
+    }
+    if (this.activeTurns.has(command.chatId) || this.startingClaudeTurns.has(command.chatId) || this.drainingStreams.has(command.chatId)) {
+      throw new Error("Chat must be idle before editing history")
+    }
+
+    const chat = this.store.requireChat(command.chatId)
+    if (!chat.provider) {
+      throw new Error("Chat has no provider")
+    }
+    const project = this.store.getProject(chat.projectId)
+    if (!project) {
+      throw new Error("Project not found")
+    }
+
+    const provider = chat.provider
+    const editIdle = async (startupReservation?: symbol) => {
+      const isCurrentReservation = () => !startupReservation || this.startingClaudeTurns.get(command.chatId) === startupReservation
+      if (!isCurrentReservation()) return { chatId: command.chatId }
+      const messages = this.store.getMessages(command.chatId)
+      const targetIndex = messages.findIndex((entry) => entry._id === command.messageId)
+      const target = messages[targetIndex]
+      if (!target || target.kind !== "user_prompt") {
+        throw new Error("User message not found")
+      }
+
+      let prefix = messages.slice(0, targetIndex)
+      let attachments = target.attachments ?? []
+      const affectedTurns = countUserPrompts(messages.slice(targetIndex))
+      if (affectedTurns < 1) {
+        throw new Error("No chat turns found to edit")
+      }
+
+      const hasPriorPrompt = countUserPrompts(prefix) > 0
+      let sessionToken: string | null | undefined
+      let forkSession: boolean | undefined
+      let resumeSessionAt: string | null | undefined
+      let resetSession: boolean | undefined
+      let pendingForkSessionToken: string | null | undefined
+      let onProviderReady: ((isCurrentTurn: () => boolean, outcome: HarnessStartupOutcome) => Promise<void>) | undefined
+      let stopCodexSessionOnStartFailure = false
+
+      const settings = this.getProviderSettings(provider, command, chat)
+      const sourceSessionToken = chat.sessionToken ?? chat.pendingForkSessionToken ?? null
+      if (chat.provider === "codex" && chat.pendingForkUserPrompt && !chat.sessionToken && messages.at(-1)?._id === command.messageId) {
+        await this.assertCodexHistoryReady(command.chatId)
+        sessionToken = null
+        pendingForkSessionToken = chat.pendingForkSessionToken
+      } else if (chat.provider === "codex") {
+        const recovered = await this.codexHistoryBindings(command.chatId, { recover: true, messageId: command.messageId })
+        const bindings = recovered.bindings
+        const plan = bindings[command.messageId]
+          ? planCodexPromptHistory(messages, command.messageId, bindings, content)
+          : planCodexGapReplay(messages, command.messageId, recovered.sessionToken ?? sourceSessionToken ?? "", recovered, content, this.codexFreshReplayBoundary(command.chatId))
+        content = plan.content
+        prefix = plan.prefix
+        attachments = plan.attachments
+        sessionToken = await this.prepareCodexHistoryPlan(command.chatId, command.messageId, plan, project.localPath, settings)
+        this.assertHistoryOperation(command.chatId)
+        pendingForkSessionToken = null
+        stopCodexSessionOnStartFailure = true
+        const prepared = sessionToken
+        onProviderReady = async (isCurrentTurn, outcome) => {
+          if (!isCurrentTurn() || outcome.kind === "fresh") return
+          this.assertHistoryOperation(command.chatId)
+          if (!isCurrentTurn()) return
+          await this.store.setPendingForkSessionToken(command.chatId, null)
+          this.assertHistoryOperation(command.chatId)
+          if (!isCurrentTurn()) return
+          const retained: Record<string, CodexPromptBinding> = {}
+          for (const entry of prefix) if (bindings[entry._id]) {
+            const binding = bindings[entry._id]!
+            retained[entry._id] = { ...binding,
+              sessionToken: binding.sessionToken === plan.sessionToken ? prepared! : binding.sessionToken }
+          }
+          await this.codexPromptHistory.remember(command.chatId, retained)
+          await this.retainCodexClassification(command.chatId, chat.codexHistoryIntegrity,
+            plan.sessionToken, prepared!, prefix)
+        }
+      } else if (chat.provider === "claude") {
+        const previousResumePoint = findPreviousClaudeResumePoint(messages, targetIndex)
+        if (previousResumePoint && (previousResumePoint.sessionToken || sourceSessionToken)) {
+          const resumeSessionToken = previousResumePoint.sessionToken ?? sourceSessionToken
+          const preparedEdit = this.preparedClaudeEditSessions.get(command.chatId)
+          if (
+            preparedEdit
+            && preparedEdit.sourceSessionToken === resumeSessionToken
+            && preparedEdit.resumeSessionAt === previousResumePoint.messageId
+          ) {
+            sessionToken = preparedEdit.sessionToken
+            prefix = preparedEdit.transcriptPrefix
+          } else {
+            const prepared = await this.prepareClaudeSessionFn({
+              localPath: project.localPath,
+              sessionToken: resumeSessionToken!,
+              resumeSessionAt: previousResumePoint.messageId,
+              boundarySessionToken: previousResumePoint.sessionToken,
+              transcriptPrefix: prefix,
+            })
+            if (!isCurrentReservation()) return { chatId: command.chatId }
+            sessionToken = typeof prepared === "string" ? prepared : prepared.sessionToken
+            if (typeof prepared !== "string") prefix = prepared.transcriptPrefix
+            this.preparedClaudeEditSessions.set(command.chatId, {
+              sourceSessionToken: resumeSessionToken!,
+              resumeSessionAt: previousResumePoint.messageId,
+              sessionToken,
+              transcriptPrefix: prefix,
+            })
+          }
+          const preparedSessionToken = sessionToken
+          onProviderReady = async (isCurrentTurn, outcome) => {
+            if (!isCurrentTurn()) return
+            if (outcome.kind !== "fresh") await this.store.setSessionToken(command.chatId, preparedSessionToken)
+            if (!isCurrentTurn()) return
+            this.preparedClaudeEditSessions.delete(command.chatId)
+          }
+          forkSession = false
+          resumeSessionAt = null
+          resetSession = true
+        } else {
+          if (hasPriorPrompt) {
+            throw new Error("Chat has no Claude resume point before this message")
+          }
+          sessionToken = null
+          forkSession = false
+          resetSession = true
+          onProviderReady = async () => {
+            // Startup may have observed a fresh token without publishing it.
+            // Commit that pointer only once replacement history is ready.
+            if (this.store.requireChat(command.chatId).sessionToken === sourceSessionToken) {
+              await this.store.setSessionToken(command.chatId, this.claudeSessions.get(command.chatId)?.sessionToken ?? null)
+            }
+          }
+        }
+      } else {
+        throw new Error(`Editing chat history is not supported for ${chat.provider}`)
+      }
+
+      if (stopCodexSessionOnStartFailure) {
+        // Reconnect pending-fork preparation with the normal Kanna tool host.
+        this.codexManager.stopSession(command.chatId)
+      }
+
+      this.analytics.track("message_sent")
+      try {
+        await this.startTurnForChat({
+          chatId: command.chatId,
+          provider: chat.provider,
+          content,
+          attachments,
+          model: settings.model,
+          effort: settings.effort,
+          serviceTier: settings.serviceTier,
+          planMode: settings.planMode,
+          autoPlan: settings.autoPlan,
+          modelSettings: {
+            model: settings.chatModel,
+            modelOptions: settings.chatModelOptions,
+          },
+          appendUserPrompt: true,
+          startupReservation,
+          sessionToken,
+          pendingForkSessionToken,
+          forkSession,
+          resumeSessionAt,
+          resetSession,
+          replaceTranscriptPrefix: prefix,
+          expectedCodexSessionToken: stopCodexSessionOnStartFailure ? sessionToken ?? undefined : undefined,
+          onProviderReady,
+        })
+      } catch (error) {
+        if (stopCodexSessionOnStartFailure) {
+          this.codexManager.stopSession(command.chatId)
+        }
+        throw error
+      }
+
+      return { chatId: command.chatId }
+    }
+    return chat.provider === "claude"
+      ? await this.withClaudeStartupReservation(command.chatId, editIdle)
+      : await editIdle()
   }
 
   async enqueue(command: Extract<ClientCommand, { type: "message.enqueue" }>) {
@@ -2597,6 +3628,10 @@ export class AgentCoordinator {
     if (!queuedMessage) {
       throw new Error("Queued message not found")
     }
+    // Before native startup registers an active turn there is no turn to
+    // interrupt. Keep the queued message for the owning turn's normal drain.
+    if (this.startingClaudeTurns.has(command.chatId) && !this.activeTurns.has(command.chatId)) return
+
     // Before native startup registers an active turn there is no turn to
     // interrupt. Keep the queued message for the owning turn's normal drain.
     if (this.startingClaudeTurns.has(command.chatId) && !this.activeTurns.has(command.chatId)) return
@@ -2908,7 +3943,7 @@ export class AgentCoordinator {
       model: chat.lastModel,
       planMode: chat.planMode,
       autoPlan: chat.autoPlan,
-    })
+    }, chat)
     await this.startTurnForChat({
       chatId,
       provider: chat.provider,
@@ -2924,7 +3959,17 @@ export class AgentCoordinator {
     return true
   }
 
-  async forkChat(chatId: string) {
+  async forkChat(commandOrChatId: string | Extract<ClientCommand, { type: "chat.fork" }>) {
+    const command = typeof commandOrChatId === "string"
+      ? { type: "chat.fork" as const, chatId: commandOrChatId }
+      : commandOrChatId
+
+    if (command.messageId) {
+      return await this.forkChatAtUserPrompt(command)
+    }
+
+    const chatId = command.chatId
+    if (this.codexHistoryChecks.has(chatId)) throw new Error("A Codex history check is running; retry after it finishes")
     const chat = this.store.requireChat(chatId)
     if (!chat.provider) {
       throw new Error("Chat must have a provider before forking")
@@ -2987,8 +4032,9 @@ export class AgentCoordinator {
    */
   private async resumeBackgroundTurn(session: ClaudeSessionState) {
     if (this.claudeSessions.get(session.chatId) !== session
-      || this.activeTurns.has(session.chatId)) return
-    if (this.startingClaudeTurns.has(session.chatId)) return
+      || this.activeTurns.has(session.chatId)
+      || this.startingClaudeTurns.has(session.chatId)
+      || this.claudeReadinessCommits.has(session.chatId)) return
     const active: ActiveTurn = {
       chatId: session.chatId,
       provider: "claude",
@@ -3017,17 +4063,195 @@ export class AgentCoordinator {
     this.emitStateChange(session.chatId)
   }
 
+  private async forkChatAtUserPrompt(command: Extract<ClientCommand, { type: "chat.fork" }>) {
+    if (this.store.requireChat(command.chatId).provider === "codex") {
+      return this.withHistoryOperation(command.chatId, () => this.performForkChatAtUserPrompt(command))
+    }
+    return this.performForkChatAtUserPrompt(command)
+  }
+
+  private async performForkChatAtUserPrompt(
+    command: Extract<ClientCommand, { type: "chat.fork" }>,
+  ) {
+    if (
+      this.activeTurns.has(command.chatId) || this.startingClaudeTurns.has(command.chatId) ||
+      this.drainingStreams.has(command.chatId)
+    ) {
+      throw new Error("Chat must be idle before forking history")
+    }
+
+    const chat = this.store.requireChat(command.chatId)
+    if (!chat.provider) {
+      throw new Error("Chat has no provider")
+    }
+    const project = this.store.getProject(chat.projectId)
+    if (!project) {
+      throw new Error("Project not found")
+    }
+
+    const messages = this.store.getMessages(command.chatId)
+    const targetIndex = messages.findIndex(
+      (entry) => entry._id === command.messageId,
+    )
+    const target = messages[targetIndex]
+    if (!target || target.kind !== "user_prompt") {
+      throw new Error("User message not found")
+    }
+
+    let prefix = messages.slice(0, targetIndex)
+    let transcriptPrefix = messages.slice(0, targetIndex + 1)
+    let codexPlan: ReturnType<typeof planCodexPromptHistory> | ReturnType<typeof planCodexGapReplay> | undefined
+    let codexBindings: Record<string, CodexPromptBinding> | undefined
+    const affectedTurns = countUserPrompts(messages.slice(targetIndex))
+    if (affectedTurns < 1) {
+      throw new Error("No chat turns found to fork")
+    }
+
+    const sourceSessionToken =
+      chat.sessionToken ?? chat.pendingForkSessionToken ?? null
+    let pendingForkSessionToken = sourceSessionToken
+    let pendingForkResumeAt: string | null = null
+
+    const unsentCodexDraft =
+      chat.provider === "codex" &&
+      chat.pendingForkUserPrompt &&
+      !chat.sessionToken &&
+      messages.at(-1)?._id === command.messageId
+    if (chat.provider === "codex" && !unsentCodexDraft) {
+      const recovered = await this.codexHistoryBindings(command.chatId, { recover: true, messageId: command.messageId })
+      codexBindings = recovered.bindings
+      codexPlan = codexBindings[command.messageId!]
+        ? planCodexPromptHistory(messages, command.messageId!, codexBindings)
+        : planCodexGapReplay(messages, command.messageId!, recovered.sessionToken ?? sourceSessionToken ?? "", recovered, undefined, this.codexFreshReplayBoundary(command.chatId))
+      prefix = codexPlan.prefix
+      transcriptPrefix = [
+        ...prefix,
+        {
+          ...target,
+          _id: crypto.randomUUID(),
+          content: codexPlan.content,
+          attachments: codexPlan.attachments,
+          steered: false,
+        },
+      ]
+    } else if (chat.provider === "codex" && unsentCodexDraft) {
+      // Keep the prepared prefix and still-unsent prompt without another cut.
+    } else if (chat.provider === "claude") {
+      const hasPriorPrompt = countUserPrompts(prefix) > 0
+      const previousResumePoint = findPreviousClaudeResumePoint(
+        messages,
+        targetIndex,
+      )
+      if (
+        previousResumePoint &&
+        (previousResumePoint.sessionToken || sourceSessionToken)
+      ) {
+        pendingForkSessionToken =
+          previousResumePoint.sessionToken ?? sourceSessionToken
+        pendingForkResumeAt = previousResumePoint.messageId
+      } else {
+        if (hasPriorPrompt) {
+          throw new Error("Chat has no Claude resume point before this message")
+        }
+        pendingForkSessionToken = null
+      }
+    } else {
+      throw new Error(
+        `Forking chat history is not supported for ${chat.provider}`,
+      )
+    }
+
+    const settings = this.getProviderSettings(chat.provider, command, chat)
+    let preparedCodexSession: string | null | undefined
+    if (codexPlan) {
+      preparedCodexSession = await this.prepareCodexHistoryPlan(command.chatId, command.messageId!, codexPlan, project.localPath, settings)
+      this.assertHistoryOperation(command.chatId)
+      pendingForkSessionToken = preparedCodexSession
+    }
+    const forked = await this.store.forkChat(command.chatId, {
+      transcriptEntries: transcriptPrefix,
+      pendingForkSessionToken,
+      pendingForkResumeAt,
+      pendingForkUserPrompt: true,
+    })
+
+    try {
+      this.assertHistoryOperation(command.chatId)
+      if (chat.provider === "codex" && codexPlan && preparedCodexSession) {
+        const sessionToken = preparedCodexSession!
+        await this.store.setPendingForkSessionToken(forked.id, sessionToken)
+        this.assertHistoryOperation(command.chatId)
+        const retained: Record<string, CodexPromptBinding> = {}
+        for (const entry of prefix)
+          if (codexBindings![entry._id]) {
+            const binding = codexBindings![entry._id]!
+            retained[entry._id] = {
+              ...binding,
+              sessionToken:
+                binding.sessionToken === codexPlan!.sessionToken
+                  ? sessionToken
+                  : binding.sessionToken,
+            }
+          }
+        await this.codexPromptHistory.remember(forked.id, retained)
+        await this.retainCodexClassification(forked.id, chat.codexHistoryIntegrity,
+          codexPlan.sessionToken, sessionToken, prefix)
+        await this.saveCodexIntegrity(forked.id)
+        this.assertHistoryOperation(command.chatId)
+      }
+    } catch (error) {
+      this.codexManager.stopSession(forked.id)
+      await this.store.deleteChat(forked.id)
+      throw error
+    }
+
+    this.analytics.track("chat_created")
+    return { chatId: forked.id }
+  }
+
+  private async restoreClaudeSessionTokenAfterFailedTurn(session: ClaudeSessionState, active: ActiveTurn) {
+    if (active.claudeSourceSessionToken === undefined) return
+    const chat = this.store.getChat(session.chatId)
+    if (!chat || chat.sessionToken === active.claudeSourceSessionToken) return
+    await this.store.setSessionToken(session.chatId, active.claudeSourceSessionToken)
+  }
+
   private async runClaudeSession(session: ClaudeSessionState) {
     const customToolEvents = new KannaToolEventFilter()
     const isCurrentClaudeSession = () => this.claudeSessions.get(session.chatId) === session
       && (!this.activeTurns.has(session.chatId) || this.activeTurns.get(session.chatId)?.provider === "claude")
     try {
       for await (const event of session.session.stream) {
+        if (!isCurrentClaudeSession()) {
+          logClaudeSteer("claude_stale_session_event_suppressed", {
+            chatId: session.chatId,
+            sessionId: session.id,
+            eventType: event.type,
+          })
+          break
+        }
+
+        // Starting the iterator can itself have SDK side effects, so leave it
+        // running while deferred history commits. Keep observed tokens local;
+        // no event may change durable state until the owning startup is ready.
+        if (event.type === "session_token" && event.sessionToken) session.sessionToken = event.sessionToken
+        await session.publicationReady
         if (!isCurrentClaudeSession()) break
+
         if (event.type === "session_token" && event.sessionToken) {
-          session.sessionToken = event.sessionToken
-          await this.store.setSessionToken(session.chatId, event.sessionToken)
+          if (this.store.getChat(session.chatId)?.sessionToken !== event.sessionToken) {
+            await this.store.setSessionToken(session.chatId, event.sessionToken)
+          }
           if (!isCurrentClaudeSession()) break
+          const chat = this.store.getChat(session.chatId)
+          if (
+            chat?.pendingForkSessionToken
+            && session.sessionToken !== chat.pendingForkSessionToken
+          ) {
+            await this.store.setPendingForkSessionToken(session.chatId, null)
+            if (!isCurrentClaudeSession()) break
+            await this.store.setPendingForkResumeAt(session.chatId, null)
+          }
           this.emitStateChange(session.chatId)
           continue
         }
@@ -3105,6 +4329,7 @@ export class AgentCoordinator {
             && session.sessionToken !== chat.pendingForkSessionToken
           ) {
             await this.store.setPendingForkSessionToken(session.chatId, null)
+            await this.store.setPendingForkResumeAt(session.chatId, null)
           }
           logClaudeSteer("claude_event_system_init", {
             chatId: session.chatId,
@@ -3136,9 +4361,15 @@ export class AgentCoordinator {
         if (event.entry.kind === "result" && active?.provider === "claude" && completesActive) {
           active.hasFinalResult = true
           if (event.entry.isError) {
+            await this.restoreClaudeSessionTokenAfterFailedTurn(session, active)
+            session.forceClosed = true
+            session.session.close()
+            this.claudeSessions.delete(session.chatId)
             await this.store.recordTurnFailed(session.chatId, event.entry.result || "Turn failed")
           } else if (!active.cancelRequested) {
-            if (active.contextRestorationId && this.activeTurns.get(session.chatId) === active) await this.store.acknowledgeContextRestoration(session.chatId, active.contextRestorationId)
+            if (active.contextRestorationId && this.activeTurns.get(session.chatId) === active) {
+                await this.store.acknowledgeContextRestoration(session.chatId, active.contextRestorationId)
+              }
             if (!active.cancelRequested && this.activeTurns.get(session.chatId) === active) await this.store.recordTurnFinished(session.chatId)
           }
           active.customTools?.abort()
@@ -3162,8 +4393,11 @@ export class AgentCoordinator {
         this.emitStateChange(session.chatId)
       }
     } catch (error) {
+      session.streamFailure = error instanceof Error ? error : new Error(String(error))
+      await session.publicationReady
       const active = this.claudeSessions.get(session.chatId) === session
-        ? this.activeTurns.get(session.chatId) : undefined
+        ? this.activeTurns.get(session.chatId)
+        : undefined
       if (active?.provider === "claude" && !active.cancelRequested) {
         const message = error instanceof Error ? error.message : String(error)
         await this.store.appendMessage(
@@ -3181,6 +4415,8 @@ export class AgentCoordinator {
         }
       }
     } finally {
+      session.streamFailure ??= new Error("Claude session ended before its startup was ready")
+      await session.publicationReady
       // Only evict if this session is still the chat's current one — a restart
       // (localPath/effort/autoPlan change, or a fork) closes the old session
       // and immediately registers a replacement, and the old stream's cleanup
@@ -3199,6 +4435,10 @@ export class AgentCoordinator {
             this.activeTurns.delete(session.chatId)
           }
         }
+        this.emitStateChange(session.chatId)
+      }
+      if (!session.forceClosed) {
+        session.session.close()
       }
       // The session is gone, so nothing it spawned can report back. Only when
       // it is still the chat's session: a restart's replacement owns them now.
@@ -3207,10 +4447,6 @@ export class AgentCoordinator {
         this.ambientTaskIds.delete(session.chatId)
         this.foregroundTasks.delete(session.chatId)
       }
-      if (!session.forceClosed) {
-        session.session.close()
-      }
-      this.emitStateChange(session.chatId)
     }
   }
 
@@ -3262,6 +4498,7 @@ export class AgentCoordinator {
             && event.sessionToken !== chat.pendingForkSessionToken
           ) {
             await this.store.setPendingForkSessionToken(active.chatId, null)
+            await this.store.setPendingForkResumeAt(active.chatId, null)
           }
           this.emitStateChange(active.chatId)
           continue
@@ -3398,6 +4635,16 @@ export class AgentCoordinator {
 
   async cancel(chatId: string, options?: { hideInterrupted?: boolean }) {
     this.startingClaudeTurns.delete(chatId)
+    const historyOperation = this.historyOperations.get(chatId)
+    const checking = this.codexHistoryChecks.get(chatId)
+    if (checking) this.cancelledCodexHistoryChecks.add(checking)
+    if (historyOperation) {
+      historyOperation.cancelled = true
+      if (historyOperation.turn) {
+        void historyOperation.turn.interrupt().catch(() => {})
+        this.codexManager.stopSession(chatId)
+      }
+    }
     this.cancelingChats.add(chatId)
     try {
       // Also clean up any draining stream for this chat.
@@ -3456,10 +4703,12 @@ export class AgentCoordinator {
         }
       }
 
-      await this.store.appendMessage(chatId, timestamped({ kind: "interrupted", hidden: options?.hideInterrupted }))
-      await this.store.recordTurnCancelled(chatId)
-      active.cancelRecorded = true
-      active.hasFinalResult = true
+    if (!historyOperation || historyOperation.publicationStarted) {
+        await this.store.appendMessage(chatId, timestamped({ kind: "interrupted", hidden: options?.hideInterrupted }))
+        await this.store.recordTurnCancelled(chatId)
+      }
+    active.cancelRecorded = true
+    active.hasFinalResult = true
 
       // Remove from activeTurns immediately so the UI reflects the cancellation
       // right away, rather than waiting for interrupt() which may hang.
@@ -3595,6 +4844,15 @@ export class AgentCoordinator {
     pending.resolve(command.result)
 
     this.emitStateChange(command.chatId)
+  }
+
+  private readonly prepareClaudeSessionFn: NonNullable<AgentCoordinatorArgs["prepareClaudeSession"]>
+
+  private async recordCodexHistoryFailure(chatId: string, error: unknown) {
+    const message = `Codex history could not be saved or recovered: ${error instanceof Error ? error.message : String(error)}`
+    await this.store.appendMessage(chatId, timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: message }))
+    await this.store.recordTurnFailed(chatId, message)
+    this.emitStateChange(chatId)
   }
 }
 

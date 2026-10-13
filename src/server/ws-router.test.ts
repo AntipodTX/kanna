@@ -29,6 +29,7 @@ import { StartupSyncProgress } from "./startup-sync"
 
 
 
+
 function withSidebarGroupDefaults(group: {
   groupKey: string
   title: string
@@ -1834,18 +1835,19 @@ describe("ws-router", () => {
       lastTurnOutcome: null,
     })
 
-    const forkChatCalls: string[] = []
+    const forkChatCalls: Array<{ type: "chat.fork"; chatId: string }> = []
     const router = createTestRouter({
       store: createFakeStore({ state }),
       agent: {
         getActiveStatuses: () => new Map(),
         getDrainingChatIds: () => new Set(),
-          forkChat: async (chatId: string) => {
-          forkChatCalls.push(chatId)
+        getPendingToolPreviews: () => new Map(),
+        forkChat: async (command: { type: "chat.fork"; chatId: string }) => {
+          forkChatCalls.push(command)
           state.chatsById.set("chat-fork-1", {
             id: "chat-fork-1",
             projectId: "project-1",
-            title: "Fork: Chat",
+            title: "Chat (forked)",
             createdAt: 2,
             updatedAt: 2,
             unread: false,
@@ -1883,7 +1885,7 @@ describe("ws-router", () => {
       })
     )
 
-    expect(forkChatCalls).toEqual(["chat-1"])
+    expect(forkChatCalls).toEqual([{ type: "chat.fork", chatId: "chat-1" }])
     expect(ws.sent.at(-2)).toEqual({
       v: PROTOCOL_VERSION,
       type: "ack",
@@ -1905,7 +1907,7 @@ describe("ws-router", () => {
               _id: "chat-fork-1",
               _creationTime: 2,
               chatId: "chat-fork-1",
-              title: "Fork: Chat",
+              title: "Chat (forked)",
               status: "idle",
               unread: false,
               localPath: "/tmp/project",
@@ -2828,5 +2830,60 @@ describe("transcript windows", () => {
     expect(data.messages.map(entry => entry._id)).toEqual(["p5", "a5", "b5"])
     expect(data.outline).toHaveLength(2)
     router.dispose()
+  })
+
+
+  for (const rewrittenTurns of [[8], [8, 9, 10], [8, 9, 10, 11]]) {
+    test(`history rewrites refresh all subscribed windows (${rewrittenTurns.length} turns)`, async () => {
+      const entries = [...turn(1), ...turn(2), ...turn(3)]
+      const router = createWindowedRouter(entries)
+      const sockets = [new FakeWebSocket(), new FakeWebSocket()]
+      try {
+        for (const ws of sockets) {
+          router.handleOpen(ws as never)
+          await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+        }
+        await router.handleMessage(sockets[1] as never, JSON.stringify({ v: 1, type: "command", id: "older", command: { type: "chat.loadOlder", chatId: "chat-1", all: true } }))
+        entries.splice(0, entries.length, ...rewrittenTurns.flatMap(number => turn(number)))
+        router.invalidateChatTranscript?.("chat-1")
+        await router.broadcastSnapshots()
+        for (const ws of sockets) {
+          const data = chatData(ws, ws.sent.length - 1)
+          expect(data.incremental).not.toBe(true)
+          expect(data.startIndex).toBe((rewrittenTurns.length - 1) * 3)
+          const last = rewrittenTurns.at(-1)
+          expect(data.messages.map(entry => entry._id)).toEqual([`p${last}`, `a${last}`, `b${last}`])
+          expect(data.outline).toHaveLength(rewrittenTurns.length)
+        }
+      } finally {
+        router.dispose()
+      }
+    })
+  }
+
+
+  test.each([false, true])("history rewrites retain independent expanded boundaries when indexes shift: %s", async (shifted) => {
+    const entries = [1, 2, 3, 4, 5].flatMap(number => turn(number))
+    const router = createWindowedRouter(entries)
+    const sockets = [new FakeWebSocket(), new FakeWebSocket()]
+    try {
+      for (const ws of sockets) {
+        router.handleOpen(ws as never)
+        await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+      }
+      await router.handleMessage(sockets[0] as never, JSON.stringify({ v: 1, type: "command", id: "all", command: { type: "chat.loadOlder", chatId: "chat-1", all: true } }))
+      await router.handleMessage(sockets[1] as never, JSON.stringify({ v: 1, type: "command", id: "some", command: { type: "chat.loadOlder", chatId: "chat-1", untilMessageId: "p3" } }))
+      const replacement = [...(shifted ? turn(0) : []), ...[1, 2, 3, 4, 9].flatMap(number => turn(number))]
+      entries.splice(0, entries.length, ...replacement)
+      router.invalidateChatTranscript("chat-1")
+      await router.broadcastSnapshots()
+      const starts = [shifted ? 3 : 0, shifted ? 9 : 6]
+      for (const [index, ws] of sockets.entries()) {
+        const data = chatData(ws, ws.sent.length - 1)
+        expect(data.incremental).not.toBe(true)
+        expect(data.startIndex).toBe(starts[index]!)
+        expect(data.messages.map(item => item._id)).toEqual(replacement.slice(starts[index]!).map(item => item._id))
+      }
+    } finally { router.dispose() }
   })
 })

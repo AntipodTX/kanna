@@ -23,9 +23,14 @@ function sameRuntime(left: ChatSnapshot["runtime"] | null | undefined, right: Ch
     && left.status === right.status
     && left.isDraining === right.isDraining
     && left.provider === right.provider
+    && left.model === right.model
+    && JSON.stringify(left.modelOptions) === JSON.stringify(right.modelOptions)
     && left.planMode === right.planMode
     && left.autoPlan === right.autoPlan
     && left.sessionToken === right.sessionToken
+    && left.historyRevision === right.historyRevision
+    && left.historyIntegrityRevision === right.historyIntegrityRevision
+    && JSON.stringify(left.historyRepair) === JSON.stringify(right.historyRepair)
     && sameSubagents(left.subagents, right.subagents)
 }
 

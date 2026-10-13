@@ -1,25 +1,15 @@
 import { recordClientPerformance, startClientPerformance } from "./clientPerformance"
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState, useLayoutEffect } from "react"
 import { useNavigate } from "react-router-dom"
 import { useShallow } from "zustand/react/shallow"
-import { PROVIDERS, withPiFaveModels, type AgentProvider, type AppSettingsPatch, type AskUserQuestionAnswerMap, type AppSettingsSnapshot, type ChatDiffSnapshot, type CodexApprovalDecision, type FaveModel, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type TranscriptEntry, type UpdateSnapshot, type StartupSyncSnapshot } from "../../shared/types"
-import { NEW_CHAT_COMPOSER_ID, useChatPreferencesStore } from "../stores/chatPreferencesStore"
+import { PROVIDERS, withPiFaveModels, type AgentProvider, type AppSettingsPatch, type AskUserQuestionAnswerMap, type AppSettingsSnapshot, type ChatDiffSnapshot, type FaveModel, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type TranscriptEntry, type UpdateSnapshot, type CodexApprovalDecision, type StartupSyncSnapshot, type ChatProviderPreferences } from "../../shared/types"
+import { NEW_CHAT_COMPOSER_ID, useChatPreferencesStore, composerStateForProvider, composerStateFromModelSettings, type ComposerState } from "../stores/chatPreferencesStore"
 import { useRightSidebarStore } from "../stores/rightSidebarStore"
 import { useTerminalLayoutStore } from "../stores/terminalLayoutStore"
 import { getEditorPresetLabel, useTerminalPreferencesStore } from "../stores/terminalPreferencesStore"
 import { useEffectiveEditorPreset } from "../components/open-external-menu"
 import { useChatInputStore } from "../stores/chatInputStore"
-import {
-  findSidebarChat,
-  getSidebarProjectGroups,
-  useChatExists,
-  useFirstProjectGroup,
-  useNavbarRepoLabel,
-  useProjectIdForChat,
-  useSidebarChatStatus,
-  useSidebarReady,
-  useSidebarStore,
-} from "../stores/sidebarStore"
+import { findSidebarChat, getSidebarProjectGroups, useChatExists, useFirstProjectGroup, useNavbarRepoLabel, useProjectIdForChat, useSidebarChatStatus, useSidebarReady, useSidebarStore } from "../stores/sidebarStore"
 import type { BranchActionFailure, BranchActionSuccess, ChatSnapshot, HydratedTranscriptMessage, LocalProjectsSnapshot, SidebarChatRow, SidebarData, TranscriptOutlineEntry } from "../../shared/types"
 import type { AskUserQuestionItem } from "../components/messages/types"
 import type { OpenLocalLinkTarget } from "../components/messages/shared"
@@ -27,31 +17,9 @@ import { useAppDialog } from "../components/ui/app-dialog"
 import { useTheme } from "../hooks/useTheme"
 import { processTranscriptMessages } from "../lib/parseTranscript"
 import { canCancelStatus, getLatestToolIds, isProcessingStatus } from "./derived"
-import {
-  getActiveChatSnapshot,
-  getMostRecentlyActiveProjectId,
-  getNewestRemainingChatId,
-  getPreviousPrompt,
-  NEW_CHAT_OPTIMISTIC_SCOPE,
-  reconcileOptimisticUserPrompts,
-  resolveComposeIntent,
-  type OptimisticProcessingState,
-  type OptimisticUserPrompt,
-  type ProjectRequest,
-  type StartChatIntent,
-} from "./kannaStateHelpers"
-import {
-  foldChatSnapshot,
-  sameDiffs,
-  shouldPreserveExistingProjectDiffs,
-} from "./snapshotEquality"
-import {
-  cachedWindowToMessages,
-  createTranscriptCacheWriter,
-  readCachedWindow,
-  readMemoryCachedWindow,
-  type CachedTranscriptWindow,
-} from "./chatTranscriptCache"
+import { getActiveChatSnapshot, getMostRecentlyActiveProjectId, getNewestRemainingChatId, getPreviousPrompt, NEW_CHAT_OPTIMISTIC_SCOPE, reconcileOptimisticUserPrompts, resolveComposeIntent, type OptimisticProcessingState, type OptimisticUserPrompt, type ProjectRequest, type StartChatIntent } from "./kannaStateHelpers"
+import { foldChatSnapshot, sameDiffs, shouldPreserveExistingProjectDiffs } from "./snapshotEquality"
+import { cachedWindowToMessages, createTranscriptCacheWriter, readCachedWindow, readMemoryCachedWindow, type CachedTranscriptWindow } from "./chatTranscriptCache"
 import { DEFAULT_TRANSCRIPT_WINDOW_ASSISTANT_MESSAGES, trimTranscriptWindow } from "../../shared/transcript-window"
 import { CLOUD_WS_ENDPOINT_PATH, type CloudWsEndpointResponse } from "../../shared/cloud-api"
 import { KannaSocket, type SocketStatus } from "./socket"
@@ -64,6 +32,94 @@ import { useShareExport } from "./useShareExport"
 import { useUpdateRestart } from "./useUpdateRestart"
 import type { EditorOpenSettings, OpenExternalAction, TerminalPreset } from "../../shared/protocol"
 import { applySidebarPatch, type SidebarPatch } from "../../shared/sidebar-patch"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function getComposerStateForActiveProvider(
+  composerState: ComposerState,
+  activeProvider: AgentProvider | null,
+  providerDefaults: ChatProviderPreferences,
+): ComposerState {
+  if (!activeProvider || composerState.provider === activeProvider) {
+    return composerState
+  }
+
+  return composerStateForProvider(activeProvider, {
+    ...providerDefaults[activeProvider],
+    planMode: composerState.planMode,
+  })
+}
+
+function getComposerStateModelOptions(composerState: ComposerState): ModelOptions {
+  return {
+    [composerState.provider]: { ...composerState.modelOptions },
+  } as ModelOptions
+}
+
+export function getEditUserPromptSendOptions(
+  composerState: ComposerState,
+  activeProvider: AgentProvider | null,
+  providerDefaults: ChatProviderPreferences,
+  supportsPlanMode: boolean,
+  _runtime?: ChatSnapshot["runtime"] | null,
+): { model: string; modelOptions: ModelOptions; planMode: boolean } {
+  const providerComposerState = getComposerStateForActiveProvider(composerState, activeProvider, providerDefaults)
+  return {
+    model: providerComposerState.model,
+    modelOptions: getComposerStateModelOptions(providerComposerState),
+    planMode: supportsPlanMode ? providerComposerState.planMode : false,
+  }
+}
+
+export function getForkUserPromptSendOptions(
+  composerState: ComposerState,
+  activeProvider: AgentProvider | null,
+  providerDefaults: ChatProviderPreferences,
+  supportsPlanMode: boolean,
+  runtime?: ChatSnapshot["runtime"] | null,
+  providerConfig?: ProviderCatalogEntry,
+): { model: string; modelOptions: ModelOptions; planMode: boolean } {
+  const providerComposerState = composerStateFromModelSettings(runtime, providerConfig)
+    ?? getComposerStateForActiveProvider(composerState, activeProvider, providerDefaults)
+  return {
+    model: providerComposerState.model,
+    modelOptions: getComposerStateModelOptions(providerComposerState),
+    planMode: supportsPlanMode ? providerComposerState.planMode : false,
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 export {
   getUiUpdateReadinessPath,
@@ -230,6 +286,8 @@ export interface KannaState {
   handleValidateLlmProvider: (value: Pick<LlmProviderSnapshot, "provider" | "apiKey" | "model" | "baseUrl">) => Promise<LlmProviderValidationResult>
   handleSignOut: () => Promise<void>
   handleSend: (content: string, options?: { provider?: AgentProvider; model?: string; modelOptions?: ModelOptions; planMode?: boolean; autoPlan?: boolean }) => Promise<void>
+  handleEditUserPrompt: (messageId: string, content: string) => Promise<void>
+  handleForkUserPrompt: (messageId: string) => Promise<void>
   handleSteerQueuedMessage: (queuedMessageId: string) => Promise<void>
   handleRemoveQueuedMessage: (queuedMessageId: string) => Promise<void>
   handleCancel: () => Promise<void>
@@ -346,7 +404,6 @@ export function useKannaState(activeChatId: string | null): KannaState {
           held = { revision: snapshot.to, data }
         }
         useSidebarStore.getState().setSnapshot(data)
-        setCommandError(null)
       })
     }
     const resubscribe = () => {
@@ -370,7 +427,6 @@ export function useKannaState(activeChatId: string | null): KannaState {
     return socket.subscribe<LocalProjectsSnapshot>({ type: "local-projects" }, (snapshot) => {
       setLocalProjects(snapshot)
       setLocalProjectsReady(true)
-      setCommandError(null)
     })
   }, [socket])
 
@@ -447,6 +503,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
   }, [activeChatId, chatSnapshot])
 
   useEffect(() => {
+    setCommandError(null)
     if (!activeChatId) {
       setChatSnapshot(null)
       setChatReady(true)
@@ -479,7 +536,6 @@ export function useKannaState(activeChatId: string | null): KannaState {
       // then left the transcript blank.
       setChatSnapshot((current) => foldChatSnapshot(current, base, snapshot))
       setChatReady(true)
-      setCommandError(null)
     }
 
     let subscribed = false
@@ -668,7 +724,6 @@ export function useKannaState(activeChatId: string | null): KannaState {
           [activeProjectId]: nextDiffs,
         }
       })
-      setCommandError(null)
     })
 
     return unsubscribe
@@ -713,6 +768,13 @@ export function useKannaState(activeChatId: string | null): KannaState {
   const previousPrompt = useMemo(() => getPreviousPrompt(messages), [messages])
   const latestToolIds = useMemo(() => getLatestToolIds(messages), [messages])
   const runtime = activeChatSnapshot?.runtime ?? null
+  const runtimeProviderConfig = activeChatSnapshot?.availableProviders.find(provider => provider.id === runtime?.provider)
+  const runtimeModelOptionsKey = JSON.stringify(runtime?.modelOptions)
+  useLayoutEffect(() => {
+    const runtimeComposerState = composerStateFromModelSettings(runtime, runtimeProviderConfig)
+    if (!runtime || !runtimeComposerState) return
+    useChatPreferencesStore.getState().hydrateComposerFromRuntime(runtime.chatId, runtimeComposerState, { providerConfig: runtimeProviderConfig })
+  }, [runtime?.autoPlan, runtime?.chatId, runtime?.model, runtime?.planMode, runtime?.provider, runtimeModelOptionsKey, runtimeProviderConfig])
   const queuedMessages = activeChatSnapshot?.queuedMessages ?? EMPTY_QUEUED_MESSAGES
   const optimisticRuntimeStatus = optimisticProcessing?.scopeId === optimisticScopeId && (!runtime || runtime.status === "idle")
     ? "starting"
@@ -940,6 +1002,83 @@ export function useKannaState(activeChatId: string | null): KannaState {
       fallbackLocalProjectPath,
     },
   })
+
+  const handleEditUserPrompt = useCallback(async (messageId: string, content: string) => {
+    if (!activeChatId) return
+    if (isProcessing || isDraining) {
+      const message = "Wait for the current turn to finish before editing history"
+      setCommandError(message)
+      throw new Error(message)
+    }
+
+    try {
+      const chatPreferences = useChatPreferencesStore.getState()
+      const composerState = chatPreferences.getComposerState(activeChatId)
+      const activeProvider = runtime?.provider ?? null
+      const effectiveProvider = activeProvider ?? composerState.provider
+      const commandOptions = getEditUserPromptSendOptions(
+        composerState,
+        activeProvider,
+        chatPreferences.providerDefaults,
+        availableProviders.find((provider) => provider.id === effectiveProvider)?.supportsPlanMode ?? false,
+        runtime,
+      )
+      await socket.command({
+        type: "chat.editUserPrompt",
+        chatId: activeChatId,
+        messageId,
+        content,
+        model: commandOptions.model,
+        modelOptions: commandOptions.modelOptions,
+        planMode: commandOptions.planMode,
+      })
+      setCommandError(null)
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : String(error))
+      throw error
+    }
+  }, [activeChatId, availableProviders, isDraining, isProcessing, runtime, socket])
+
+  const handleForkUserPrompt = useCallback(async (messageId: string) => {
+    if (!activeChatId) return
+    if (isProcessing || isDraining) {
+      const message = "Wait for the current turn to finish before forking history"
+      setCommandError(message)
+      throw new Error(message)
+    }
+
+    try {
+      const chatPreferences = useChatPreferencesStore.getState()
+      const composerState = chatPreferences.getComposerState(activeChatId)
+      const activeProvider = runtime?.provider ?? null
+      const effectiveProvider = activeProvider ?? composerState.provider
+      const commandOptions = getForkUserPromptSendOptions(
+        composerState,
+        activeProvider,
+        chatPreferences.providerDefaults,
+        availableProviders.find((provider) => provider.id === effectiveProvider)?.supportsPlanMode ?? false,
+        runtime,
+        availableProviders.find(provider => provider.id === runtime?.provider),
+      )
+      const result = await socket.command<{ chatId: string }>({
+        type: "chat.fork",
+        chatId: activeChatId,
+        messageId,
+        model: commandOptions.model,
+        modelOptions: commandOptions.modelOptions,
+        planMode: commandOptions.planMode,
+      })
+      chatPreferences.initializeComposerForChat(result.chatId, {
+        sourceState: composerStateFromModelSettings(runtime, availableProviders.find(provider => provider.id === runtime?.provider)) ?? chatPreferences.getComposerState(activeChatId),
+      })
+      setPendingChatId(result.chatId)
+      navigate(`/chat/${result.chatId}`)
+      setCommandError(null)
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : String(error))
+      throw error
+    }
+  }, [activeChatId, availableProviders, isDraining, isProcessing, navigate, runtime, socket])
 
   const handleDeleteChat = useCallback(async (chat: SidebarChatRow) => {
     const confirmed = await dialog.confirm({
@@ -1186,6 +1325,8 @@ export function useKannaState(activeChatId: string | null): KannaState {
     handleValidateLlmProvider,
     handleSignOut,
     handleSend,
+    handleEditUserPrompt,
+    handleForkUserPrompt,
     handleSteerQueuedMessage,
     handleRemoveQueuedMessage,
     handleCancel,

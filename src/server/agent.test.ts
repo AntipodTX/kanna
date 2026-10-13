@@ -1,14 +1,17 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, test, afterAll } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { AgentCoordinator, buildAttachmentHintText, buildConcurrentAgentsNotice, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, resolveClaudeRuntimeOptions, classifyClaudeBackgroundWorkState, createClaudeStopHook, type ClaudeBackgroundWorkState, startClaudeSession } from "./agent"
+import { AgentCoordinator, startClaudeSession, buildAttachmentHintText, buildConcurrentAgentsNotice, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, resolveClaudeRuntimeOptions, classifyClaudeBackgroundWorkState, createClaudeStopHook, type ClaudeBackgroundWorkState, buildClaudeSdkUserMessage } from "./agent"
 import type { HarnessTurn } from "./harness-types"
+import type { ContextRestoration } from "./events"
 import type { SubagentActivityUpdate } from "./background-tasks"
-import type { ChatAttachment, TranscriptEntry, AgentProvider } from "../shared/types"
+import type { AgentProvider, ChatAttachment, TranscriptEntry } from "../shared/types"
 import type { SessionArtifactStatus } from "./session-artifacts"
 import { timestamped } from "./transcript"
-import type { ContextRestoration } from "./events"
+import { CodexPromptHistory } from "./codex-prompt-history"
+import { EventStore } from "./event-store"
+import { getServerProviderCatalog } from "./provider-catalog"
 
 
 
@@ -20,6 +23,163 @@ import type { ContextRestoration } from "./events"
 
 
 
+
+
+
+
+function createForkableFakeStore(
+  provider: "claude" | "codex",
+  options: { title: string; sessionToken: string | null; pendingForkSessionToken?: string | null }
+) {
+  const sourceChat = {
+    id: "chat-1",
+    projectId: "project-1",
+    title: options.title,
+    provider,
+    model: null as string | null,
+    modelOptions: null as any,
+    planMode: false,
+    autoPlan: false,
+    sessionToken: options.sessionToken,
+    pendingForkSessionToken: options.pendingForkSessionToken ?? null,
+    pendingForkResumeAt: null as string | null,
+    pendingForkUserPrompt: false,
+  }
+  const project = {
+    id: "project-1",
+    localPath: "/tmp/project",
+  }
+  const chatsById = new Map<string, typeof sourceChat>([["chat-1", sourceChat]])
+  const messagesByChatId = new Map<string, TranscriptEntry[]>([["chat-1", []]])
+
+  return {
+    dataDir: fakeStoreDirectory(),
+    chat: sourceChat,
+    turnFinishedCount: 0,
+    hiddenProviderSessions: [] as Array<{
+      provider: "claude" | "codex"
+      sessionToken: string
+    }>,
+    deletedChatIds: [] as string[],
+    setMessages(chatId: string, entries: TranscriptEntry[]) {
+      messagesByChatId.set(chatId, [...entries])
+    },
+    requireChat(chatId: string) {
+      const chat = chatsById.get(chatId)
+      if (!chat) {
+        throw new Error(`Missing chat ${chatId}`)
+      }
+      return chat
+    },
+    getChat(chatId: string) {
+      return chatsById.get(chatId) ?? null
+    },
+    getProject(projectId: string) {
+      expect(projectId).toBe("project-1")
+      return project
+    },
+    getMessages(chatId: string) {
+      return messagesByChatId.get(chatId) ?? []
+    },
+    getTranscriptLength(chatId: string) { return (messagesByChatId.get(chatId) ?? []).length },
+    getContextBounds(chatId: string) {
+      const entries = messagesByChatId.get(chatId) ?? []
+      let start = 0
+      entries.forEach((entry, index) => { if (entry.kind === "context_cleared") start = index + 1 })
+      return { start, endExclusive: entries.length, hasConversation: entries.slice(start).some(entry => ["user_prompt", "assistant_text", "tool_call", "tool_result"].includes(entry.kind)) }
+    },
+    async setContextRestoration(chatId: string, restoration: any) { (this.requireChat(chatId) as any).contextRestoration = restoration },
+    async acknowledgeContextRestoration(chatId: string, id: string) { const chat = this.requireChat(chatId) as any; if (chat.contextRestoration?.id === id) chat.contextRestoration = null },
+    getPromptHistoryEntries(chatId:string) {return this.getMessages(chatId)},
+    getEntryIdAt(chatId:string,index:number) {return (messagesByChatId.get(chatId) ?? [])[index]?._id??null},
+    async setChatProvider(chatId: string, nextProvider: "claude" | "codex") {
+      this.requireChat(chatId).provider = nextProvider
+    },
+    async setPlanMode(chatId: string, planMode: boolean) {
+      this.requireChat(chatId).planMode = planMode
+    },
+    async setAutoPlan(chatId: string, autoPlan: boolean) {
+      this.requireChat(chatId).autoPlan = autoPlan
+    },
+    async setChatModelSettings(chatId: string, settings: { model: string | null; modelOptions: any }) {
+      this.requireChat(chatId).model = settings.model
+      this.requireChat(chatId).modelOptions = settings.modelOptions
+    },
+    async renameChat(chatId: string, title: string) {
+      this.requireChat(chatId).title = title
+    },
+    async appendMessage(chatId: string, entry: TranscriptEntry) {
+      messagesByChatId.set(chatId, [...this.getMessages(chatId), entry])
+    },
+    async replaceTranscript(chatId: string, entries: TranscriptEntry[]) {
+      messagesByChatId.set(chatId, [...entries])
+    },
+    async recordTurnStarted() {},
+    async recordTurnFinished() {
+      this.turnFinishedCount += 1
+    },
+    async recordTurnFailed() {
+      throw new Error("Did not expect turn failure")
+    },
+    async recordTurnCancelled() {},
+    async setSessionToken(chatId: string, sessionToken: string | null) {
+      this.requireChat(chatId).sessionToken = sessionToken
+    },
+    async hideProviderSession(nextProvider: "claude" | "codex", sessionToken: string) {
+      this.hiddenProviderSessions.push({ provider: nextProvider, sessionToken })
+    },
+    async setPendingForkSessionToken(chatId: string, pendingForkSessionToken: string | null) {
+      this.requireChat(chatId).pendingForkSessionToken = pendingForkSessionToken
+    },
+    async setPendingForkResumeAt(chatId: string, pendingForkResumeAt: string | null) {
+      this.requireChat(chatId).pendingForkResumeAt = pendingForkResumeAt
+    },
+    async setPendingForkUserPrompt(chatId: string, pendingForkUserPrompt: boolean) {
+      this.requireChat(chatId).pendingForkUserPrompt = pendingForkUserPrompt
+    },
+    async deleteChat(chatId: string) {
+      this.requireChat(chatId)
+      this.deletedChatIds.push(chatId)
+    },
+    async forkChat(sourceChatId: string, forkOptions?: {
+      transcriptEntries?: TranscriptEntry[]
+      pendingForkSessionToken?: string | null
+      pendingForkResumeAt?: string | null
+      pendingForkUserPrompt?: boolean
+    }) {
+      const source = this.requireChat(sourceChatId)
+      const forked = {
+        ...source,
+        id: "chat-fork-1",
+        title: `Fork: ${source.title}`,
+        sessionToken: null,
+        pendingForkSessionToken: forkOptions && "pendingForkSessionToken" in forkOptions
+          ? forkOptions.pendingForkSessionToken ?? null
+          : source.sessionToken ?? source.pendingForkSessionToken,
+        pendingForkResumeAt: forkOptions?.pendingForkResumeAt ?? null,
+        pendingForkUserPrompt: Boolean(forkOptions?.pendingForkUserPrompt),
+      }
+      chatsById.set(forked.id, forked)
+      messagesByChatId.set(forked.id, [...(forkOptions?.transcriptEntries ?? this.getMessages(sourceChatId))])
+      return forked
+    },
+    getQueuedMessages() {
+      return []
+    },
+  }
+}
+
+function fakeStoreDirectory() {
+  const dir=mkdtempSync(path.join(tmpdir(),"kanna-fake-store-"))
+  fakeStoreDirectories.push(dir)
+  return dir
+}
+
+const fakeStoreDirectories: string[] = []
+
+const codexStartResult = (sessionToken: string | null | undefined) => sessionToken
+  ? { sessionToken, resumeFellBack: false }
+  : undefined
 
 const withChatLinks = (content: string) => content
 
@@ -92,6 +252,41 @@ describe("formatQuestionAnswersFollowUp", () => {
 })
 
 describe("normalizeClaudeStreamMessage", () => {
+  test("keeps the native session owning Claude message UUIDs", () => {
+    for (const sessionField of ["session_id", "sessionId"]) {
+      const entries = normalizeClaudeStreamMessage({
+        type: "assistant", uuid: "answer-uuid", [sessionField]: "native-session",
+        message: { content: [
+          { type: "text", text: "answer" },
+          { type: "tool_use", id: "tool-1", name: "Read", input: { file_path: "x" } },
+        ] },
+      })
+      expect(entries).toHaveLength(2)
+      for (const entry of entries) {
+        expect(entry).toMatchObject({ messageId: "answer-uuid", claudeSessionToken: "native-session" })
+      }
+    }
+  })
+  test("builds streaming Claude prompts without pinning them to the resumed session id", () => {
+    expect(buildClaudeSdkUserMessage("edited task")).toEqual({
+      type: "user",
+      message: {
+        role: "user",
+        content: "edited task",
+      },
+      parent_tool_use_id: null,
+      session_id: "",
+    })
+  })
+
+  test("keeps upstream prompt UUIDs on unpinned streaming Claude prompts", () => {
+    expect(buildClaudeSdkUserMessage("edited task", "prompt-uuid")).toMatchObject({
+      session_id: "",
+      uuid: "prompt-uuid",
+      message: { role: "user", content: "edited task" },
+    })
+  })
+
   test("normalizes assistant tool calls", () => {
     const entries = normalizeClaudeStreamMessage({
       type: "assistant",
@@ -672,6 +867,11 @@ describe("AgentCoordinator codex integration", () => {
     // health-check preflight) no-op instead of re-resuming.
     const openSessions = new Set<string>()
     const fakeCodexManager = {
+      async readPromptHistory() {
+        return { inputs: store.messages.filter((entry) => entry.kind === "user_prompt").map((entry, i) => ({
+          turnId: `native-${i}`, userIndex: 0, promptId: entry._id, text: (entry as { content: string }).content,
+        })) }
+      },
       async startSession(args: { chatId: string; sessionToken: string | null; pendingForkSessionToken?: string | null }) {
         if (openSessions.has(args.chatId) && !args.pendingForkSessionToken) return
         openSessions.add(args.chatId)
@@ -1106,8 +1306,10 @@ describe("AgentCoordinator codex integration", () => {
       content: "run something with a background task",
     })
 
-    // Wait for the result message to be persisted
-    await waitFor(() => store.messages.some((entry) => entry.kind === "result"))
+    // Result persistence precedes the awaited completion bookkeeping. Observe
+    // idle while the stream is still open rather than racing that bookkeeping.
+    await waitFor(() => store.messages.some((entry) => entry.kind === "result")
+      && !coordinator.getActiveStatuses().has("chat-1"))
 
     // The active turn should be removed even though the stream is still open.
     // This is the key assertion: the UI should show idle (not "Running...")
@@ -1990,10 +2192,801 @@ describe("AgentCoordinator codex integration", () => {
 
     for (const stream of streams) stream.close()
   })
+
+
+  for (const selection of [
+    { provider: "claude", model: undefined, expected: getServerProviderCatalog("codex").defaultModel },
+    { provider: "claude", model: "custom-target-model", expected: "custom-target-model" },
+    { provider: "codex", model: undefined, expected: "custom-stored-model" },
+  ] as const) {
+    test(`model fallback stays within its provider (${selection.provider}, ${selection.model ?? "implicit"})`, async () => {
+      const store = createFakeStore()
+      store.chat.title = "Existing chat"
+      store.chat.provider = selection.provider
+      store.chat.model = "custom-stored-model"
+      const models: string[] = []
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => {},
+        codexManager: {
+          stopSession() {},
+          async startSession() {},
+          async startTurn(args: { model: string }): Promise<HarnessTurn> {
+            models.push(args.model)
+            return {
+              provider: "codex",
+              stream: (async function* () {
+                yield { type: "transcript" as const, entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) }
+              })(),
+              interrupt: async () => {}, close: () => {},
+            }
+          },
+        } as never,
+      })
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "follow up", model: selection.model })
+      await waitFor(() => store.turnFinishedCount === 1)
+      expect(models).toEqual([selection.expected])
+      expect(store.chat.model).toBe(selection.expected)
+    })
+  }
+
+
+  test("pending Codex fork edits reconnect with Kanna tools before replacement startup", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = null
+    store.chat.pendingForkSessionToken = "source"
+    store.chat.pendingForkUserPrompt = true
+    const prompt = timestamped({ kind: "user_prompt", content: "task" })
+    store.messages = [prompt]
+    let connected = false
+    let toolsAvailable = false
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      codexManager: {
+        async startSession(args: { pendingForkSessionToken?: string | null; customTools?: unknown }) {
+          if (connected && !args.pendingForkSessionToken) return
+          connected = true
+          toolsAvailable = Boolean(args.customTools)
+          return codexStartResult("prepared")
+        },
+        async rollbackThread() {},
+        stopSession() { connected = false },
+        async startTurn(): Promise<HarnessTurn> {
+          if (!toolsAvailable) throw new Error("Kanna tools are missing from the prepared session")
+          return { provider: "codex", interrupt: async () => {}, close: () => {},
+            stream: (async function* () {
+              yield { type: "transcript" as const, entry: timestamped({ kind: "result", subtype: "success",
+                isError: false, durationMs: 0, result: "done" }) }
+            })(),
+          }
+        },
+      } as never,
+    })
+    await coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1",
+      messageId: prompt._id, content: "replacement" })
+    await waitFor(() => store.turnFinishedCount === 1)
+    expect(toolsAvailable).toBe(true)
+  })
+
+
+  test.each(["rollback", "reconnect", "turn"])("keeps the original Codex history intact after edit %s failure and retry", async (failure) => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "source"
+    const prompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const originalMessages = [prompt,
+      timestamped({ kind: "assistant_text", text: "first answer" }),
+      timestamped({ kind: "user_prompt", content: "second task" }),
+      timestamped({ kind: "assistant_text", text: "second answer" })]
+    store.messages = [...originalMessages]
+    const histories = new Map<string, string[]>([["source", ["first task", "second task"]]])
+    const rollbackThreads: string[] = []
+    let currentThread = "source"
+    let forks = 0
+    let failed = false
+    const failOnce = (stage: string) => {
+      if (failure === stage && !failed) {
+        failed = true
+        throw new Error(`${stage} failed`)
+      }
+    }
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      codexManager: {
+        async readPromptHistory() {
+          return {inputs:originalMessages.filter(entry=>entry.kind==="user_prompt").map((entry,index)=>({turnId:`turn-${index}`,userIndex:0,promptId:entry._id,text:entry.content}))}
+        },
+        async forkBeforeTurn(args: {threadId:string;beforeTurnId:string}) {
+          currentThread = `edit-${++forks}`
+          const index=Number(args.beforeTurnId.slice(5))
+          histories.set(currentThread,histories.get(args.threadId)!.slice(0,index))
+          rollbackThreads.push(currentThread)
+          failOnce("rollback")
+          return currentThread
+        },
+        async startSession(args: {sessionToken:string;customTools?:unknown}) {
+          failOnce("reconnect")
+          currentThread=args.sessionToken
+          expect(args.customTools).toBeDefined()
+          return codexStartResult(currentThread)
+        },
+        stopSession() {},
+        async startTurn(): Promise<HarnessTurn> {
+          failOnce("turn")
+          return { provider: "codex", interrupt: async () => {}, close: () => {},
+            stream: (async function* () {
+              yield { type: "transcript" as const, entry: timestamped({ kind: "result", subtype: "success",
+                isError: false, durationMs: 0, result: "done" }) }
+            })(),
+          }
+        },
+      } as never,
+    })
+    const command = { type: "chat.editUserPrompt" as const, chatId: "chat-1", messageId: prompt._id, content: "replacement" }
+    await expect(coordinator.editUserPrompt(command)).rejects.toThrow(`${failure} failed`)
+    expect(histories.get("source")).toEqual(["first task", "second task"])
+    expect(store.chat.sessionToken).toBe("source")
+    expect(store.messages).toEqual(originalMessages)
+    await coordinator.editUserPrompt(command)
+    await waitFor(() => store.turnFinishedCount === 1)
+    expect(rollbackThreads).toEqual(["edit-1", "edit-2"])
+    expect(histories.get("source")).toEqual(["first task", "second task"])
+    expect(store.chat.sessionToken).toBe("edit-2")
+    expect(store.messages[0]).toMatchObject({ kind: "user_prompt", content: "replacement" })
+  })
+
+
+  test.each([
+    { sessionToken: "fresh", resumeFellBack: true },
+    { sessionToken: "unrelated", resumeFellBack: false },
+    null,
+  ])("preserves original Codex history when prepared fork reconnect loses its identity (%j)", async (reconnected) => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "source"
+    const prompt = timestamped({ kind: "user_prompt", content: "task" })
+    const original = [prompt, timestamped({ kind: "assistant_text", text: "original answer" })]
+    store.messages = [...original]
+    let turns = 0
+    let stops = 0
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      codexManager: {
+        async readPromptHistory() {return {inputs:[{turnId:"turn",userIndex:0,promptId:prompt._id,text:"task"}]}},
+        async forkBeforeTurn() {return "prepared"},
+        async startSession() {return reconnected},
+        stopSession() { stops++ },
+        async startTurn(): Promise<HarnessTurn> {
+          turns++
+          return { provider: "codex", interrupt: async () => {}, close: () => {}, stream: (async function* () {})() }
+        },
+      } as never,
+    })
+    await expect(coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: prompt._id,
+      content: "replacement" })).rejects.toThrow("prepared edit session")
+    expect(turns).toBe(0)
+    expect(stops).toBe(2)
+    expect(store.chat.sessionToken).toBe("source")
+    expect(store.messages).toEqual(original)
+    expect(coordinator.activeTurns.has("chat-1")).toBe(false)
+  })
+
+
+  test.each([null, "source"])("refuses to edit Codex history without an isolated fork (%s)", async (forkToken) => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "source"
+    const prompt = timestamped({ kind: "user_prompt", content: "task" })
+    store.messages = [prompt]
+    let rollbacks = 0
+    let stops = 0
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      codexManager: {
+        async readPromptHistory() {return {inputs:[{turnId:"turn",userIndex:0,promptId:prompt._id,text:"task"}]}},
+        async forkBeforeTurn() {throw new Error(`Codex did not return an isolated forked session (${forkToken})`)},
+        async rollbackThread() { rollbacks++ },
+        stopSession() { stops++ },
+      } as never,
+    })
+    await expect(coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: prompt._id,
+      content: "replacement" })).rejects.toThrow("forked session")
+    expect(rollbacks).toBe(0)
+    expect(stops).toBe(0)
+    expect(store.chat.sessionToken).toBe("source")
+    expect(store.messages).toEqual([prompt])
+  })
+
+
+  test("forks a Claude chat from the selected user prompt using the previous assistant resume point", async () => {
+    const events = new AsyncEventQueue<any>()
+    const startSessionCalls: Array<{
+      sessionToken: string | null
+      forkSession: boolean
+      resumeSessionAt?: string
+      resetSession?: boolean
+    }> = []
+    const prompts: string[] = []
+    const store = createForkableFakeStore("claude", {
+      title: "Claude Debug",
+      sessionToken: "claude-session-1",
+    })
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "second task" })
+    store.setMessages("chat-1", [
+      firstPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-1", text: "first answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ])
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          sessionToken: args.sessionToken,
+          forkSession: args.forkSession,
+          resumeSessionAt: args.resumeSessionAt,
+          resetSession: args.resetSession,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-fork-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    const result = await coordinator.forkChat({
+      type: "chat.fork",
+      chatId: "chat-1",
+      messageId: secondPrompt._id,
+    })
+
+    expect(result).toEqual({ chatId: "chat-fork-1" })
+    expect(startSessionCalls).toEqual([])
+    expect(prompts).toEqual([])
+    expect(store.requireChat("chat-fork-1")).toMatchObject({
+      title: "Fork: Claude Debug",
+      provider: "claude",
+      sessionToken: null,
+      pendingForkSessionToken: "claude-session-1",
+      pendingForkResumeAt: "assistant-msg-1",
+    })
+    expect(store.hiddenProviderSessions).toEqual([])
+    expect(store.turnFinishedCount).toBe(0)
+    expect(store.getMessages("chat-1").length).toBe(6)
+    expect(store.getMessages("chat-fork-1").map((entry) => entry.kind)).toEqual([
+      "user_prompt",
+      "assistant_text",
+      "result",
+      "user_prompt",
+    ])
+    expect(store.getMessages("chat-fork-1")[3]).toMatchObject({ kind: "user_prompt", content: "second task" })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: result.chatId,
+      provider: "claude",
+      content: "continue from fork",
+      model: "claude-opus-4-1",
+    })
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(startSessionCalls).toEqual([{
+      sessionToken: "claude-session-1",
+      forkSession: true,
+      resumeSessionAt: "assistant-msg-1",
+      resetSession: undefined,
+    }])
+    expect(prompts).toEqual(["second task\n\ncontinue from fork"])
+    expect(store.requireChat("chat-fork-1")).toMatchObject({
+      sessionToken: "claude-fork-session",
+      pendingForkSessionToken: null,
+      pendingForkResumeAt: null,
+    })
+    expect(store.getMessages("chat-fork-1").map((entry) => entry.kind)).toEqual([
+      "user_prompt",
+      "assistant_text",
+      "result",
+      "user_prompt",
+      "result",
+    ])
+    expect(store.getMessages("chat-fork-1")[3]).toMatchObject({
+      kind: "user_prompt",
+      content: "second task\n\ncontinue from fork",
+    })
+
+    events.close()
+  })
+
+
+  test("continues a first-message Claude fork by gluing the next prompt into the visible pending prompt", async () => {
+    const events = new AsyncEventQueue<any>()
+    const startSessionCalls: Array<{
+      sessionToken: string | null
+      forkSession: boolean
+      resumeSessionAt?: string
+    }> = []
+    const prompts: string[] = []
+    const store = createForkableFakeStore("claude", {
+      title: "Claude Debug",
+      sessionToken: "claude-session-1",
+    })
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "second task" })
+    store.setMessages("chat-1", [
+      firstPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-1", text: "first answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ])
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          sessionToken: args.sessionToken,
+          forkSession: args.forkSession,
+          resumeSessionAt: args.resumeSessionAt,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-fork-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    const result = await coordinator.forkChat({
+      type: "chat.fork",
+      chatId: "chat-1",
+      messageId: firstPrompt._id,
+    })
+
+    expect(store.requireChat(result.chatId)).toMatchObject({
+      pendingForkSessionToken: null,
+      pendingForkResumeAt: null,
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: result.chatId,
+      provider: "claude",
+      content: "continue from fork",
+      model: "claude-opus-4-1",
+    })
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(startSessionCalls).toEqual([{
+      sessionToken: null,
+      forkSession: false,
+      resumeSessionAt: undefined,
+    }])
+    expect(prompts).toEqual(["first task\n\ncontinue from fork"])
+    expect(store.getMessages("chat-fork-1").map((entry) => entry.kind)).toEqual([
+      "user_prompt",
+      "result",
+    ])
+    expect(store.getMessages("chat-fork-1")[0]).toMatchObject({
+      kind: "user_prompt",
+      content: "first task\n\ncontinue from fork",
+    })
+
+    events.close()
+  })
+
+
+  test("starts Claude only after editing the last prompt in a forked chat", async () => {
+    const events = new AsyncEventQueue<any>()
+    const startSessionCalls: Array<{
+      sessionToken: string | null
+      forkSession: boolean
+      resumeSessionAt?: string
+      resetSession?: boolean
+    }> = []
+    const prompts: string[] = []
+    const store = createForkableFakeStore("claude", {
+      title: "Claude Debug",
+      sessionToken: "claude-session-1",
+    })
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "second task" })
+    store.setMessages("chat-1", [
+      firstPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-1", text: "first answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ])
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          sessionToken: args.sessionToken,
+          forkSession: args.forkSession,
+          resumeSessionAt: args.resumeSessionAt,
+          resetSession: args.resetSession,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-edit-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "system_init",
+                provider: "claude",
+                model: "claude-opus-4-1",
+                tools: [],
+                agents: [],
+                slashCommands: [],
+                mcpServers: [],
+              }),
+            })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    await coordinator.forkChat({
+      type: "chat.fork",
+      chatId: "chat-1",
+      messageId: secondPrompt._id,
+    })
+
+    expect(startSessionCalls).toEqual([])
+    expect(prompts).toEqual([])
+    expect(store.requireChat("chat-fork-1").pendingForkSessionToken).toBe("claude-session-1")
+
+    await coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-fork-1",
+      messageId: secondPrompt._id,
+      content: "edited second task",
+    })
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(startSessionCalls).toEqual([{
+      sessionToken: "claude-session-1",
+      forkSession: false,
+      resumeSessionAt: undefined,
+      resetSession: true,
+    }])
+    expect(prompts).toEqual(["edited second task"])
+    expect(store.requireChat("chat-fork-1")).toMatchObject({
+      sessionToken: "claude-edit-session",
+      pendingForkSessionToken: null,
+    })
+    expect(store.getMessages("chat-fork-1").map((entry) => entry.kind)).toEqual([
+      "user_prompt",
+      "assistant_text",
+      "result",
+      "user_prompt",
+      "system_init",
+      "result",
+    ])
+    expect(store.getMessages("chat-fork-1")[3]).toMatchObject({ kind: "user_prompt", content: "edited second task" })
+
+    events.close()
+  })
+
+
+  test("starts Claude after editing a non-last prompt in a pending forked chat", async () => {
+    const events = new AsyncEventQueue<any>()
+    const startSessionCalls: Array<{
+      sessionToken: string | null
+      forkSession: boolean
+      resumeSessionAt?: string
+      resetSession?: boolean
+    }> = []
+    const prompts: string[] = []
+    const store = createForkableFakeStore("claude", {
+      title: "Claude Debug",
+      sessionToken: "claude-session-1",
+    })
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "second task" })
+    const thirdPrompt = timestamped({ kind: "user_prompt", content: "third task" })
+    store.setMessages("chat-1", [
+      firstPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-1", text: "first answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      thirdPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-3", text: "third answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ])
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          sessionToken: args.sessionToken,
+          forkSession: args.forkSession,
+          resumeSessionAt: args.resumeSessionAt,
+          resetSession: args.resetSession,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-edit-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "system_init",
+                provider: "claude",
+                model: "claude-opus-4-1",
+                tools: [],
+                agents: [],
+                slashCommands: [],
+                mcpServers: [],
+              }),
+            })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    await coordinator.forkChat({
+      type: "chat.fork",
+      chatId: "chat-1",
+      messageId: thirdPrompt._id,
+    })
+
+    expect(startSessionCalls).toEqual([])
+    expect(prompts).toEqual([])
+    expect(store.requireChat("chat-fork-1")).toMatchObject({
+      pendingForkSessionToken: "claude-session-1",
+      pendingForkResumeAt: "assistant-msg-2",
+    })
+
+    await coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-fork-1",
+      messageId: secondPrompt._id,
+      content: "edited second task",
+    })
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(startSessionCalls).toEqual([{
+      sessionToken: "claude-session-1",
+      forkSession: false,
+      resumeSessionAt: undefined,
+      resetSession: true,
+    }])
+    expect(prompts).toEqual(["edited second task"])
+    expect(store.requireChat("chat-fork-1")).toMatchObject({
+      sessionToken: "claude-edit-session",
+      pendingForkSessionToken: null,
+      pendingForkResumeAt: null,
+    })
+    expect(store.getMessages("chat-fork-1").map((entry) => entry.kind)).toEqual([
+      "user_prompt",
+      "assistant_text",
+      "result",
+      "user_prompt",
+      "system_init",
+      "result",
+    ])
+    expect(store.getMessages("chat-fork-1")[3]).toMatchObject({ kind: "user_prompt", content: "edited second task" })
+    expect(store.getMessages("chat-fork-1").some((entry) => entry.kind === "user_prompt" && entry.content === "third task")).toBe(false)
+
+    events.close()
+  })
+
+
+  test("maps explicit and legacy Codex options over persisted chat settings", async () => {
+    const sessionCalls: Array<{ chatId: string; sessionToken: string | null; serviceTier?: string }> = []
+    const turnCalls: Array<{ effort?: string; serviceTier?: string }> = []
+    const openSessions = new Set<string>()
+
+    const fakeCodexManager = {
+      async readPromptHistory() {
+        return { inputs: store.messages.filter((entry) => entry.kind === "user_prompt").map((entry, i) => ({
+          turnId: `native-${i}`, userIndex: 0, promptId: entry._id, text: (entry as { content: string }).content,
+        })) }
+      },
+      async startSession(args: { chatId: string; sessionToken: string | null; serviceTier?: string }) {
+        if (openSessions.has(args.chatId)) return
+        openSessions.add(args.chatId)
+        sessionCalls.push({
+          chatId: args.chatId,
+          sessionToken: args.sessionToken,
+          serviceTier: args.serviceTier,
+        })
+        return codexStartResult("thread-1")
+      },
+      async startTurn(args: { effort?: string; serviceTier?: string }): Promise<HarnessTurn> {
+        turnCalls.push({
+          effort: args.effort,
+          serviceTier: args.serviceTier,
+        })
+
+        async function* stream() {
+          yield { type: "session_token" as const, sessionToken: "thread-1" }
+          yield {
+            type: "transcript" as const,
+            entry: timestamped({
+              kind: "system_init",
+              provider: "codex",
+              model: "gpt-5.4",
+              tools: [],
+              agents: [],
+              slashCommands: [],
+              mcpServers: [],
+            }),
+          }
+          yield {
+            type: "transcript" as const,
+            entry: timestamped({
+              kind: "result",
+              subtype: "success",
+              isError: false,
+              durationMs: 0,
+              result: "",
+            }),
+          }
+        }
+
+        return {
+          provider: "codex",
+          stream: stream(),
+          interrupt: async () => {},
+          close: () => {},
+        }
+      },
+    }
+
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: fakeCodexManager as never,
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "codex",
+      content: "opt in",
+      modelOptions: {
+        codex: {
+          reasoningEffort: "xhigh",
+          fastMode: true,
+        },
+      },
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(sessionCalls).toEqual([{ chatId: "chat-1", sessionToken: null, serviceTier: "fast" }])
+    expect(turnCalls).toEqual([{ effort: "xhigh", serviceTier: "fast" }])
+    expect(store.chat.model).toBe("gpt-5.6-sol")
+    expect(store.chat.modelOptions).toEqual({
+      codex: {
+        reasoningEffort: "xhigh",
+        fastMode: true,
+      },
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "codex",
+      content: "legacy effort override",
+      effort: "low",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 2)
+
+    expect(sessionCalls).toEqual([
+      { chatId: "chat-1", sessionToken: null, serviceTier: "fast" },
+    ])
+    expect(turnCalls).toEqual([
+      { effort: "xhigh", serviceTier: "fast" },
+      { effort: "low", serviceTier: "fast" },
+    ])
+    expect(store.chat.modelOptions).toEqual({
+      codex: {
+        reasoningEffort: "low",
+        fastMode: true,
+      },
+    })
+  })
 })
 
 describe("AgentCoordinator claude integration", () => {
-  function createIdleAwareClaudeHarness(timeoutMs = 40) {
+  const readinessGate = () => {
+    let release!: () => void
+    const ready = new Promise<void>((resolve) => { release = resolve })
+    return { ready, release }
+  }
+
+function createIdleAwareClaudeHarness(timeoutMs = 40) {
     const closeCalls: number[] = []
     const backgroundStateCallbacks: Array<(state: ClaudeBackgroundWorkState) => void> = []
     const eventStreams: Array<AsyncEventQueue<any>> = []
@@ -2223,7 +3216,7 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
 
     expect(startSessionCalls).toEqual([
       { planMode: false, autoPlan: false },
-      { planMode: false, autoPlan: true },
+      { planMode: true, autoPlan: true },
     ])
     expect(permissionModeCalls).toEqual([true])
     expect(store.chat.autoPlan).toBe(true)
@@ -3619,6 +4612,1644 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
   })
 
 
+  for (const failedPhase of ["history", "readiness"] as const) {
+    test(`a failed deferred Claude ${failedPhase} commit retires startup without publishing native initialization`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "claude"
+      store.chat.sessionToken = "source-session"
+      const first = timestamped({ kind: "user_prompt", content: "first" })
+      const answer = timestamped({ kind: "assistant_text", messageId: "source-answer", text: "answer" })
+      const target = timestamped({ kind: "user_prompt", content: "second" })
+      store.messages = [first, answer, target]
+      const originalMessages = [...store.messages]
+      const events = new AsyncEventQueue<any>()
+      let closes = 0
+      let prompts = 0
+      const replace = store.replaceTranscript.bind(store)
+      if (failedPhase === "history") store.replaceTranscript = async () => { throw new Error("history unavailable") }
+      else store.setSessionToken = async () => { throw new Error("readiness unavailable") }
+      const coordinator = new AgentCoordinator({
+        store: store as never, onStateChange: () => {},
+        prepareClaudeSession: async (args) => ({ sessionToken: "prepared-session", transcriptPrefix: args.transcriptPrefix }),
+        startClaudeSession: async () => {
+          events.push({ type: "session_token", sessionToken: "native-startup-session" })
+          events.push({ type: "transcript", entry: timestamped({ kind: "system_init", provider: "claude",
+            model: "claude-opus-4-1", tools: [], agents: [], slashCommands: [], mcpServers: [] }) })
+          return { provider: "claude", stream: events,
+            interrupt: async () => {}, close: () => { closes++; events.close() },
+            setModel: async () => {}, setPermissionMode: async () => {}, sendPrompt: async () => { prompts++ },
+          }
+        },
+      })
+      await expect(coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: target._id,
+        content: "edited" })).rejects.toThrow(`${failedPhase} unavailable`)
+      expect(store.chat.sessionToken).toBe("source-session")
+      expect(store.messages.some((entry) => entry.kind === "system_init")).toBe(false)
+      if (failedPhase === "history") expect(store.messages).toEqual(originalMessages)
+      expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+      expect(coordinator.claudeSessions.has("chat-1")).toBe(false)
+      expect(closes).toBe(1)
+      expect(prompts).toBe(0)
+      store.replaceTranscript = replace
+    })
+  }
+
+
+  for (const streamEnd of ["closed", "failed"] as const) {
+    test(`a ${streamEnd} provisional Claude stream cannot publish before a deferred history failure`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "claude"
+      store.chat.sessionToken = "source-session"
+      const target = timestamped({ kind: "user_prompt", content: "first" })
+      store.messages = [target]
+      const history = readinessGate()
+      const historyStarted = readinessGate()
+      const iterated = readinessGate()
+      let closes = 0
+      let failures = 0
+      let prompts = 0
+      store.replaceTranscript = async () => { historyStarted.release(); await history.ready; throw new Error("history unavailable") }
+      store.recordTurnFailed = async () => { failures++ }
+      const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+        startClaudeSession: async () => ({ provider: "claude",
+          stream: { async *[Symbol.asyncIterator]() { iterated.release(); if (streamEnd === "failed") throw new Error("native stream failed") } },
+          interrupt: async () => {}, close: () => { closes++ }, setModel: async () => {}, setPermissionMode: async () => {},
+          sendPrompt: async () => { prompts++ },
+        }),
+      })
+      const edit = coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: target._id, content: "edited" })
+      try {
+        await Promise.all([historyStarted.ready, iterated.ready])
+        expect(coordinator.getActiveStatuses().get("chat-1")).toBe("starting")
+        expect(store.messages).toEqual([target])
+        history.release()
+        await expect(edit).rejects.toThrow("history unavailable")
+        expect(store.messages).toEqual([target])
+        expect(store.chat.sessionToken).toBe("source-session")
+        expect(failures).toBe(0)
+        expect(prompts).toBe(0)
+        expect(closes).toBe(1)
+        expect(coordinator.claudeSessions.has("chat-1")).toBe(false)
+      } finally { history.release(); await edit.catch(() => {}) }
+    })
+  }
+
+
+  for (const streamEnd of ["closed", "failed"] as const) {
+    test(`a ${streamEnd} provisional Claude stream preserves source history even when its history write succeeds`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "claude"
+      store.chat.sessionToken = "source-session"
+      const target = timestamped({ kind: "user_prompt", content: "first" })
+      store.messages = [target, timestamped({ kind: "assistant_text", text: "original answer" })]
+      const original = [...store.messages]
+      const history = readinessGate()
+      const historyStarted = readinessGate()
+      const die = readinessGate()
+      const ended = readinessGate()
+      const replace = store.replaceTranscript.bind(store)
+      let writes = 0
+      store.replaceTranscript = async (chatId, entries) => {
+        if (++writes === 1) { historyStarted.release(); await history.ready }
+        await replace(chatId, entries)
+      }
+      let prompts = 0
+      const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+        startClaudeSession: async () => ({ provider: "claude",
+          stream: { async *[Symbol.asyncIterator]() {
+            await die.ready
+            ended.release()
+            if (streamEnd === "failed") throw new Error("native startup failed")
+          } },
+          interrupt: async () => {}, close: () => {}, setModel: async () => {}, setPermissionMode: async () => {},
+          sendPrompt: async () => { prompts++ },
+        }),
+      })
+      const edit = coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: target._id, content: "edited" })
+      try {
+        await historyStarted.ready
+        die.release()
+        await ended.ready
+        await new Promise(resolve => setTimeout(resolve, 0))
+        history.release()
+        await expect(edit).rejects.toThrow(streamEnd === "failed" ? "native startup failed" : "ended before")
+        expect(store.messages).toEqual(original)
+        expect(store.chat.sessionToken).toBe("source-session")
+        expect(prompts).toBe(0)
+        expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+        expect(coordinator.claudeSessions.has("chat-1")).toBe(false)
+      } finally { die.release(); history.release(); await edit.catch(() => {}) }
+    })
+  }
+
+
+  for (const streamEnd of ["closed", "failed"] as const) {
+    for (const stop of [undefined, "cancel", "close", "dispose"] as const) {
+      test(`a ${streamEnd} provisional Claude edit restores its turn count through restart${stop ? ` with ${stop} during rollback` : ""}`, async () => {
+        const dir = fakeStoreDirectory()
+        const store = new EventStore(dir)
+        await store.initialize()
+        const project = await store.openProject(dir)
+        const chat = await store.createChat(project.id)
+        await store.renameChat(chat.id, "Existing conversation")
+        await store.setChatProvider(chat.id, "claude")
+        await store.setSessionToken(chat.id, "source-session")
+        await store.recordTurnStarted(chat.id, undefined, { turnCount: 7 })
+        const target = timestamped({ kind: "user_prompt", content: "original" })
+        const original = [target, timestamped({ kind: "assistant_text", text: "original answer" })]
+        await store.replaceTranscript(chat.id, original)
+        const rollbackWritten = readinessGate()
+        const rollback = readinessGate()
+        const replace = store.replaceTranscript.bind(store)
+        let writes = 0
+        store.replaceTranscript = async (...args) => {
+          await replace(...args)
+          if (++writes === 2 && stop) { rollbackWritten.release(); await rollback.ready }
+        }
+        const countWritten = readinessGate()
+        const publication = readinessGate()
+        const die = readinessGate()
+        const ended = readinessGate()
+        const record = store.recordTurnStarted.bind(store)
+        store.recordTurnStarted = async (...args) => { await record(...args); countWritten.release(); await publication.ready }
+        let prompts = 0
+        const coordinator = new AgentCoordinator({ store, onStateChange: () => {},
+          startClaudeSession: async () => ({ provider: "claude", startupOutcome: { kind: "resumed" },
+            stream: { async *[Symbol.asyncIterator]() {
+              await die.ready
+              ended.release()
+              if (streamEnd === "failed") throw new Error("native startup failed")
+            } },
+            interrupt: async () => {}, close: () => {}, setModel: async () => {}, setPermissionMode: async () => {},
+            sendPrompt: async () => { prompts++ },
+          }),
+        })
+        const edit = coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: chat.id, messageId: target._id, content: "edited" })
+        void edit.catch(() => {})
+        try {
+          await countWritten.ready
+          expect(store.requireChat(chat.id).turnCount).toBe(1)
+          die.release()
+          await ended.ready
+          await new Promise(resolve => setTimeout(resolve, 0))
+          publication.release()
+          if (stop) {
+            await rollbackWritten.ready
+            if (stop === "cancel") await coordinator.cancel(chat.id)
+            else if (stop === "close") await coordinator.closeChat(chat.id)
+            else coordinator.dispose()
+            rollback.release()
+          }
+          await expect(edit).rejects.toThrow(stop ? "cancelled or replaced" : streamEnd === "failed" ? "native startup failed" : "ended before")
+          const expectedTranscript = stop === "cancel"
+            ? [...original, expect.objectContaining({ kind: "interrupted" })] : original
+          expect(store.getMessages(chat.id)).toEqual(expectedTranscript)
+          expect(store.requireChat(chat.id).sessionToken).toBe("source-session")
+          expect(store.requireChat(chat.id).turnCount).toBe(7)
+          expect(prompts).toBe(0)
+          const reloaded = new EventStore(dir)
+          await reloaded.initialize()
+          expect(reloaded.getMessages(chat.id)).toEqual(expectedTranscript)
+          expect(reloaded.requireChat(chat.id).turnCount).toBe(7)
+        } finally { die.release(); publication.release(); rollback.release(); await edit.catch(() => {}); coordinator.dispose() }
+      })
+    }
+  }
+
+
+  test("a deferred first Claude edit holds native token and init publication until its history commits", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "source-session"
+    const target = timestamped({ kind: "user_prompt", content: "first" })
+    store.messages = [target, timestamped({ kind: "assistant_text", text: "original answer", messageId: "source-answer" })]
+    const originalMessages = [...store.messages]
+    const history = readinessGate()
+    const historyStarted = readinessGate()
+    const tokenObserved = readinessGate()
+    const replace = store.replaceTranscript.bind(store)
+    store.replaceTranscript = async (chatId, entries) => { historyStarted.release(); await history.ready; await replace(chatId, entries) }
+    let prompts = 0
+    const events = new AsyncEventQueue<any>()
+    const assigned: Array<string | null> = []
+    store.setSessionToken = async (_chatId, token) => { assigned.push(token); store.chat.sessionToken = token }
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      startClaudeSession: async () => ({ provider: "claude", echoesPromptIds: true,
+        stream: { async *[Symbol.asyncIterator]() {
+          tokenObserved.release()
+          yield { type: "session_token" as const, sessionToken: "native-session" }
+          yield { type: "transcript" as const, entry: timestamped({ kind: "system_init", provider: "claude",
+            model: "claude-opus-4-1", tools: [], agents: [], slashCommands: [], mcpServers: [] }) }
+          yield* events
+        } },
+        interrupt: async () => {}, close: () => events.close(), setModel: async () => {}, setPermissionMode: async () => {},
+        sendPrompt: async (_content, promptId) => { prompts++; events.push({ type: "transcript", promptIds: [promptId],
+          entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) }) },
+      }),
+    })
+    const edit = coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: target._id, content: "edited" })
+    try {
+      await Promise.all([historyStarted.ready, tokenObserved.ready])
+      expect(store.messages).toEqual(originalMessages)
+      expect(store.chat.sessionToken).toBe("source-session")
+      expect(assigned).toEqual([])
+      expect(prompts).toBe(0)
+      expect(coordinator.getActiveStatuses().get("chat-1")).toBe("starting")
+      history.release()
+      await edit
+      await waitFor(() => store.turnFinishedCount === 1)
+      expect(assigned).toEqual(["native-session"])
+      expect(store.messages[0]).toMatchObject({ kind: "user_prompt", content: "edited" })
+      expect(store.messages.some((entry) => entry.kind === "system_init")).toBe(true)
+    } finally { history.release(); await edit.catch(() => {}); events.close() }
+  })
+
+
+  for (const blockedPhase of ["history", "readiness"] as const) {
+    test(`cancellation during deferred Claude ${blockedPhase} drains before a successor and skips stale work`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "claude"
+      store.chat.pendingForkSessionToken = "source-session"
+      store.chat.pendingForkResumeAt = "source-answer"
+      store.messages = [timestamped({ kind: "user_prompt", content: "first" }),
+        timestamped({ kind: "assistant_text", text: "answer", messageId: "source-answer" })]
+      const commit = readinessGate()
+      const commitStarted = readinessGate()
+      const replace = store.replaceTranscript.bind(store)
+      let replaced = 0
+      store.replaceTranscript = async (chatId, entries) => {
+        if (blockedPhase === "history" && ++replaced === 1) { commitStarted.release(); await commit.ready }
+        await replace(chatId, entries)
+      }
+      let assigned = 0
+      store.setSessionToken = async (_chatId, token) => {
+        if (blockedPhase === "readiness" && ++assigned === 1) { commitStarted.release(); await commit.ready }
+        store.chat.sessionToken = token
+      }
+      const queues: AsyncEventQueue<any>[] = []
+      const prompts: string[] = []
+      const closes: number[] = []
+      const starts: Array<string | null> = []
+      const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+        prepareClaudeSession: async (args) => ({ sessionToken: `prepared-${starts.length + 1}`, transcriptPrefix: args.transcriptPrefix }),
+        startClaudeSession: async (args) => {
+          starts.push(args.sessionToken)
+          const index = starts.length
+          const events = new AsyncEventQueue<any>()
+          queues.push(events)
+          events.push({ type: "session_token", sessionToken: args.sessionToken })
+          return { provider: "claude", stream: events,
+            interrupt: async () => {}, close: () => { closes.push(index); events.close() },
+            setModel: async () => {}, setPermissionMode: async () => {},
+            sendPrompt: async (content) => { prompts.push(content.split("\n\n")[0]!) },
+          }
+        },
+      })
+      const cancelled = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "cancelled" })
+      let successor: ReturnType<typeof coordinator.send> | undefined
+      try {
+        await commitStarted.ready
+        await coordinator.cancel("chat-1")
+        successor = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "successor" })
+        await waitFor(() => (coordinator as any).startingClaudeTurns.has("chat-1"))
+        expect(starts).toHaveLength(1)
+        commit.release()
+        await Promise.all([cancelled, successor])
+        expect(starts).toHaveLength(2)
+        expect(prompts).toEqual(["successor"])
+        expect(closes).toEqual([1])
+        expect(store.chat.sessionToken).toBe("prepared-2")
+        expect(coordinator.getActiveStatuses().get("chat-1")).toBe("running")
+      } finally { commit.release(); await cancelled.catch(() => {}); await successor?.catch(() => {}); for (const queue of queues) queue.close() }
+    })
+  }
+
+
+  test("a Claude edit preserves its source while the native initialize handshake fails", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "source-session"
+    const target = timestamped({ kind: "user_prompt", content: "original" })
+    store.messages = [target]
+    const handshake = readinessGate()
+    const handshakeStarted = readinessGate()
+    let prompts = 0
+    let closes = 0
+    const events = new AsyncEventQueue<any>()
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      startClaudeSession: async () => ({ provider: "claude", stream: events,
+        waitUntilReady: async () => { handshakeStarted.release(); await handshake.ready; throw new Error("initialize failed") },
+        interrupt: async () => {}, close: () => { closes++; events.close() },
+        setModel: async () => {}, setPermissionMode: async () => {}, sendPrompt: async () => { prompts++ },
+      }),
+    })
+    const edit = coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: target._id, content: "edited" })
+    try {
+      await Promise.race([handshakeStarted.ready, edit])
+      expect(store.messages).toEqual([target])
+      expect(store.chat.sessionToken).toBe("source-session")
+      handshake.release()
+      await expect(edit).rejects.toThrow("initialize failed")
+      expect(store.messages).toEqual([target])
+      expect(store.chat.sessionToken).toBe("source-session")
+      expect(prompts).toBe(0)
+      expect(closes).toBe(1)
+    } finally { handshake.release(); events.close(); await edit.catch(() => {}) }
+  })
+
+
+  test("does not glue a failed first Claude prompt into the next send", async () => {
+    const events = new AsyncEventQueue<any>()
+    const prompts: string[] = []
+    let startAttempts = 0
+
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => {
+        startAttempts += 1
+        if (startAttempts === 1) {
+          throw new Error("Claude boot failed")
+        }
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-session-1" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    await expect(coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "failed first prompt",
+      model: "claude-opus-4-1",
+    })).rejects.toThrow("Claude boot failed")
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "fresh second prompt",
+      model: "claude-opus-4-1",
+    })
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(prompts).toEqual(["fresh second prompt"])
+    expect(store.messages.filter((entry) => entry.kind === "user_prompt").map((entry) => entry.content)).toEqual([
+      "failed first prompt",
+      "fresh second prompt",
+    ])
+    expect(store.chat.pendingForkUserPrompt).toBe(false)
+
+    events.close()
+  })
+
+
+  test("keeps an edited Claude turn active when the stopped session stream closes late", async () => {
+    const oldEvents = new AsyncEventQueue<any>()
+    const editedEvents = new AsyncEventQueue<any>()
+    const prompts: Array<{ sessionIndex: number; content: string }> = []
+    let sessionIndex = 0
+    let resolveOldStreamCleanup!: () => void
+    const oldStreamCleanup = new Promise<void>((resolve) => {
+      resolveOldStreamCleanup = resolve
+    })
+    const oldStream = {
+      async *[Symbol.asyncIterator]() {
+        try {
+          yield* oldEvents
+        } finally {
+          setTimeout(resolveOldStreamCleanup, 0)
+        }
+      },
+    }
+
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => {
+        const currentSessionIndex = sessionIndex++
+        const events = currentSessionIndex === 0 ? oldStream : editedEvents
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push({ sessionIndex: currentSessionIndex, content })
+          },
+        }
+      },
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "original prompt",
+      model: "claude-opus-4-1",
+    })
+    const originalPrompt = store.messages.find((entry) => entry.kind === "user_prompt")
+    expect(originalPrompt).toBeDefined()
+
+    await coordinator.cancel("chat-1")
+    await coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-1",
+      messageId: originalPrompt!._id,
+      content: "edited prompt",
+    })
+
+    expect(prompts).toEqual([
+      { sessionIndex: 0, content: "original prompt" },
+      { sessionIndex: 1, content: "edited prompt" },
+    ])
+    expect(coordinator.getActiveStatuses().get("chat-1")).toBe("running")
+
+    oldEvents.push({
+      type: "transcript" as const,
+      entry: timestamped({
+        kind: "assistant_text",
+        messageId: "stale-assistant-message",
+        text: "stale answer",
+      }),
+    })
+    oldEvents.close()
+    await oldStreamCleanup
+
+    try {
+      expect(store.messages.some((entry) => entry.kind === "assistant_text" && entry.text === "stale answer")).toBe(false)
+      expect(coordinator.getActiveStatuses().get("chat-1")).toBe("running")
+    } finally {
+      editedEvents.close()
+    }
+  })
+
+
+  test("edits a Claude user prompt by forking at the previous assistant message", async () => {
+    const startSessionCalls: Array<{
+      sessionToken: string | null
+      forkSession: boolean
+      resumeSessionAt?: string
+    }> = []
+    const prompts: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "claude-session-1"
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "original task" })
+    const assistant = timestamped({ kind: "assistant_text", messageId: "assistant-msg-1", text: "first answer" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "follow-up" })
+    store.messages = [
+      firstPrompt,
+      assistant,
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ]
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          sessionToken: args.sessionToken,
+          forkSession: args.forkSession,
+          resumeSessionAt: args.resumeSessionAt,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-edited-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    await coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-1",
+      messageId: secondPrompt._id,
+      content: "edited follow-up",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(startSessionCalls).toEqual([{
+      sessionToken: "claude-session-1",
+      forkSession: false,
+      resumeSessionAt: undefined,
+    }])
+    expect(prompts).toEqual(["edited follow-up"])
+    expect(store.chat.sessionToken).toBe("claude-edited-session")
+    expect(store.messages.map((entry) => entry.kind)).toEqual(["user_prompt", "assistant_text", "result", "user_prompt", "result"])
+    expect(store.messages[3]).toMatchObject({ kind: "user_prompt", content: "edited follow-up" })
+
+    events.close()
+  })
+
+
+  test("edits a Claude prompt by resuming at the last main-session message before sidechain work", async () => {
+    const prepareSessionCalls: Array<{
+      localPath: string
+      sessionToken: string
+      resumeSessionAt?: string
+    }> = []
+    const startSessionCalls: Array<{
+      sessionToken: string | null
+      forkSession: boolean
+      resumeSessionAt?: string
+    }> = []
+    const prompts: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "claude-session-1"
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "original task" })
+    const mainSessionTask = timestamped({
+      kind: "tool_call",
+      messageId: "main-task-msg",
+      tool: {
+        kind: "tool",
+        toolKind: "subagent_task",
+        toolName: "Task",
+        toolId: "toolu_task",
+        input: { subagentType: "Plan" },
+        rawInput: { subagent_type: "Plan" },
+      },
+      debugRaw: JSON.stringify({
+        type: "assistant",
+        uuid: "main-task-msg",
+        parent_tool_use_id: null,
+      }),
+    })
+    const sidechainTool = timestamped({
+      kind: "tool_call",
+      messageId: "sidechain-grep-msg",
+      tool: {
+        kind: "tool",
+        toolKind: "grep",
+        toolName: "Grep",
+        toolId: "toolu_grep",
+        input: { pattern: "source" },
+        rawInput: { pattern: "source" },
+      },
+      debugRaw: JSON.stringify({
+        type: "assistant",
+        uuid: "sidechain-grep-msg",
+        parent_tool_use_id: "toolu_task",
+        subagent_type: "Plan",
+      }),
+    })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "follow-up" })
+    store.messages = [
+      firstPrompt,
+      mainSessionTask,
+      timestamped({
+        kind: "tool_result",
+        messageId: "main-task-result",
+        toolId: "toolu_task",
+        content: "subagent output",
+        isError: false,
+      }),
+      sidechainTool,
+      timestamped({
+        kind: "tool_result",
+        messageId: "sidechain-grep-result",
+        toolId: "toolu_grep",
+        content: "matches",
+        isError: false,
+        debugRaw: JSON.stringify({
+          type: "user",
+          uuid: "sidechain-grep-result",
+          parent_tool_use_id: "toolu_task",
+          subagent_type: "Plan",
+        }),
+      }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ]
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      prepareClaudeSession: async (args) => {
+        prepareSessionCalls.push(args)
+        return "prepared-claude-session"
+      },
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          sessionToken: args.sessionToken,
+          forkSession: args.forkSession,
+          resumeSessionAt: args.resumeSessionAt,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-edited-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    await coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-1",
+      messageId: secondPrompt._id,
+      content: "edited follow-up",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(prepareSessionCalls).toMatchObject([{
+      localPath: "/tmp/project",
+      sessionToken: "claude-session-1",
+      resumeSessionAt: "main-task-msg",
+    }])
+    expect(startSessionCalls).toEqual([{
+      sessionToken: "prepared-claude-session",
+      forkSession: false,
+      resumeSessionAt: undefined,
+    }])
+    expect(prompts).toEqual(["edited follow-up"])
+
+    events.close()
+  })
+
+
+  test("edits a Claude prompt using the transcript resume session when chat state holds a failed fork token", async () => {
+    const prepareSessionCalls: Array<{
+      localPath: string
+      sessionToken: string
+      resumeSessionAt?: string
+    }> = []
+    const startSessionCalls: Array<{
+      sessionToken: string | null
+      forkSession: boolean
+      resumeSessionAt?: string
+    }> = []
+    const prompts: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "failed-fork-session"
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "original task" })
+    const assistant = timestamped({
+      kind: "assistant_text",
+      messageId: "assistant-msg-1",
+      text: "first answer",
+      debugRaw: JSON.stringify({
+        type: "assistant",
+        uuid: "assistant-msg-1",
+        session_id: "claude-session-1",
+      }),
+    })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "follow-up" })
+    store.messages = [
+      firstPrompt,
+      assistant,
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({
+        kind: "result",
+        subtype: "error",
+        isError: true,
+        durationMs: 0,
+        result: "",
+        debugRaw: JSON.stringify({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          num_turns: 0,
+          session_id: "failed-fork-session",
+          errors: ["No conversation found with session ID: previous-failed-fork"],
+        }),
+      }),
+    ]
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      prepareClaudeSession: async (args) => {
+        prepareSessionCalls.push(args)
+        return "prepared-claude-session"
+      },
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          sessionToken: args.sessionToken,
+          forkSession: args.forkSession,
+          resumeSessionAt: args.resumeSessionAt,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-edited-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    await coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-1",
+      messageId: secondPrompt._id,
+      content: "edited follow-up",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(prepareSessionCalls).toMatchObject([{
+      localPath: "/tmp/project",
+      sessionToken: "claude-session-1",
+      resumeSessionAt: "assistant-msg-1",
+    }])
+    expect(startSessionCalls).toEqual([{
+      sessionToken: "prepared-claude-session",
+      forkSession: false,
+      resumeSessionAt: undefined,
+    }])
+    expect(prompts).toEqual(["edited follow-up"])
+    expect(store.chat.sessionToken).toBe("claude-edited-session")
+
+    events.close()
+  })
+
+
+  test("reuses a prepared Claude edit session after provider boot failure", async () => {
+    const prepareSessionCalls: Array<{
+      sessionToken: string
+      resumeSessionAt?: string
+    }> = []
+    const startSessionTokens: Array<string | null> = []
+    const events = new AsyncEventQueue<any>()
+    let startSessionCount = 0
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "claude-session-current"
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "second task" })
+    store.messages = [
+      firstPrompt,
+      timestamped({
+        kind: "assistant_text",
+        messageId: "assistant-msg-1",
+        text: "first answer",
+        debugRaw: JSON.stringify({
+          type: "assistant",
+          uuid: "assistant-msg-1",
+          session_id: "claude-session-source",
+        }),
+      }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ]
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      prepareClaudeSession: async (args) => {
+        prepareSessionCalls.push(args)
+        return "prepared-claude-session"
+      },
+      startClaudeSession: async (args) => {
+        startSessionCount += 1
+        startSessionTokens.push(args.sessionToken)
+        if (startSessionCount === 1) {
+          throw new Error("Claude boot failed")
+        }
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => events.close(),
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async () => {
+            events.push({ type: "session_token" as const, sessionToken: "claude-edited-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+    const editCommand = {
+      type: "chat.editUserPrompt" as const,
+      chatId: "chat-1",
+      messageId: secondPrompt._id,
+      content: "edited second task",
+    }
+
+    await expect(coordinator.editUserPrompt(editCommand)).rejects.toThrow("Claude boot failed")
+
+    expect(store.chat.sessionToken).toBe("claude-session-current")
+
+    await coordinator.editUserPrompt(editCommand)
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(prepareSessionCalls).toMatchObject([{
+      sessionToken: "claude-session-source",
+      resumeSessionAt: "assistant-msg-1",
+    }])
+    expect(startSessionTokens).toEqual([
+      "prepared-claude-session",
+      "prepared-claude-session",
+    ])
+    expect(store.chat.sessionToken).toBe("claude-edited-session")
+
+    events.close()
+  })
+
+
+  test("edits a Claude user prompt using persisted chat model settings when the command omits them", async () => {
+    const startSessionCalls: Array<{
+      model: string
+      effort?: string
+      planMode: boolean
+    }> = []
+    const prompts: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "claude-session-1"
+    store.chat.model = "claude-opus-4-8"
+    store.chat.modelOptions = { claude: { reasoningEffort: "max", contextWindow: "1m" } }
+    store.chat.planMode = true
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "original task" })
+    const assistant = timestamped({ kind: "assistant_text", messageId: "assistant-msg-1", text: "first answer" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "follow-up" })
+    store.messages = [
+      firstPrompt,
+      assistant,
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ]
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          model: args.model,
+          effort: args.effort,
+          planMode: args.planMode,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-edited-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    await coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-1",
+      messageId: secondPrompt._id,
+      content: "edited follow-up",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(startSessionCalls).toEqual([{
+      model: "opus[1m]",
+      effort: "max",
+      planMode: true,
+    }])
+    expect(prompts).toEqual(["edited follow-up"])
+
+    events.close()
+  })
+
+
+  test("edits the first Claude user prompt out of two by starting a fresh session", async () => {
+    const startSessionCalls: Array<{
+      sessionToken: string | null
+      forkSession: boolean
+      resumeSessionAt?: string
+      resetSession?: boolean
+    }> = []
+    const prompts: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "claude-session-1"
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "second task" })
+    store.messages = [
+      firstPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-1", text: "first answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ]
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          sessionToken: args.sessionToken,
+          forkSession: args.forkSession,
+          resumeSessionAt: args.resumeSessionAt,
+          resetSession: args.resetSession,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-edited-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    await coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-1",
+      messageId: firstPrompt._id,
+      content: "edited first task",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(startSessionCalls).toEqual([{
+      sessionToken: null,
+      forkSession: false,
+      resumeSessionAt: undefined,
+      resetSession: true,
+    }])
+    expect(prompts).toEqual(["edited first task"])
+    expect(store.chat.sessionToken).toBe("claude-edited-session")
+    expect(store.messages.map((entry) => entry.kind)).toEqual(["user_prompt", "result"])
+    expect(store.messages[0]).toMatchObject({ kind: "user_prompt", content: "edited first task" })
+    expect(store.messages.some((entry) => entry.kind === "user_prompt" && entry.content === "second task")).toBe(false)
+
+    events.close()
+  })
+
+
+  test.each(["text", "tool_use"])("skips normalized Claude child %s boundaries for edits and forks", async (childKind) => {
+    const store = createForkableFakeStore("claude", { title: "Claude Debug", sessionToken: "source-session" })
+    const prompt = timestamped({ kind: "user_prompt", content: "second task" })
+    store.setMessages("chat-1", [
+      timestamped({ kind: "user_prompt", content: "first task" }),
+      ...normalizeClaudeStreamMessage({ type: "assistant", uuid: "main-answer", session_id: "source-session",
+        message: { content: [{ type: "text", text: "answer" }] } }),
+      ...normalizeClaudeStreamMessage({ type: "assistant", uuid: "child-answer", session_id: "source-session",
+        parent_tool_use_id: "agent-tool", message: { content: [childKind === "text"
+          ? { type: "text", text: "child answer" }
+          : { type: "tool_use", name: "Read", id: "child-read", input: { file_path: "file" } }] } }),
+      prompt,
+    ])
+    const prepared: string[] = []
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      prepareClaudeSession: async (args) => { prepared.push(args.resumeSessionAt!); return "prepared" },
+      startClaudeSession: async () => { throw new Error("boot failed") },
+    })
+    await coordinator.forkChat({ type: "chat.fork", chatId: "chat-1", messageId: prompt._id })
+    expect(store.requireChat("chat-fork-1").pendingForkResumeAt).toBe("main-answer")
+    await expect(coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1",
+      messageId: prompt._id, content: "edit" })).rejects.toThrow("boot failed")
+    expect(prepared).toEqual(["main-answer"])
+  })
+
+
+  test.each([
+    { childKind: "text", metadata: { isSidechain: true } },
+    { childKind: "tool_use", metadata: { isSidechain: true } },
+    { childKind: "text", metadata: { subagent_type: "Explore" } },
+    { childKind: "tool_use", metadata: { subagent_type: "Explore" } },
+  ])("skips normalized Claude child boundaries without a parent tool id (%j)", async ({ childKind, metadata }) => {
+    const store = createForkableFakeStore("claude", { title: "Claude Debug", sessionToken: "source-session" })
+    const prompt = timestamped({ kind: "user_prompt", content: "second task" })
+    const children = normalizeClaudeStreamMessage({ type: "assistant", uuid: "child-answer", session_id: "source-session",
+      ...metadata, message: { content: [childKind === "text" ? { type: "text", text: "child answer" }
+        : { type: "tool_use", name: "Read", id: "child-read", input: { file_path: "file" } }] } })
+    expect(children).toHaveLength(1)
+    expect(children[0]).toMatchObject({ claudeSidechain: true })
+    expect(children[0]?.parentToolUseId).toBeUndefined()
+    expect(children[0]?.debugRaw).toBeUndefined()
+    store.setMessages("chat-1", [timestamped({ kind: "user_prompt", content: "first task" }),
+      ...normalizeClaudeStreamMessage({ type: "assistant", uuid: "main-answer", session_id: "source-session",
+        message: { content: [{ type: "text", text: "main answer" }] } }), ...children, prompt])
+    const prepared: string[] = []
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      prepareClaudeSession: async (args) => { prepared.push(args.resumeSessionAt!); return "prepared" },
+      startClaudeSession: async () => { throw new Error("boot failed") },
+    })
+    await coordinator.forkChat({ type: "chat.fork", chatId: "chat-1", messageId: prompt._id })
+    expect(store.requireChat("chat-fork-1").pendingForkResumeAt).toBe("main-answer")
+    await expect(coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: prompt._id,
+      content: "edit" })).rejects.toThrow("boot failed")
+    expect(prepared).toEqual(["main-answer"])
+  })
+
+
+  test("keeps Claude history when editing the first prompt fails before provider start", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "claude-session-1"
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "second task" })
+    store.messages = [
+      firstPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-1", text: "first answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ]
+    const originalMessages = [...store.messages]
+    const startedSessionTokens: Array<string | null> = []
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startedSessionTokens.push(args.sessionToken)
+        throw new Error("Claude boot failed")
+      },
+    })
+
+    await expect(coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-1",
+      messageId: firstPrompt._id,
+      content: "edited first task",
+    })).rejects.toThrow("Claude boot failed")
+
+    expect(store.messages).toEqual(originalMessages)
+    expect(store.chat.sessionToken).toBe("claude-session-1")
+    await expect(coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "continue" }))
+      .rejects.toThrow("Claude boot failed")
+    expect(startedSessionTokens).toEqual([null, "claude-session-1"])
+  })
+
+
+  test("first-prompt readiness preserves a new Claude token already emitted by startup", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "old-session"
+    const prompt = timestamped({ kind: "user_prompt", content: "original" })
+    store.messages = [prompt, timestamped({ kind: "assistant_text", messageId: "old-answer", text: "old" })]
+    const events = new AsyncEventQueue<any>()
+    const assigned: Array<string | null> = []
+    store.setSessionToken = async (_chatId, token) => { assigned.push(token); store.chat.sessionToken = token }
+    const coordinator = new AgentCoordinator({
+      store: store as never, onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        expect(args.sessionToken).toBeNull()
+        expect(store.chat.sessionToken).toBe("old-session")
+        events.push({ type: "session_token", sessionToken: "ready-session" })
+        return { provider: "claude", stream: events, getAccountInfo: async () => null,
+          interrupt: async () => {}, close: () => events.close(), setModel: async () => {},
+          setPermissionMode: async () => {}, sendPrompt: async () => {
+            events.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success",
+              isError: false, durationMs: 0, result: "done" }) })
+          } }
+      },
+    })
+    await coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: prompt._id,
+      content: "replacement" })
+    await waitFor(() => store.turnFinishedCount === 1)
+    expect(store.chat.sessionToken).toBe("ready-session")
+    expect(assigned).toEqual(["ready-session"])
+    events.close()
+  })
+
+
+  test("publishes prepared Claude UUIDs with their owning session on repeated edits", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "original-session"
+    const first = timestamped({ kind: "user_prompt", content: "same prompt" })
+    const second = timestamped({ kind: "user_prompt", content: "same prompt" })
+    const answer = timestamped({ kind: "assistant_text", messageId: "original-answer", text: "answer" })
+    store.messages = [first, answer, second]
+    const preparedCalls: Array<{ sessionToken: string; resumeSessionAt?: string }> = []
+    const started: Array<string | null> = []
+    const queues: AsyncEventQueue<any>[] = []
+    const coordinator = new AgentCoordinator({
+      store: store as never, onStateChange: () => {},
+      prepareClaudeSession: (async (args: any) => {
+        preparedCalls.push({ sessionToken: args.sessionToken, resumeSessionAt: args.resumeSessionAt })
+        const sessionToken = `prepared-${preparedCalls.length}`
+        return { sessionToken, transcriptPrefix: (args.transcriptPrefix ?? [first, answer]).map((entry: TranscriptEntry) =>
+          entry.kind === "assistant_text"
+            ? { ...entry, messageId: `mapped-${preparedCalls.length}`, claudeSessionToken: sessionToken }
+            : entry) }
+      }) as never,
+      startClaudeSession: async (args) => {
+        started.push(args.sessionToken)
+        const events = new AsyncEventQueue<any>()
+        queues.push(events)
+        return { provider: "claude", stream: events, getAccountInfo: async () => null,
+          interrupt: async () => {}, close: () => events.close(), setModel: async () => {},
+          setPermissionMode: async () => {}, sendPrompt: async () => {
+            events.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success",
+              isError: false, durationMs: 0, result: "done" }) })
+          } }
+      },
+    })
+    await coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1",
+      messageId: second._id, content: "edit one" })
+    await waitFor(() => store.turnFinishedCount === 1)
+    const edited = store.messages.find((entry) => entry.kind === "user_prompt" && entry.content === "edit one")!
+    await coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1",
+      messageId: edited._id, content: "edit two" })
+    await waitFor(() => store.turnFinishedCount === 2)
+    expect(started).toEqual(["prepared-1", "prepared-2"])
+    expect(preparedCalls).toEqual([
+      { sessionToken: "original-session", resumeSessionAt: "original-answer" },
+      { sessionToken: "prepared-1", resumeSessionAt: "mapped-1" },
+    ])
+    expect(store.messages[1]).toMatchObject({ _id: answer._id, createdAt: answer.createdAt,
+      messageId: "mapped-2", claudeSessionToken: "prepared-2" })
+    for (const queue of queues) queue.close()
+  })
+
+
+  test("maps a pending Claude fork before sending and reuses those UUIDs on another fork", async () => {
+    const store = createForkableFakeStore("claude", { title: "Repeat", sessionToken: "source" })
+    const answer = timestamped({ kind: "assistant_text", messageId: "a1", text: "answer" })
+    const target = timestamped({ kind: "user_prompt", content: "repeat" })
+    store.setMessages("chat-1", [timestamped({ kind: "user_prompt", content: "repeat" }), answer, target])
+    const events = new AsyncEventQueue<any>()
+    const starts: Array<{ token: string | null; fork: boolean }> = []
+    const coordinator = new AgentCoordinator({
+      store: store as never, onStateChange: () => {},
+      prepareClaudeSession: async (args) => ({ sessionToken: "prepared-fork", transcriptPrefix:
+        args.transcriptPrefix.map((entry) => entry.messageId === "a1"
+          ? { ...entry, messageId: "fork-a1", claudeSessionToken: "prepared-fork" } : entry) }),
+      startClaudeSession: async (args) => {
+        starts.push({ token: args.sessionToken, fork: args.forkSession })
+        return { provider: "claude", stream: events, getAccountInfo: async () => null,
+          interrupt: async () => {}, close: () => events.close(), setModel: async () => {},
+          setPermissionMode: async () => {}, sendPrompt: async () => {
+            events.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success",
+              isError: false, durationMs: 0, result: "done" }) })
+          } }
+      },
+    })
+    const first = await coordinator.forkChat({ type: "chat.fork", chatId: "chat-1", messageId: target._id })
+    await coordinator.send({ type: "chat.send", chatId: first.chatId, provider: "claude", content: "continue" })
+    await waitFor(() => store.turnFinishedCount === 1)
+    expect(starts).toEqual([{ token: "prepared-fork", fork: false }])
+    const kept = store.getMessages(first.chatId)
+    expect(kept[1]).toMatchObject({ _id: answer._id, createdAt: answer.createdAt,
+      messageId: "fork-a1", claudeSessionToken: "prepared-fork" })
+    const nextTarget = kept.find((entry) => entry.kind === "user_prompt" && entry.content.includes("continue"))!
+    await coordinator.forkChat({ type: "chat.fork", chatId: first.chatId, messageId: nextTarget._id })
+    expect(store.requireChat("chat-fork-1")).toMatchObject({ pendingForkSessionToken: "prepared-fork",
+      pendingForkResumeAt: "fork-a1" })
+    events.close()
+  })
+
+
+  test("keeps a pending Claude fork unchanged if native mapping fails", async () => {
+    const store = createForkableFakeStore("claude", { title: "Repeat", sessionToken: "source" })
+    const target = timestamped({ kind: "user_prompt", content: "repeat" })
+    store.setMessages("chat-1", [timestamped({ kind: "user_prompt", content: "first" }),
+      timestamped({ kind: "assistant_text", messageId: "a1", text: "answer" }), target])
+    let started = false
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      prepareClaudeSession: async () => { throw new Error("native mapping unavailable") },
+      startClaudeSession: async () => { started = true; throw new Error("unexpected provider start") },
+    })
+    const fork = await coordinator.forkChat({ type: "chat.fork", chatId: "chat-1", messageId: target._id })
+    const before = JSON.stringify(store.getMessages(fork.chatId))
+    await expect(coordinator.send({ type: "chat.send", chatId: fork.chatId, provider: "claude", content: "continue" }))
+      .rejects.toThrow("native mapping unavailable")
+    expect(started).toBe(false)
+    expect(JSON.stringify(store.getMessages(fork.chatId))).toBe(before)
+    expect(store.requireChat(fork.chatId)).toMatchObject({ sessionToken: null, pendingForkSessionToken: "source",
+      pendingForkResumeAt: "a1", pendingForkUserPrompt: true })
+  })
+
+
+  test("retries a Claude edit from the source session after a fork fails during provider execution", async () => {
+    const startSessionCalls: Array<{
+      sessionToken: string | null
+      forkSession: boolean
+      resumeSessionAt?: string
+    }> = []
+    const prompts: string[] = []
+    const queues: AsyncEventQueue<any>[] = []
+    let turnFailedCount = 0
+    const store = createFakeStore()
+    store.recordTurnFailed = async () => {
+      turnFailedCount += 1
+    }
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "claude-session-1"
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "second task" })
+    store.messages = [
+      firstPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-1", text: "first answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ]
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          sessionToken: args.sessionToken,
+          forkSession: args.forkSession,
+          resumeSessionAt: args.resumeSessionAt,
+        })
+        const queue = new AsyncEventQueue<any>()
+        queues.push(queue)
+        const sessionIndex = queues.length
+
+        return {
+          provider: "claude",
+          stream: queue,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => queue.close(),
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            if (sessionIndex === 1) {
+              queue.push({ type: "session_token" as const, sessionToken: "failed-fork-session" })
+              queue.push({
+                type: "transcript" as const,
+                entry: timestamped({
+                  kind: "result",
+                  subtype: "error",
+                  isError: true,
+                  durationMs: 0,
+                  result: "",
+                  debugRaw: JSON.stringify({
+                    type: "result",
+                    subtype: "error_during_execution",
+                    is_error: true,
+                    num_turns: 0,
+                    session_id: "failed-fork-session",
+                    errors: ["No message found with message.uuid of: bad-resume-point"],
+                  }),
+                }),
+              })
+              return
+            }
+
+            queue.push({ type: "session_token" as const, sessionToken: "claude-edited-session" })
+            queue.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    await coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-1",
+      messageId: secondPrompt._id,
+      content: "edited once",
+    })
+
+    await waitFor(() => turnFailedCount === 1)
+    expect(store.chat.sessionToken).toBe("claude-session-1")
+
+    const editedPrompt = store.messages.find((entry) => entry.kind === "user_prompt" && entry.content === "edited once")
+    expect(editedPrompt?.kind).toBe("user_prompt")
+    if (!editedPrompt || editedPrompt.kind !== "user_prompt") throw new Error("missing edited prompt")
+
+    await coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-1",
+      messageId: editedPrompt._id,
+      content: "edited twice",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(startSessionCalls).toEqual([
+      {
+        sessionToken: "claude-session-1",
+        forkSession: false,
+        resumeSessionAt: undefined,
+      },
+      {
+        sessionToken: "claude-session-1",
+        forkSession: false,
+        resumeSessionAt: undefined,
+      },
+    ])
+    expect(prompts).toEqual(["edited once", "edited twice"])
+    expect(store.chat.sessionToken).toBe("claude-edited-session")
+
+    for (const queue of queues) {
+      queue.close()
+    }
+  })
+
+
+  test("edits the second Claude user prompt out of three and discards later turns", async () => {
+    const startSessionCalls: Array<{
+      sessionToken: string | null
+      forkSession: boolean
+      resumeSessionAt?: string
+      resetSession?: boolean
+    }> = []
+    const prompts: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "claude-session-1"
+    const firstPrompt = timestamped({ kind: "user_prompt", content: "first task" })
+    const secondPrompt = timestamped({ kind: "user_prompt", content: "second task" })
+    const thirdPrompt = timestamped({ kind: "user_prompt", content: "third task" })
+    store.messages = [
+      firstPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-1", text: "first answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      secondPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-2", text: "second answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+      thirdPrompt,
+      timestamped({ kind: "assistant_text", messageId: "assistant-msg-3", text: "third answer" }),
+      timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+    ]
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          sessionToken: args.sessionToken,
+          forkSession: args.forkSession,
+          resumeSessionAt: args.resumeSessionAt,
+          resetSession: args.resetSession,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            events.push({ type: "session_token" as const, sessionToken: "claude-edited-session" })
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    await coordinator.editUserPrompt({
+      type: "chat.editUserPrompt",
+      chatId: "chat-1",
+      messageId: secondPrompt._id,
+      content: "edited second task",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(startSessionCalls).toEqual([{
+      sessionToken: "claude-session-1",
+      forkSession: false,
+      resumeSessionAt: undefined,
+      resetSession: true,
+    }])
+    expect(prompts).toEqual(["edited second task"])
+    expect(store.chat.sessionToken).toBe("claude-edited-session")
+    expect(store.messages.map((entry) => entry.kind)).toEqual(["user_prompt", "assistant_text", "result", "user_prompt", "result"])
+    expect(store.messages[0]).toBe(firstPrompt)
+    expect(store.messages[3]).toMatchObject({ kind: "user_prompt", content: "edited second task" })
+    expect(store.messages.some((entry) => entry.kind === "user_prompt" && entry.content === "third task")).toBe(false)
+
+    events.close()
+  })
+
+
+  test("prepared Claude edits check their own artifact and retain the source on failed startup", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "source-session"
+    const prompt = timestamped({ kind: "user_prompt", content: "second task" })
+    store.messages = [
+      timestamped({ kind: "user_prompt", content: "first task" }),
+      timestamped({ kind: "assistant_text", text: "answer", messageId: "main-answer" }),
+      prompt,
+    ]
+    const originalMessages = [...store.messages]
+    const checkedTokens: Array<string | null | undefined> = []
+    const startedTokens: Array<string | null> = []
+    const coordinator = new AgentCoordinator({
+      store: store as never, onStateChange: () => {},
+      checkSessionArtifact: (_provider, args) => { checkedTokens.push(args.sessionToken); return "missing" },
+      prepareClaudeSession: async () => "prepared-session",
+      startClaudeSession: async (args) => { startedTokens.push(args.sessionToken); throw new Error("boot failed") },
+    })
+    await expect(coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1",
+      messageId: prompt._id, content: "edit" })).rejects.toThrow("boot failed")
+    expect(checkedTokens).toEqual(["prepared-session"])
+    expect(startedTokens).toEqual([null])
+    expect(store.chat.sessionToken).toBe("source-session")
+    expect(store.messages).toEqual(originalMessages)
+  })
+
+
+  test("send waits for a cancelled history publication before inspecting history state", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    let release!: () => void
+    const pendingPublication = new Promise<void>(resolve => { release = resolve })
+    const events = new AsyncEventQueue<any>()
+    const prompts: string[] = []
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      startClaudeSession: async () => ({ provider: "claude", stream: events,
+        interrupt: async () => {}, close: () => events.close(),
+        setModel: async () => {}, setPermissionMode: async () => {},
+        sendPrompt: async content => { prompts.push(content.split("\n\n")[0]!) },
+      }),
+    })
+    // Cancellation releases the active turn before an owned durable write settles.
+    // Keep the publication and history locks until the source is restored.
+    const state = coordinator as any
+    state.claudeReadinessCommits.set("chat-1", pendingPublication)
+    state.historyOperations.set("chat-1", { cancelled: true })
+    let rejected: unknown
+    const successor = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "successor" })
+    void successor.catch(error => { rejected = error })
+    try {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(rejected).toBeUndefined()
+      expect(prompts).toEqual([])
+      state.historyOperations.delete("chat-1")
+      state.claudeReadinessCommits.delete("chat-1")
+      release()
+      await successor
+      expect(prompts).toEqual(["successor"])
+      expect(coordinator.getActiveStatuses().get("chat-1")).toBe("running")
+    } finally {
+      state.historyOperations.delete("chat-1")
+      state.claudeReadinessCommits.delete("chat-1")
+      release()
+      await successor.catch(() => {})
+      events.close()
+    }
+  })
 
 })
 
@@ -3829,6 +6460,13 @@ describe("mid-conversation provider switch", () => {
     const sentContents: string[] = []
     const stoppedCodexSessions: string[] = []
     const fakeCodexManager = {
+      async readPromptHistory() {
+        return { inputs: store.messages.filter((entry) => entry.kind === "user_prompt").map((entry, i) => ({
+          turnId: `native-${i}`, userIndex: 0, promptId: entry._id, text: (entry as { content: string }).content,
+        })) }
+      },
+      // Accepted native sessions always expose their token, including this handoff fixture.
+
       async startSession() {
         return { sessionToken: "codex-thread-1", resumeFellBack: false }
       },
@@ -3838,6 +6476,7 @@ describe("mid-conversation provider switch", () => {
       async startTurn(args: { content: string }): Promise<HarnessTurn> {
         sentContents.push(args.content)
         async function* stream() {
+          yield { type: "session_token" as const, sessionToken: "codex-thread-1" }
           yield {
             type: "transcript" as const,
             entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "" }),
@@ -3874,7 +6513,7 @@ describe("mid-conversation provider switch", () => {
 
     // Fresh native session on the new harness; the old one is never resumed.
     expect(store.chat.provider).toBe("codex")
-    expect(store.chat.sessionToken).toBeNull()
+    expect(store.chat.sessionToken).toBe("codex-thread-1")
     expect(store.chat.pendingForkSessionToken).toBeNull()
     expect(stoppedCodexSessions).toEqual(["chat-1"])
 
@@ -4039,6 +6678,11 @@ describe("session restore on lost native session", () => {
     const sentContents: string[] = []
     let resumeFellBack = true
     const fakeCodexManager = {
+      async readPromptHistory() {
+        return { inputs: store.messages.filter((entry) => entry.kind === "user_prompt").map((entry, i) => ({
+          turnId: `native-${i}`, userIndex: 0, promptId: entry._id, text: (entry as { content: string }).content,
+        })) }
+      },
       async startSession() {
         return { sessionToken: "codex-thread-new", resumeFellBack }
       },
@@ -4299,14 +6943,19 @@ function createFakeChat(id: string, projectId: string, title = "New Chat") {
     projectId,
     title,
     provider: null as AgentProvider | null,
-    contextRestoration: null as ContextRestoration | null,
+    model: null as string | null,
+    modelOptions: null as any,
     planMode: false,
     autoPlan: false,
     sessionToken: null as string | null,
     pendingForkSessionToken: null as string | null,
     resumePending: undefined as boolean | undefined,
     lastModel: undefined as string | undefined,
+    turnCount: undefined as number | undefined,
     deletedAt: undefined as number | undefined,
+    pendingForkResumeAt: null as string | null,
+    pendingForkUserPrompt: false,
+    contextRestoration: null as ContextRestoration | null,
   }
 }
 
@@ -4326,8 +6975,10 @@ function createFakeStore(options?: {
     return found
   }
   return {
+    dataDir: fakeStoreDirectory(),
     chat,
     turnFinishedCount: 0,
+    turnStartedCounts: [] as Array<number | undefined>,
     messages: [] as TranscriptEntry[],
     queuedMessages: [] as any[],
     requireChat,
@@ -4343,15 +6994,19 @@ function createFakeStore(options?: {
     getMessages(chatId = chat.id) {
       return chats.length === 1 ? this.messages : this.messages.filter(entry => (messageOwners.get(entry._id) ?? chat.id) === chatId)
     },
+    getPromptHistoryEntries(chatId = chat.id) {return this.messages.filter(entry => (messageOwners.get(entry._id) ?? chat.id) === chatId)},
+    getEntryIdAt(chatId:string,index:number) {return this.messages.filter(entry => (messageOwners.get(entry._id) ?? chat.id) === chatId)[index]?._id??null},
     getTranscriptLength(chatId = chat.id) { return this.messages.filter(entry => (messageOwners.get(entry._id) ?? chat.id) === chatId).length },
-    getContextBounds(chatId = chat.id, endExclusive?: number) {
-      const entries = this.messages.filter(entry => (messageOwners.get(entry._id) ?? chat.id) === chatId).slice(0, endExclusive)
+    hasUserPrompt(chatId: string, messageId: string) { return this.messages.some(entry => (messageOwners.get(entry._id) ?? chat.id) === chatId && entry.kind === "user_prompt" && entry._id === messageId) },
+    getContextBounds(chatId = chat.id) {
+      const entries = this.messages.filter(entry => (messageOwners.get(entry._id) ?? chat.id) === chatId)
       let start = 0
       entries.forEach((entry, index) => { if (entry.kind === "context_cleared") start = index + 1 })
       return { start, endExclusive: entries.length, hasConversation: entries.slice(start).some(entry => ["user_prompt", "assistant_text", "tool_call", "tool_result"].includes(entry.kind)) }
     },
     async setContextRestoration(chatId: string, restoration: any) { (requireChat(chatId) as any).contextRestoration = restoration },
     async acknowledgeContextRestoration(chatId: string, id: string) { const chat = requireChat(chatId) as any; if (chat.contextRestoration?.id === id) chat.contextRestoration = null },
+    async setCodexHistoryIntegrity(chatId: string, integrity: any) { (requireChat(chatId) as any).codexHistoryIntegrity = structuredClone(integrity) },
     async setChatProvider(chatId: string, provider: AgentProvider) {
       requireChat(chatId).provider = provider
     },
@@ -4361,16 +7016,35 @@ function createFakeStore(options?: {
     async setAutoPlan(chatId: string, autoPlan: boolean) {
       requireChat(chatId).autoPlan = autoPlan
     },
+    async setChatModelSettings(chatId: string, settings: { model: string | null; modelOptions: any }) {
+      requireChat(chatId).model = settings.model
+      requireChat(chatId).modelOptions = settings.modelOptions
+    },
     async renameChat(chatId: string, title: string) {
       requireChat(chatId).title = title
     },
     async appendMessage(chatId: string, entry: TranscriptEntry) {
       messageOwners.set(entry._id, chatId)
       this.messages.push(entry)
+      if (entry.kind === "user_prompt" && !entry.hidden && !entry.parentToolUseId)
+        (requireChat(chatId) as any).promptHistoryRevision = crypto.randomUUID()
     },
-    async recordTurnStarted() {},
+    async replaceTranscript(_chatId: string, entries: TranscriptEntry[]) {
+      this.messages = [...entries]
+      ;(requireChat(_chatId) as any).promptHistoryRevision = crypto.randomUUID()
+    },
+    async recordTurnStarted(
+      _chatId: string,
+      _model?: string,
+      options?: { turnCount?: number }
+    ) {
+      this.turnStartedCounts.push(options?.turnCount)
+    },
     async recordTurnFinished() {
       this.turnFinishedCount += 1
+    },
+    async restoreTurnCount(chatId: string, turnCount: number | undefined) {
+      requireChat(chatId).turnCount = turnCount
     },
     async recordTurnFailed(): Promise<void> {
       throw new Error("Did not expect turn failure")
@@ -4390,6 +7064,12 @@ function createFakeStore(options?: {
     async setPendingForkSessionToken(chatId: string, pendingForkSessionToken: string | null) {
       requireChat(chatId).pendingForkSessionToken = pendingForkSessionToken
     },
+    async setPendingForkResumeAt(_chatId: string, pendingForkResumeAt: string | null) {
+      chat.pendingForkResumeAt = pendingForkResumeAt
+    },
+    async setPendingForkUserPrompt(_chatId: string, pendingForkUserPrompt: boolean) {
+      chat.pendingForkUserPrompt = pendingForkUserPrompt
+    },
     async createChat() {
       return chat
     },
@@ -4400,6 +7080,8 @@ function createFakeStore(options?: {
         title: "Fork: New Chat",
         sessionToken: null,
         pendingForkSessionToken: chat.sessionToken ?? chat.pendingForkSessionToken,
+        pendingForkResumeAt: chat.pendingForkResumeAt,
+        pendingForkUserPrompt: false,
       }
     },
     async enqueueMessage(_chatId: string, message: any) {
@@ -4841,7 +7523,7 @@ describe("Claude background work snapshots", () => {
 
 
 describe("provider context read contract", () => {
-  function fixture(provider: AgentProvider, options: { fallback?: boolean; failInput?: boolean } = {}) {
+  async function fixture(provider: AgentProvider, options: { fallback?: boolean; failInput?: boolean } = {}) {
     const chat = createFakeChat("chat-1", "project-1", "New Chat")
     chat.provider = provider as never
     chat.sessionToken = "native-old"
@@ -4855,6 +7537,11 @@ describe("provider context read contract", () => {
     const startupArgs: any[] = []
     const stream = new AsyncEventQueue<any>()
     const manager = {
+      async readPromptHistory() {
+        return { inputs: store.getPromptHistoryEntries("chat-1").filter((e) => e.kind === "user_prompt").map((e, i) => ({
+          turnId: `native-${i}`, promptId: e._id, text: (e as { content: string }).content, userIndex: 0,
+        })) }
+      },
       async startSession(args: any) {
         starts++
         startupArgs.push(args)
@@ -4868,7 +7555,7 @@ describe("provider context read contract", () => {
           : args.content
         if (options.failInput) throw new Error("input rejected")
         sent.push(content)
-        return { provider, stream, interrupt: async () => {}, close: () => stream.close() }
+        return { provider, providerTurnId: `accepted-${sent.length}`, stream, interrupt: async () => {}, close: () => stream.close() }
       },
       stopSession() {}, closeChat() {},
     }
@@ -4883,12 +7570,14 @@ describe("provider context read contract", () => {
         sendPrompt: async (content: string) => { if (options.failInput) throw new Error("input rejected"); sent.push(content) },
       }) as never,
     })
+    if (provider === "codex") await new CodexPromptHistory(store.dataDir).remember("chat-1", {
+      [store.messages[0]!._id]: { sessionToken: "native-old", turnId: "native-0", mergeTurn: false, boundaryEntryId: null },
+    })
     return { store, coordinator, sent, stream, startupArgs, starts: () => starts }
   }
-
-  for (const provider of ["claude", "codex", "cursor", "grok", "pi"] as const) {
+for (const provider of ["claude", "codex", "cursor", "grok", "pi"] as const) {
     test(`${provider} cold resume and queued continuation never load the full payload`, async () => {
-      const f = fixture(provider)
+      const f = await fixture(provider)
       f.store.getMessages = () => { throw new Error("full payload read on native reuse") }
       try {
         await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider, content: "next" })
@@ -4905,7 +7594,7 @@ describe("provider context read contract", () => {
   }
 
   test("actual Codex fresh fallback starts once and restores before the first input", async () => {
-    const f = fixture("codex", { fallback: true })
+    const f = await fixture("codex", { fallback: true })
     try {
       await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "next" })
       expect(f.starts()).toBe(1)
@@ -4938,7 +7627,7 @@ describe("provider context read contract", () => {
   })
 
   test("restart continuation restores a tokenless durable obligation without adding a user prompt", async () => {
-    const f = fixture("codex", { fallback: true })
+    const f = await fixture("codex", { fallback: true })
     f.store.chat.sessionToken = null
     await f.store.setContextRestoration("chat-1", { id: "persisted", provider: "codex", fromProvider: "claude", reason: "provider_switch", endExclusive: 2 })
     try {
@@ -4954,7 +7643,7 @@ describe("provider context read contract", () => {
     const providers = ["claude", "codex", "cursor", "grok", "pi"] as const
     for (const from of providers) for (const to of providers) {
       if (from === to) continue
-      const f = fixture(from)
+      const f = await fixture(from)
       try {
         await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: to, content: "destination input" })
         expect(f.sent).toHaveLength(1)
@@ -4967,7 +7656,7 @@ describe("provider context read contract", () => {
   })
 
   test("failed turn partial progress belongs to a different retry's restoration", async () => {
-    const f = fixture("codex")
+    const f = await fixture("codex")
     f.store.recordTurnFailed = async () => { f.store.turnFinishedCount++ }
     try {
       await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "pi", content: "implement parser" })
@@ -5040,7 +7729,7 @@ describe("provider context read contract", () => {
   })
 
   test("retry reconciles a durable destination written before provider metadata changed", async () => {
-    const f = fixture("codex")
+    const f = await fixture("codex")
     await f.store.setContextRestoration("chat-1", { id: "switch-interrupted", provider: "pi", fromProvider: "codex", reason: "provider_switch", endExclusive: 2 })
     try {
       await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "continue here" })
@@ -5068,7 +7757,7 @@ describe("provider context read contract", () => {
   })
 
   test("a fresh startup after explicit clear cannot restore the previous epoch", async () => {
-    const f = fixture("codex", { fallback: true })
+    const f = await fixture("codex", { fallback: true })
     f.store.messages.push(timestamped({ kind: "context_cleared" }), timestamped({ kind: "user_prompt", content: "new epoch task" }), timestamped({ kind: "assistant_text", text: "new epoch answer" }))
     try {
       await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "continue" })
@@ -5080,10 +7769,62 @@ describe("provider context read contract", () => {
   })
 
   test("failed provider-switch input retains a bounded durable restoration obligation", async () => {
-    const f = fixture("codex", { failInput: true })
+    const f = await fixture("codex", { failInput: true })
     try {
       await expect(f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "pi", content: "next" })).rejects.toThrow("input rejected")
       expect((f.store.chat as any).contextRestoration).toMatchObject({ provider: "pi", fromProvider: "codex", endExclusive: 2 })
+    } finally { f.stream.close() }
+  })
+
+
+  for (const provider of ["cursor", "grok", "pi"] as const) {
+    test(`${provider} prefix handoff never receives the old provider's token`, async () => {
+      const f = await fixture("claude")
+      const prefix = [...f.store.messages]
+      try {
+        await (f.coordinator as any).startTurnForChat({ chatId: "chat-1", provider, content: "next", attachments: [], model: "model", planMode: false, autoPlan: false, appendUserPrompt: true, replaceTranscriptPrefix: prefix })
+        expect(f.startupArgs[0].sessionToken).toBeNull()
+        expect(f.startupArgs[0].forkSession ?? false).toBe(false)
+        expect(f.sent[0]).toContain("prior answer")
+        expect(f.store.chat.sessionToken).toBeNull()
+      } finally { f.stream.close() }
+    })
+  }
+
+
+  test("pending restoration actually forces fresh startup despite a prepared token override", async () => {
+    const f = await fixture("codex")
+    await f.store.setContextRestoration("chat-1", { id: "failed", provider: "codex", fromProvider: "claude", reason: "provider_switch", endExclusive: 2 })
+    try {
+      await (f.coordinator as any).startTurnForChat({ chatId: "chat-1", provider: "codex", content: "replacement", attachments: [], model: "gpt-5.4", planMode: false, autoPlan: false, appendUserPrompt: true, replaceTranscriptPrefix: [...f.store.messages], sessionToken: "prepared-but-incomplete", pendingForkSessionToken: "fork-source" })
+      expect(f.startupArgs[0].sessionToken).toBeNull()
+      expect(f.startupArgs[0].pendingForkSessionToken).toBeNull()
+      expect(f.sent[0]).toContain("prior answer")
+    } finally { f.stream.close() }
+  })
+
+
+  test("preserved prepared native prefix sends only the replacement input", async () => {
+    const f = await fixture("codex")
+    const prefix = [...f.store.messages]
+    f.store.getMessages = () => { throw new Error("prepared native prefix must not replay full payload") }
+    try {
+      await (f.coordinator as any).startTurnForChat({ chatId: "chat-1", provider: "codex", content: "replacement", attachments: [], model: "gpt-5.4", planMode: false, autoPlan: false, appendUserPrompt: true, replaceTranscriptPrefix: prefix, sessionToken: "prepared" })
+      expect(f.sent[0]).toBe(withChatLinks("replacement"))
+    } finally { f.stream.close() }
+  })
+
+
+  test("a fresh prepared edit restores only its prefix and never advertises the old transcript", async () => {
+    const f = await fixture("codex", { fallback: true })
+    const prefix = [...f.store.messages]
+    f.store.messages.push(timestamped({ kind: "user_prompt", content: "discard this task" }), timestamped({ kind: "assistant_text", text: "deleted answer" }))
+    try {
+      await (f.coordinator as any).startTurnForChat({ chatId: "chat-1", provider: "codex", content: "replacement", attachments: [], model: "gpt-5.4", planMode: false, autoPlan: false, appendUserPrompt: true, replaceTranscriptPrefix: prefix, sessionToken: "prepared-prefix" })
+      expect(f.sent[0]).toContain("prior answer")
+      expect(f.sent[0]).not.toContain("deleted answer")
+      expect(f.sent[0]).not.toContain("/tmp/transcripts/chat-1.jsonl")
+      expect(f.sent[0]?.match(/replacement/g)).toHaveLength(1)
     } finally { f.stream.close() }
   })
 })
@@ -5170,6 +7911,9 @@ describe("owned provider context preparation integration", () => {
     store.chat.sessionToken = "native-old"
     store.messages = [timestamped({ kind: "user_prompt", content: "original question" }),
       timestamped({ kind: "assistant_text", text: "original answer" })]
+    if (provider === "codex") await new CodexPromptHistory(store.dataDir).remember("chat-1", {
+      [store.messages[0]!._id]: { sessionToken: "native-old", turnId: "native-0", mergeTurn: false, boundaryEntryId: null },
+    })
     return store
   }
   const success = () => ({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) })
@@ -5264,6 +8008,79 @@ describe("owned provider context preparation integration", () => {
     } finally { resultBlocked.release(); for (const queue of queues) queue.close() }
   })
 
+
+
+  test("a late cancelled Codex startup cannot publish its prompt over an accepted successor", async () => {
+    const store = await contextStore("codex")
+    store.getMessages = () => { throw new Error("native continuity must stay lazy") }
+    const entered = gate(), blocked = gate()
+    const prompts: string[] = []
+    const queues: AsyncEventQueue<any>[] = []
+    let starts = 0
+    const manager = {
+      stopSession() {},
+      async readPromptHistory() { return { inputs: [{ turnId: "native-0", promptId: store.messages[0]!._id, text: "original question", userIndex: 0 }] } },
+      async startSession() { if (++starts === 1) { entered.release(); await blocked.ready }; return { sessionToken: `native-${starts}`, resumeFellBack: false, startupOutcome: { kind: "resumed" } } },
+      async startTurn(args: any) { prompts.push(args.content); const stream = new AsyncEventQueue<any>(); queues.push(stream); return { provider: "codex", providerTurnId: "accepted-turn", stream, interrupt: async () => {}, close: () => stream.close() } },
+    }
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, codexManager: manager as never })
+    const send = (content: string) => coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content })
+    const original = send("cancelled request")
+    try {
+      await entered.ready
+      await coordinator.cancel("chat-1")
+      await send("successor request")
+      blocked.release(); await original
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]).toContain("successor request")
+      expect(prompts[0]).not.toContain("cancelled request")
+      expect(coordinator.activeTurns.has("chat-1")).toBe(true)
+      expect(store.messages.some(entry => entry.kind === "user_prompt" && entry.content === "cancelled request")).toBe(false)
+    } finally { blocked.release(); await original.catch(() => {}); for (const queue of queues) queue.close() }
+  })
+
+
+  test("a cancelled blocked restoration write drains without publishing its unaccepted prompt", async () => {
+    const store = await contextStore("codex")
+    const entered = gate(), blocked = gate()
+    const setIntent = store.setContextRestoration.bind(store)
+    let writes = 0
+    store.setContextRestoration = async (chatId, intent) => {
+      if (++writes === 1) { entered.release(); await blocked.ready }
+      await setIntent(chatId, intent)
+    }
+    const prompts: string[] = []
+    let starts = 0
+    const queues: AsyncEventQueue<any>[] = []
+    const manager = {
+      stopSession() {},
+      async readPromptHistory() { return { inputs: [{ turnId: "native-0", promptId: store.messages[0]!._id, text: "original question", userIndex: 0 }] } },
+      async startSession() { starts++; return { sessionToken: "native-new", resumeFellBack: false, startupOutcome: { kind: "fresh" } } },
+      async startTurn(args: any) { prompts.push(args.content); const stream = new AsyncEventQueue<any>(); queues.push(stream); return { provider: "codex", providerTurnId: "accepted-turn", stream, interrupt: async () => {}, close: () => stream.close() } },
+    }
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, codexManager: manager as never })
+    // Force an explicit destination obligation before any native startup.
+    store.chat.provider = "grok"
+    const send = (content: string) => coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content })
+    const original = send("cancelled request")
+    let successor: Promise<unknown> | undefined
+    try {
+      await entered.ready
+      expect(coordinator.activeTurns.has("chat-1")).toBe(true)
+      await coordinator.cancel("chat-1")
+      successor = send("successor request").catch(error => error)
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(starts).toBe(0)
+      blocked.release()
+      await original
+      expect(await successor).toEqual({ chatId: "chat-1" })
+      expect(starts).toBe(1)
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]).toContain("successor request")
+      expect(prompts[0]).not.toContain("cancelled request")
+      expect(store.messages.some(entry => entry.kind === "user_prompt" && entry.content === "cancelled request")).toBe(false)
+    } finally { blocked.release(); await original.catch(() => {}); await successor?.catch(() => {}); for (const queue of queues) queue.close() }
+  })
 })
 
 
@@ -5286,8 +8103,9 @@ describe("owned provider context preparation integration", () => {
   const starts: Array<string | null> = []
   const manager = {
     stopSession() {},
+    async readPromptHistory() { return { inputs: store.getPromptHistoryEntries("chat-1").filter(e => e.kind === "user_prompt").map((e, i) => ({ turnId: `native-${i}`, promptId: e._id, text: (e as { content: string }).content, userIndex: 0 })) } },
     async startSession(args: any) { starts.push(args.sessionToken); return { sessionToken: "new", resumeFellBack: false, startupOutcome: { kind: "resumed" } } },
-    async startTurn(args: any) { prompt = args; const stream = new AsyncEventQueue<any>(); queues.push(stream); stream.push({ type: "session_token", sessionToken: "new" }); return { provider: "codex", stream, interrupt: async () => {}, close: () => stream.close() } },
+    async startTurn(args: any) { prompt = args; const stream = new AsyncEventQueue<any>(); queues.push(stream); return { provider: "codex", providerTurnId: "accepted-turn", stream, interrupt: async () => {}, close: () => stream.close() } },
   }
   const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, codexManager: manager as never })
   let responding: ReturnType<typeof coordinator.respondTool> | undefined
@@ -5306,7 +8124,6 @@ describe("owned provider context preparation integration", () => {
     expect(starts).toHaveLength(2)
     expect(starts[1]).toBeNull()
     expect(store.chat.contextRestoration?.reason).toBe("explicit_reset")
-    await waitFor(() => store.chat.sessionToken === "new")
     expect(store.chat.sessionToken).toBe("new")
     expect(coordinator.activeTurns.get("chat-1")?.postToolFollowUp).toBeNull()
   } finally { release(); await responding?.catch(() => {}); await successor?.catch(() => {}); for (const queue of queues) queue.close() }
@@ -5326,6 +8143,7 @@ describe("owned provider context preparation integration", () => {
   const content: string[] = []
   const manager = {
     stopSession() {},
+    async readPromptHistory() { return { inputs: store.getPromptHistoryEntries("chat-1").filter(e => e.kind === "user_prompt").map((e, i) => ({ turnId: `native-${i}`, promptId: e._id, text: (e as { content: string }).content, userIndex: 0 })) } },
     async startSession() { return { sessionToken: "new", resumeFellBack: false, startupOutcome: { kind: "fresh" } } },
     async startTurn(args: any) { prompt = args; content.push(args.content); const stream = new AsyncEventQueue<any>(); queues.push(stream); return { provider: "codex", providerTurnId: "accepted-turn", stream, interrupt: async () => {}, close: () => stream.close() } },
   }
@@ -5343,6 +8161,57 @@ describe("owned provider context preparation integration", () => {
     expect(content[1]).not.toContain("/tmp/transcripts/")
   } finally { for (const queue of queues) queue.close() }
 })
+
+
+  
+
+
+describe("main integration review of early preparation ownership", () => {
+  test.each(["question", "execution"])("main review: an old Claude tool %s waiting for startup cannot cross native replacement", async kind => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.title = "Existing conversation"
+    let entered!: () => void, release!: () => void
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const preparing = new Promise<void>(resolve => { entered = resolve })
+    const nativeArgs: any[] = []
+    const queues: AsyncEventQueue<any>[] = []
+    let attached = 0, executed = 0
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      startClaudeSession: async args => {
+        const stream = new AsyncEventQueue<any>(); queues.push(stream); nativeArgs.push(args)
+        return { provider: "claude", stream, interrupt: async () => {}, close: () => stream.close(),
+          sendPrompt: async () => { if (nativeArgs.length === 1) stream.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) }) },
+          setModel: async () => {}, setPermissionMode: async () => {}, setFastMode: async () => {} }
+      } }) as any
+    coordinator.refreshClaudeModelCatalog = async () => {}
+    coordinator.requestToolInput = async () => { attached++; return {} }
+    let successor: Promise<unknown> | undefined, oldCallback: Promise<any> | undefined
+    try {
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "first" })
+      await waitFor(() => !coordinator.activeTurns.has("chat-1"))
+      const oldSession = coordinator.claudeSessions.get("chat-1")
+      const setPlanMode = store.setPlanMode.bind(store)
+      store.setPlanMode = async (chatId, mode) => { entered(); await blocked; await setPlanMode(chatId, mode) }
+      successor = coordinator.startTurnForChat({ chatId: "chat-1", provider: "claude", content: "second",
+        attachments: [], model: "model", planMode: false, autoPlan: false, appendUserPrompt: true, resetSession: true })
+      await preparing
+      const owner = coordinator.activeTurns.get("chat-1")
+      owner.customTools = { abort() {}, async execute() { executed++; return { content: [{ type: "text", text: "wrong session" }] } } }
+      oldCallback = (kind === "question" ? nativeArgs[0].onToolRequest({})
+        : nativeArgs[0].customTools.execute("old_tool", {}, new AbortController().signal)).catch((error: unknown) => error)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      release()
+      await successor
+      expect(nativeArgs).toHaveLength(2)
+      expect(coordinator.claudeSessions.get("chat-1")).not.toBe(oldSession)
+      const result = await oldCallback
+      if (kind === "question") expect(result).toBeInstanceOf(Error)
+      else expect(result.isError).toBe(true)
+      expect(attached).toBe(0)
+      expect(executed).toBe(0)
+    } finally { release(); for (const queue of queues) queue.close(); await successor; await oldCallback; coordinator.dispose() }
+  })
 
 
   for (const provider of ["codex", "pi", "cursor", "grok"] as const) {
@@ -5451,96 +8320,107 @@ describe("owned provider context preparation integration", () => {
   })
 
 
-  test("a cancelled restoration write drains before a successor prepares context", async () => {
-  const store = createFakeStore()
-  store.chat.provider = "grok"
-  store.chat.title = "Existing conversation"
-  store.chat.sessionToken = "old-native"
-  store.messages = [timestamped({ kind: "user_prompt", content: "original question" }),
-    timestamped({ kind: "assistant_text", text: "original answer" })]
-  let entered!: () => void, release!: () => void
-  const blocked = new Promise<void>(resolve => { release = resolve })
-  const observed = new Promise<void>(resolve => { entered = resolve })
-  const setIntent = store.setContextRestoration.bind(store)
-  let writes = 0, starts = 0
-  store.setContextRestoration = async (chatId, intent) => {
-    if (++writes === 1) { entered(); await blocked }
-    await setIntent(chatId, intent)
-  }
-  const sent: string[] = []
-  const streams: AsyncEventQueue<any>[] = []
-  const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, codexManager: {
-    stopSession() {}, stopAll() {},
-    async startSession() { starts++; return { sessionToken: "fresh-native", resumeFellBack: false, startupOutcome: { kind: "fresh" } } },
-    async startTurn(args: any) { sent.push(args.content); const stream = new AsyncEventQueue<any>(); streams.push(stream); return { provider: "codex", stream, interrupt: async () => {}, close: () => stream.close() } },
-  } as never })
-  const send = (content: string) => coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content })
-  const original = send("cancelled request")
-  let successor: Promise<unknown> | undefined
-  try {
-    await observed
-    await coordinator.cancel("chat-1")
-    successor = send("successor request")
-    await new Promise(resolve => setTimeout(resolve, 10))
-    expect(starts).toBe(0)
-    release()
-    await original
-    await successor
-    expect(starts).toBe(1)
-    expect(sent).toHaveLength(1)
-    expect(sent[0]).toContain("original answer")
-    expect(sent[0]).toContain("successor request")
-    expect(sent[0]).not.toContain("cancelled request")
-    expect(coordinator.activeTurns.get("chat-1")?.provider).toBe("codex")
-  } finally { release(); await original.catch(() => {}); await successor?.catch(() => {}); for (const stream of streams) stream.close(); coordinator.dispose() }
-})
+  test.each(["selected prefix", "last completed turn"])("main review: %s fork restores history before a later uncommitted reset", async kind => {
+    const { EventStore } = await import("./event-store")
+    const dataDir = mkdtempSync(path.join(tmpdir(), "kanna-reset-prefix-fork-"))
+    const store = new EventStore(dataDir)
+    const stream = new AsyncEventQueue<any>()
+    let coordinator: AgentCoordinator | undefined
+    let forkId: string | undefined
+    try {
+      await store.initialize()
+      const project = await store.openProject(dataDir, "Project")
+      const source = await store.createChat(project.id)
+      await store.renameChat(source.id, "Existing conversation")
+      await store.setChatProvider(source.id, "codex")
+      await store.setSessionToken(source.id, "source-native")
+      const prefix = [timestamped({ kind: "user_prompt", content: "allowed earlier question" }),
+        timestamped({ kind: "assistant_text", text: "allowed earlier answer" }),
+        timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" })]
+      await store.replaceTranscript(source.id, [...prefix, timestamped({ kind: "user_prompt", content: "forbidden later tail" })])
+      await store.setContextRestoration(source.id, { id: "uncommitted-reset", provider: "codex", fromProvider: "codex",
+        reason: "explicit_reset", startInclusive: 4, endExclusive: 4 })
+      const fullFork = await store.forkChat(source.id)
+      expect(fullFork.contextRestoration?.startInclusive).toBe(4)
+      const fork = await store.forkChat(source.id, kind === "selected prefix" ? { transcriptEntries: prefix } : { atLastCompletedTurn: true })
+      forkId = fork.id
+      const sent: string[] = []
+      coordinator = new AgentCoordinator({ store, onStateChange: () => {}, codexManager: {
+        stopSession() {}, stopAll() {},
+        async readPromptHistory() { return { inputs: [{ turnId: "source-turn", promptId: prefix[0]!._id, text: "allowed earlier question", userIndex: 0 }] } },
+        async startSession() { return { sessionToken: "fresh-destination", resumeFellBack: false, startupOutcome: { kind: "fresh" } } },
+        async startTurn(args: any) { sent.push(args.content); return { provider: "codex", providerTurnId: "accepted-turn", stream, interrupt: async () => {}, close: () => stream.close() } },
+      } as never })
+      await coordinator.send({ type: "chat.send", chatId: fork.id, provider: "codex", content: "continue the fork" })
+      expect(sent).toHaveLength(1)
+      expect(sent[0]).toContain("allowed earlier question")
+      expect(sent[0]).toContain("allowed earlier answer")
+      expect(sent[0]).toContain("continue the fork")
+      expect(sent[0]).not.toContain("forbidden later tail")
+      expect(sent[0]).not.toContain(store.getTranscriptPath(source.id))
+      expect(source.contextRestoration?.startInclusive).toBe(4)
+      expect(store.getMessages(source.id)).toHaveLength(4)
+    } finally {
+      if (coordinator && forkId) await coordinator.cancel(forkId)
+      stream.close(); coordinator?.dispose(); rmSync(dataDir, { recursive: true, force: true })
+    }
+  })
 
 
-describe("main integration review of early preparation ownership", () => {
-  test.each(["question", "execution"])("main review: an old Claude tool %s waiting for startup cannot cross native replacement", async kind => {
+  test.each(["system_init", "stream error"])("main review: old Claude %s cannot alter a pending provider switch", async kind => {
     const store = createFakeStore()
     store.chat.provider = "claude"
     store.chat.title = "Existing conversation"
+    const events = new AsyncEventQueue<any>()
     let entered!: () => void, release!: () => void
     const blocked = new Promise<void>(resolve => { release = resolve })
-    const preparing = new Promise<void>(resolve => { entered = resolve })
-    const nativeArgs: any[] = []
-    const queues: AsyncEventQueue<any>[] = []
-    let attached = 0, executed = 0
+    const intentEntered = new Promise<void>(resolve => { entered = resolve })
+    let failures = 0
+    store.recordTurnFailed = async () => { failures++ }
     const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
-      startClaudeSession: async args => {
-        const stream = new AsyncEventQueue<any>(); queues.push(stream); nativeArgs.push(args)
-        return { provider: "claude", stream, interrupt: async () => {}, close: () => stream.close(),
-          sendPrompt: async () => { if (nativeArgs.length === 1) stream.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) }) },
-          setModel: async () => {}, setPermissionMode: async () => {}, setFastMode: async () => {} }
-      } }) as any
+      codexManager: { startSession: async () => { throw new Error("end controlled startup") }, stopSession() {}, stopAll() {} } as never,
+      startClaudeSession: async () => ({ provider: "claude",
+        stream: { async *[Symbol.asyncIterator]() { for await (const event of events) { if (event === "fail") throw new Error("old Claude failure"); yield event } } },
+        interrupt: async () => {}, close: () => events.close(),
+        sendPrompt: async () => { events.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) }) },
+        setModel: async () => {}, setPermissionMode: async () => {}, setFastMode: async () => {} }) }) as any
     coordinator.refreshClaudeModelCatalog = async () => {}
-    coordinator.requestToolInput = async () => { attached++; return {} }
-    let successor: Promise<unknown> | undefined, oldCallback: Promise<any> | undefined
+    let successor: Promise<unknown> | undefined
     try {
       await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "first" })
       await waitFor(() => !coordinator.activeTurns.has("chat-1"))
-      const oldSession = coordinator.claudeSessions.get("chat-1")
-      const setPlanMode = store.setPlanMode.bind(store)
-      store.setPlanMode = async (chatId, mode) => { entered(); await blocked; await setPlanMode(chatId, mode) }
-      successor = coordinator.startTurnForChat({ chatId: "chat-1", provider: "claude", content: "second",
-        attachments: [], model: "model", planMode: false, autoPlan: false, appendUserPrompt: true, resetSession: true })
-      await preparing
+      const setIntent = store.setContextRestoration.bind(store)
+      store.setContextRestoration = async (chatId, intent) => { entered(); await blocked; await setIntent(chatId, intent) }
+      successor = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "second" }).catch((error: unknown) => error)
+      await intentEntered
       const owner = coordinator.activeTurns.get("chat-1")
-      owner.customTools = { abort() {}, async execute() { executed++; return { content: [{ type: "text", text: "wrong session" }] } } }
-      oldCallback = (kind === "question" ? nativeArgs[0].onToolRequest({})
-        : nativeArgs[0].customTools.execute("old_tool", {}, new AbortController().signal)).catch((error: unknown) => error)
-      await new Promise(resolve => setTimeout(resolve, 0))
-      release()
-      await successor
-      expect(nativeArgs).toHaveLength(2)
-      expect(coordinator.claudeSessions.get("chat-1")).not.toBe(oldSession)
-      const result = await oldCallback
-      if (kind === "question") expect(result).toBeInstanceOf(Error)
-      else expect(result.isError).toBe(true)
-      expect(attached).toBe(0)
-      expect(executed).toBe(0)
-    } finally { release(); for (const queue of queues) queue.close(); await successor; await oldCallback; coordinator.dispose() }
+      expect(owner?.provider).toBe("codex")
+      expect(owner?.status).toBe("starting")
+      if (kind === "stream error") events.push("fail")
+      else events.push({ type: "transcript", entry: timestamped({ kind: "system_init", model: "old-model" }) })
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(failures).toBe(0)
+      expect(owner.status).toBe("starting")
+      expect(coordinator.activeTurns.get("chat-1")).toBe(owner)
+    } finally { release(); events.close(); await successor; coordinator.dispose() }
+  })
+
+
+  test.each(["headers", "deferred prefix"])("main review: failed %s loading releases the provisional owner", async kind => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.title = "Existing conversation"
+    store.chat.sessionToken = "preserved-native"
+    if (kind === "headers") store.getContextBounds = () => { throw new Error("local history read failed") }
+    else store.getMessages = () => { throw new Error("local history read failed") }
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {} }) as any
+    try {
+      await expect(coordinator.startTurnForChat({ chatId: "chat-1", provider: "claude", content: "replacement",
+        attachments: [], model: "model", planMode: false, autoPlan: false, appendUserPrompt: true,
+        ...(kind === "deferred prefix" ? { replaceTranscriptPrefix: [] } : {}) })).rejects.toThrow("local history read failed")
+      expect(coordinator.activeTurns.has("chat-1")).toBe(false)
+      expect(store.chat.sessionToken).toBe("preserved-native")
+    } finally { coordinator.dispose() }
   })
 })
 
@@ -5586,3 +8466,74 @@ describe("ordinary user prompt delivery", () => {
     })
   }
 })
+
+
+  test("a missing prepared Claude edit restores only its admissible prefix", async () => {
+  const store = createFakeStore()
+  store.chat.provider = "claude"
+  store.chat.sessionToken = "original-source"
+  const prefix = [timestamped({ kind: "user_prompt", content: "allowed task" }), timestamped({ kind: "assistant_text", text: "allowed reply" })]
+  store.messages.push(...prefix, timestamped({ kind: "user_prompt", content: "discard task" }), timestamped({ kind: "assistant_text", text: "discard answer" }))
+  const stream = new AsyncEventQueue<any>()
+  const tokens: Array<string | null> = []
+  const sent: string[] = []
+  const checked: Array<string | null | undefined> = []
+  const outcomes: any[] = []
+  const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+    checkSessionArtifact: (_provider, args) => { checked.push(args.sessionToken); return args.sessionToken === "prepared-prefix" ? "missing" : "present" },
+    startClaudeSession: async args => {
+      tokens.push(args.sessionToken)
+      return { provider: "claude", stream, startupOutcome: { kind: args.sessionToken ? "resumed" : "fresh" }, interrupt: async () => {}, close: () => stream.close(), setModel: async () => {}, setPermissionMode: async () => {}, sendPrompt: async content => { sent.push(content) } }
+    },
+  })
+  try {
+    await (coordinator as any).startTurnForChat({ chatId: "chat-1", provider: "claude", content: "replacement", attachments: [], model: "opus", planMode: false, autoPlan: false, appendUserPrompt: true,
+      sessionToken: "prepared-prefix", resetSession: true, forkSession: false, replaceTranscriptPrefix: prefix,
+      onProviderReady: async (_isCurrentTurn: any, outcome: any) => { outcomes.push(outcome) },
+    })
+    expect(checked).toContain("prepared-prefix")
+    expect(tokens).toEqual([null])
+    expect(outcomes[0].kind).toBe("fresh")
+    expect(sent[0]).toContain("allowed reply")
+    expect(sent[0]).not.toContain("discard answer")
+    expect(sent[0]).not.toContain("/tmp/transcripts/chat-1.jsonl")
+  } finally { stream.close() }
+})
+
+
+  for (const stop of ["cancel", "close", "dispose"] as const) {
+  test(`${stop} while a Claude edit mapper is pending invalidates only its reservation and cannot adopt its prefix`, async () => {
+    let release!: () => void, entered!: () => void
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const observed = new Promise<void>(resolve => { entered = resolve })
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.title = "Existing conversation"
+    store.chat.sessionToken = "source-session"
+    const target = timestamped({ kind: "user_prompt", content: "second question" })
+    store.messages = [timestamped({ kind: "user_prompt", content: "first question" }),
+      timestamped({ kind: "assistant_text", text: "first answer", messageId: "native-answer" }), target]
+    const sent: string[] = [], tokens: Array<string | null> = []
+    const events = new AsyncEventQueue<any>()
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      prepareClaudeSession: async args => { entered(); await blocked; return { sessionToken: "obsolete-prepared", transcriptPrefix: args.transcriptPrefix } },
+      startClaudeSession: async args => { tokens.push(args.sessionToken); return { provider: "claude", stream: events, startupOutcome: { kind: "resumed" },
+        interrupt: async () => {}, close: () => events.close(), setModel: async () => {}, setPermissionMode: async () => {}, sendPrompt: async content => { sent.push(content) } } },
+    })
+    const edit = coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: target._id, content: "cancelled edit" })
+    try {
+      await observed
+      if (stop === "cancel") await coordinator.cancel("chat-1"); else if (stop === "close") await coordinator.closeChat("chat-1"); else coordinator.dispose()
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "successor input" })
+      release(); await edit
+      expect(tokens).toEqual(["source-session"])
+      expect(sent).toEqual(["successor input"])
+      expect(store.chat.sessionToken).toBe("source-session")
+      expect(store.messages.some(entry => entry.kind === "user_prompt" && entry.content === "second question")).toBe(true)
+      expect(store.messages.some(entry => entry.kind === "user_prompt" && entry.content === "cancelled edit")).toBe(false)
+      expect((coordinator as any).preparedClaudeEditSessions.size).toBe(0)
+    } finally { release(); await edit.catch(() => {}); events.close() }
+  })
+}
+
+afterAll(() => {for(const dir of fakeStoreDirectories) rmSync(dir,{recursive:true,force:true})})
