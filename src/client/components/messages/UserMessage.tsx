@@ -1,4 +1,4 @@
-import { formatCodexQuestionReply } from "../../../shared/codex-questions"
+import { formatCodexQuestionReply, parseCodexQuestionReplies } from "../../../shared/codex-questions"
 import {
   useCallback,
   useEffect,
@@ -182,8 +182,9 @@ export function UserMessage({
     () => getUserMessageEditTextareaRows(parsedContent.body),
     [parsedContent.body],
   )
-  const canEdit = Boolean(messageId && onEdit && !renderOptions.readonly)
-  const canFork = Boolean(messageId && onFork && !renderOptions.readonly)
+  const isAsyncQuestionReply = parseCodexQuestionReplies(parsedContent.body).length > 0
+  const canEdit = Boolean(messageId && onEdit && !renderOptions.readonly && !isAsyncQuestionReply)
+  const canFork = Boolean(messageId && onFork && !renderOptions.readonly && !isAsyncQuestionReply)
   const canSaveEdit = draftContent.trim().length > 0 && !isSaving
   const shouldRenderContentBubble = Boolean(
     isEditing

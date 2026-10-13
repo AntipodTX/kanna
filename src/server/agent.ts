@@ -1845,9 +1845,7 @@ export class AgentCoordinator {
     const provider = this.resolveProvider(queuedMessage, chat.provider)
     if (provider === "codex")
       await this.assertCodexHistoryReady(chatId)
-    const alreadyPersisted = this.store.getMessages(chatId).some((entry) => (
-      entry.kind === "user_prompt" && entry._id === queuedMessage.id
-    ))
+    const alreadyPersisted = this.store.hasUserPrompt(chatId, queuedMessage.id)
     await this.store.removeQueuedMessage(chatId, queuedMessage.id)
     if (alreadyPersisted) {
       this.emitStateChange(chatId)
@@ -1988,30 +1986,7 @@ export class AgentCoordinator {
     }
   }
 
-  private async preparePromptInput(args: {
-    provider: AgentProvider
-    chatId: string
-    content: string
-    steered?: boolean
-    cwd: string
-    awaitOwned?: <T>(operation: () => Promise<T>) => Promise<T>
-  }) {
-    const awaitOwned = args.awaitOwned ?? (async <T>(operation: () => Promise<T>) => await operation())
-    const isQuestionReply = args.provider === "codex" && parseCodexQuestionReplies(args.content).length > 0
-    const skills = isQuestionReply ? [] : await awaitOwned(() => this.resolvePromptSkills(args.provider, args.chatId, args.content))
-    let wireContent = args.steered && !isQuestionReply ? buildSteeredMessageContent(args.content) : args.content
-    if (args.provider !== "codex" && skills.length > 0) {
-      wireContent = appendSystemMessageBlock(wireContent, buildSkillSystemMessage(skills))
-    }
-    const concurrentAgentsNotice = buildConcurrentAgentsNotice(
-      this.collectConcurrentProjectChats(args.chatId, args.cwd)
-    )
-    if (concurrentAgentsNotice && !isQuestionReply) {
-      wireContent = appendSystemMessageBlock(wireContent, concurrentAgentsNotice)
-    }
 
-    return { skills, wireContent }
-  }
 
   private async startTurnForChat(args: {
     chatId: string
@@ -2272,13 +2247,14 @@ export class AgentCoordinator {
       assertCurrent()
       if (shouldGenerateTitle) void this.generateTitleInBackground(args.chatId, args.content, project.localPath, optimisticTitle ?? "New Chat")
 
-      const skills = await awaitOwned(() => this.resolvePromptSkills(args.provider, args.chatId, args.content))
-      let wireContent = args.steered ? buildSteeredMessageContent(args.content) : args.content
+      const isQuestionReply = args.provider === "codex" && parseCodexQuestionReplies(args.content).length > 0
+      const skills = isQuestionReply ? [] : await awaitOwned(() => this.resolvePromptSkills(args.provider, args.chatId, args.content))
+      let wireContent = args.steered && !isQuestionReply ? buildSteeredMessageContent(args.content) : args.content
       if (args.provider !== "codex" && skills.length > 0) wireContent = appendSystemMessageBlock(wireContent, buildSkillSystemMessage(skills))
       const concurrentAgentsNotice = buildConcurrentAgentsNotice(this.collectConcurrentProjectChats(args.chatId, project.localPath))
-      if (concurrentAgentsNotice) wireContent = appendSystemMessageBlock(wireContent, concurrentAgentsNotice)
+      if (concurrentAgentsNotice && !isQuestionReply) wireContent = appendSystemMessageBlock(wireContent, concurrentAgentsNotice)
       let existingMessagesCache: ReturnType<typeof this.store.getMessages> | null = null
-      const prepareWireContent = async (outcome: HarnessStartupOutcome) => {
+    const prepareWireContent = async (outcome: HarnessStartupOutcome) => {
         assertCurrent()
         if (contentPrepared) return wireContent
         actualStartup.outcome = outcome
@@ -3277,10 +3253,10 @@ export class AgentCoordinator {
         attachments = plan.attachments
         sessionToken = await this.prepareCodexHistoryPlan(command.chatId, command.messageId, plan, project.localPath, settings)
         this.assertHistoryOperation(command.chatId)
-        pendingForkSessionToken = null
-        stopCodexSessionOnStartFailure = true
+        pendingForkSessionToken=null
+        stopCodexSessionOnStartFailure=true
         const prepared = sessionToken
-        onProviderReady = async (isCurrentTurn, outcome) => {
+        onProviderReady=async(isCurrentTurn,outcome)=> {
           if (!isCurrentTurn() || outcome.kind === "fresh") return
           this.assertHistoryOperation(command.chatId)
           if (!isCurrentTurn()) return
@@ -3288,10 +3264,9 @@ export class AgentCoordinator {
           this.assertHistoryOperation(command.chatId)
           if (!isCurrentTurn()) return
           const retained: Record<string, CodexPromptBinding> = {}
-          for (const entry of prefix) if (bindings[entry._id]) {
+          for(const entry of prefix) if(bindings[entry._id]) {
             const binding = bindings[entry._id]!
-            retained[entry._id] = { ...binding,
-              sessionToken: binding.sessionToken === plan.sessionToken ? prepared! : binding.sessionToken }
+            retained[entry._id]={...binding,sessionToken:binding.sessionToken===plan.sessionToken?prepared!:binding.sessionToken}
           }
           await this.codexPromptHistory.remember(command.chatId, retained)
           await this.retainCodexClassification(command.chatId, chat.codexHistoryIntegrity,
