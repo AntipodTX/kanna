@@ -6,6 +6,7 @@ import path from "node:path"
 import { getDataDir, LOG_PREFIX } from "../shared/branding"
 import { toMessagePreview } from "../shared/message-preview"
 import { buildTranscriptOutline, findTranscriptWindowStart, snapToRowStart } from "../shared/transcript-window"
+import { ClaudeExitPlanRecovery, isEmptyClaudeExitPlan } from "../shared/claude-plan-recovery"
 import type { TranscriptOutlineEntry } from "../shared/types"
 import type { AgentProvider, QueuedChatMessage, ResolvedChatReadAnchor, TranscriptEntry } from "../shared/types"
 import { STORE_VERSION } from "../shared/types"
@@ -2470,15 +2471,69 @@ export class EventStore {
   getClientTranscript(chatId: string, fromIndex = 0) {
     const entries = this.getTranscriptEntries(chatId)
     const start = Math.max(0, Math.min(fromIndex, entries.length))
+    const recoveredPlans = this.getRecoveredClaudePlans(chatId, entries, start)
+    const messages = cloneTranscriptEntriesForClient(
+      start === 0 ? entries : entries.slice(start),
+      (toolId) => this.getToolKind(chatId, toolId),
+    ).map((entry) => {
+      if (!isEmptyClaudeExitPlan(entry) || entry.kind !== "tool_call") return entry
+      const plan = recoveredPlans.get(entry.tool.toolId)
+      return plan === undefined ? entry : { ...entry, tool: { ...entry.tool, input: { ...entry.tool.input, plan } } } as TranscriptEntry
+    })
     return {
-      messages: cloneTranscriptEntriesForClient(
-        start === 0 ? entries : entries.slice(start),
-        (toolId) => this.getToolKind(chatId, toolId),
-      ),
+      messages,
       startIndex: start,
       readAnchor: this.getChatReadAnchor(chatId),
       outline: this.getTranscriptOutline(chatId, entries),
     }
+  }
+
+  /** Weak keys follow header eviction, reload, import and replacement. */
+  private readonly claudePlanCache = new WeakMap<TranscriptEntry[], { scannedLength: number; recovery: ClaudeExitPlanRecovery }>()
+  // Separate from the header budget: even the one active oversized transcript
+  // allowed by that cache cannot retain an oversized recovery state.
+  private static readonly CLAUDE_PLAN_CACHE_BYTES = 4 * 1024 * 1024
+
+  private getRecoveredClaudePlans(chatId: string, entries: TranscriptEntry[], fromIndex: number): Map<string, string> {
+    // After budget eviction a request would replay history. Ordinary streamed
+    // slices with no empty exit to project must not trigger that work.
+    let needsRecovery = false
+    for (let index = fromIndex; index < entries.length; index += 1) {
+      if (isEmptyClaudeExitPlan(entries[index]!)) {
+        needsRecovery = true
+        break
+      }
+    }
+    if (!needsRecovery) return new Map()
+    let cached = this.claudePlanCache.get(entries)
+    if (!cached) {
+      cached = { scannedLength: 0, recovery: new ClaudeExitPlanRecovery() }
+      this.claudePlanCache.set(entries, cached)
+    }
+    // Scan only new headers, and defer all reconstruction/payload reads until
+    // an empty exit needs them. Explicit plans and ordinary pushes stay cold.
+    let end = 0
+    for (let index = cached.scannedLength; index < entries.length; index += 1) {
+      if (isEmptyClaudeExitPlan(entries[index]!)) end = index + 1
+    }
+    cached.scannedLength = entries.length
+    if (end > 0) {
+      try {
+        cached.recovery.update(entries, end, (entry) => {
+          if (!entry.trimmed) return entry
+          const payload = this.getPayloadIndex(chatId).read(entry._id)
+          return mergeTranscriptPayload(entry, payload ?? undefined) as typeof entry
+        })
+      } finally {
+        if (cached.recovery.getEstimatedBytes() > EventStore.CLAUDE_PLAN_CACHE_BYTES) {
+          // Return historical plans for this wire request, but retain none of
+          // the oversized state. A later request replays from stored operations;
+          // retaining only a tail would lose old exits and known edit bases.
+          this.claudePlanCache.delete(entries)
+        }
+      }
+    }
+    return cached.recovery.recoveredPlans
   }
 
   /**

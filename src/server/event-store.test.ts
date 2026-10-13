@@ -1,3 +1,8 @@
+import { ExitPlanModeMessage } from "../client/components/messages/ExitPlanModeMessage"
+import { renderToStaticMarkup } from "react-dom/server"
+import { createElement } from "react"
+import { TranscriptPayloadIndex } from "./transcript-payloads"
+import { processTranscriptMessages } from "../client/lib/parseTranscript"
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
@@ -2020,5 +2025,320 @@ describe("chat pins", () => {
     expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
     await store.unarchiveChat(chat.id)
     expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
+  })
+})
+
+
+describe("stored Claude plan recovery", () => {
+  const planPath = "/missing-project/.claude/plans/review.md"
+  function call(id: string, toolKind: "write_file" | "edit_file" | "exit_plan_mode", input: Record<string, unknown>, rawInput?: Record<string, unknown>): TranscriptEntry {
+    return {
+      _id: id, createdAt: 1, kind: "tool_call",
+      tool: { kind: "tool", toolId: id, toolKind, toolName: toolKind, input, rawInput },
+    } as TranscriptEntry
+  }
+  function result(id: string, isError = false): TranscriptEntry {
+    return { _id: `${id}-result`, createdAt: 2, kind: "tool_result", toolId: id, isError, content: "done" }
+  }
+  function plan(entries: TranscriptEntry[], id: string) {
+    const found = entries.find((entry) => entry._id === id)
+    if (found?.kind !== "tool_call" || found.tool.toolKind !== "exit_plan_mode") throw new Error("missing exit")
+    return found.tool.input.plan
+  }
+  async function setup() {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(join(dataDir, "project"))
+    const chat = await store.createChat(project.id)
+    return { dataDir, store, chat }
+  }
+
+  test("recovers persisted skinny Write/Edit into the real client plan card across reload", async () => {
+    const { dataDir, store, chat } = await setup()
+    const sourceExit = call("exit", "exit_plan_mode", { plan: "" })
+    for (const entry of [
+      call("write", "write_file", { filePath: planPath, content: "## Plan\n\n- First step\n- First step" }), result("write"),
+      call("edit", "edit_file", { filePath: planPath, oldString: "First", newString: "Updated" }, { replace_all: true }), result("edit"),
+      sourceExit,
+    ]) await store.appendMessage(chat.id, entry)
+    const expected = "## Plan\n\n- Updated step\n- Updated step"
+    const diskBefore = await readFile(store.getTranscriptPath(chat.id), "utf8")
+    const sidecarBefore = await readFile(join(dataDir, "transcripts", `${chat.id}.payloads.jsonl`), "utf8")
+    expect(diskBefore).not.toContain("First step")
+    expect(sidecarBefore).toContain("First step")
+
+    const assertSnapshot = (snapshot: ReturnType<EventStore["getClientTranscript"]>) => {
+      expect(plan(snapshot.messages, "exit")).toBe(expected)
+      for (const entry of snapshot.messages) {
+        if (entry.kind !== "tool_call" || entry.tool.toolKind === "exit_plan_mode") continue
+        expect(entry.trimmed).toBe(true)
+        expect(entry.tool.input).toEqual({ filePath: planPath })
+        expect(entry.tool.rawInput).toBeUndefined()
+      }
+      const rendered = processTranscriptMessages(snapshot.messages).find((message) => message.kind === "tool" && message.toolId === "exit")
+      if (rendered?.kind !== "tool" || rendered.toolKind !== "exit_plan_mode") throw new Error("missing plan message")
+      expect(rendered.input.plan).toBe(expected)
+      const html = renderToStaticMarkup(createElement(ExitPlanModeMessage, { message: rendered, onConfirm: () => {}, isLatest: true }))
+      expect(html).toContain("Updated step")
+      expect(html).not.toContain("No plan provided")
+    }
+    assertSnapshot(store.getClientTranscript(chat.id))
+    assertSnapshot(store.getClientTranscript(chat.id, 4))
+    expect(plan(store.getEntriesById(chat.id, ["exit"]), "exit")).toBe("")
+    expect(sourceExit.kind === "tool_call" && sourceExit.tool.input).toEqual({ plan: "" })
+    expect(await readFile(store.getTranscriptPath(chat.id), "utf8")).toBe(diskBefore)
+    expect(await readFile(join(dataDir, "transcripts", `${chat.id}.payloads.jsonl`), "utf8")).toBe(sidecarBefore)
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    await reloaded.prepareTranscript(chat.id)
+    assertSnapshot(reloaded.getClientTranscript(chat.id, 4))
+  })
+
+  test("replacing a warmed transcript through the slim import boundary discards old recovery", async () => {
+    const { dataDir, store, chat } = await setup()
+    for (const entry of [call("write", "write_file", { filePath: planPath, content: "Old plan" }), result("write"), call("exit", "exit_plan_mode", {})]) {
+      await store.appendMessage(chat.id, entry)
+    }
+    expect(plan(store.getClientTranscript(chat.id).messages, "exit")).toBe("Old plan")
+    // Imported full entries are replaced on disk and normalized by the real
+    // sweep, which invalidates loaded headers and sidecar offsets.
+    const imported = [call("write", "write_file", { filePath: planPath, content: "Imported plan" }), result("write"), call("exit", "exit_plan_mode", {})]
+    await writeFile(store.getTranscriptPath(chat.id), imported.map((entry) => JSON.stringify(entry)).join("\n") + "\n")
+    expect((await store.slimTranscripts({ force: true })).rewritten).toBe(1)
+    expect(plan(store.getClientTranscript(chat.id, 2).messages, "exit")).toBe("Imported plan")
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    expect(plan(reloaded.getClientTranscript(chat.id).messages, "exit")).toBe("Imported plan")
+    await writeFile(store.getTranscriptPath(chat.id), JSON.stringify(call("exit", "exit_plan_mode", {})) + "\n")
+    // A header-only replacement is picked up by a fresh loaded lifecycle.
+    const replaced = new EventStore(dataDir)
+    await replaced.initialize()
+    expect(plan(replaced.getClientTranscript(chat.id).messages, "exit")).toBeUndefined()
+  })
+
+  test("hydrates only successful plan calls once as empty exits stream beyond retained slices", async () => {
+    const { store, chat } = await setup()
+    const read = spyOn(TranscriptPayloadIndex.prototype, "read")
+    const fullRead = spyOn(store, "getMessages")
+    try {
+      for (const entry of [
+        call("ordinary", "write_file", { filePath: "/project/a.md", content: "large unrelated body" }), result("ordinary"),
+        call("write", "write_file", { filePath: planPath, content: "First First" }), result("write"),
+        call("failed-write", "write_file", { filePath: planPath, content: "Wrong" }), result("failed-write", true),
+      ]) {
+        await store.appendMessage(chat.id, entry)
+        store.getClientTranscript(chat.id)
+      }
+      expect(read).not.toHaveBeenCalled()
+      await store.appendMessage(chat.id, call("exit", "exit_plan_mode", {}))
+      const first = store.getClientTranscript(chat.id, 6)
+      expect(plan(first.messages, "exit")).toBe("First First")
+      for (let i = 0; i < 5; i++) store.getClientTranscript(chat.id, i)
+      expect(read.mock.calls.map(([id]) => id)).toEqual(["write"])
+      const tailStart = store.getTranscriptLength(chat.id)
+      for (const entry of [
+        call("failed-edit", "edit_file", { filePath: planPath, oldString: "First", newString: "Wrong" }), result("failed-edit", true),
+        call("edit", "edit_file", { filePath: planPath, oldString: "First", newString: "Second" }), result("edit"),
+        call("exit-edit", "exit_plan_mode", {}),
+      ]) {
+        await store.appendMessage(chat.id, entry)
+        store.getClientTranscript(chat.id, tailStart)
+      }
+      const next = store.getClientTranscript(chat.id, tailStart)
+      expect(plan(next.messages, "exit-edit")).toBe("Second First")
+      expect(plan(first.messages, "exit")).toBe("First First")
+      expect(plan(store.getClientTranscript(chat.id).messages, "exit")).toBe("First First")
+      expect(read.mock.calls.map(([id]) => id)).toEqual(["write", "edit"])
+      expect(fullRead).not.toHaveBeenCalled()
+    } finally {
+      read.mockRestore()
+      fullRead.mockRestore()
+    }
+  })
+
+  test("preserves explicit plans and consumes latest boundaries across multiple files and exits", async () => {
+    const { store, chat } = await setup()
+    const otherPath = "/missing-project/.claude/plans/other.md"
+    for (const entry of [
+      call("write", "write_file", { filePath: planPath, content: "Older older" }), result("write"),
+      call("other", "write_file", { filePath: otherPath, content: "Latest" }), result("other"),
+      call("unknown-edit", "edit_file", { filePath: "/missing-project/.claude/plans/unknown.md", oldString: "x", newString: "Invented" }), result("unknown-edit"),
+      call("mismatch", "edit_file", { filePath: planPath, oldString: "missing", newString: "Invented" }), result("mismatch"),
+      call("exit-latest", "exit_plan_mode", {}), call("exit-unrelated", "exit_plan_mode", {}),
+      call("edit-older", "edit_file", { filePath: planPath, oldString: "older", newString: "updated" }), result("edit-older"),
+      call("exit-explicit", "exit_plan_mode", { plan: "Explicit", allowedPrompts: [] }),
+      call("exit-after-explicit", "exit_plan_mode", {}),
+      call("edit-again", "edit_file", { filePath: planPath, oldString: "Older", newString: "Revised" }), result("edit-again"),
+      call("exit-revised", "exit_plan_mode", {}),
+    ]) await store.appendMessage(chat.id, entry)
+    const wire = store.getClientTranscript(chat.id).messages
+    expect(plan(wire, "exit-latest")).toBe("Latest")
+    expect(plan(wire, "exit-unrelated")).toBeUndefined()
+    expect(plan(wire, "exit-explicit")).toBe("Explicit")
+    expect(wire.find((entry) => entry._id === "exit-explicit")).toMatchObject({ tool: { input: { plan: "Explicit", allowedPrompts: [] } } })
+    expect(plan(wire, "exit-after-explicit")).toBeUndefined()
+    expect(plan(wire, "exit-revised")).toBe("Revised updated")
+  })
+
+  test("leaves honest empty cards when only failed operations or missing/corrupt payloads exist", async () => {
+    for (const payloadState of ["failed", "missing", "corrupt"] as const) {
+      const { dataDir, store, chat } = await setup()
+      for (const entry of [call("write", "write_file", { filePath: planPath, content: "Unavailable" }), result("write", payloadState === "failed"), call("exit", "exit_plan_mode", {})]) {
+        await store.appendMessage(chat.id, entry)
+      }
+      const sidecar = join(dataDir, "transcripts", `${chat.id}.payloads.jsonl`)
+      if (payloadState === "missing") await rm(sidecar)
+      if (payloadState === "corrupt") await writeFile(sidecar, '{"_id":"write",garbled}\n')
+      const wire = store.getClientTranscript(chat.id).messages
+      expect(plan(wire, "exit")).toBeUndefined()
+      const rendered = processTranscriptMessages(wire).find((message) => message.kind === "tool" && message.toolId === "exit")
+      if (rendered?.kind !== "tool" || rendered.toolKind !== "exit_plan_mode") throw new Error("missing plan message")
+      expect(renderToStaticMarkup(createElement(ExitPlanModeMessage, { message: rendered, onConfirm: () => {}, isLatest: true }))).toContain("No plan provided")
+    }
+  })
+
+  test("an explicit-only plan snapshot never reads payloads", async () => {
+    const { store, chat } = await setup()
+    for (const entry of [call("write", "write_file", { filePath: planPath, content: "Stored" }), result("write"), call("exit", "exit_plan_mode", { plan: "Explicit" })]) {
+      await store.appendMessage(chat.id, entry)
+    }
+    const read = spyOn(TranscriptPayloadIndex.prototype, "read")
+    try {
+      expect(plan(store.getClientTranscript(chat.id).messages, "exit")).toBe("Explicit")
+      expect(read).not.toHaveBeenCalled()
+    } finally {
+      read.mockRestore()
+    }
+  })
+
+  test("a lost newer successful payload cannot expose stale plan text", async () => {
+    for (const toolKind of ["write_file", "edit_file"] as const) {
+      const { dataDir, store, chat } = await setup()
+      for (const entry of [call("write", "write_file", { filePath: planPath, content: "Old text" }), result("write"), call("exit-old", "exit_plan_mode", {})]) {
+        await store.appendMessage(chat.id, entry)
+      }
+      expect(plan(store.getClientTranscript(chat.id).messages, "exit-old")).toBe("Old text")
+      for (const entry of [
+        call("lost", toolKind, toolKind === "write_file"
+          ? { filePath: planPath, content: "New text" }
+          : { filePath: planPath, oldString: "Old", newString: "New" }),
+        result("lost"), call("exit-lost", "exit_plan_mode", {}),
+      ]) await store.appendMessage(chat.id, entry)
+      const sidecar = join(dataDir, "transcripts", `${chat.id}.payloads.jsonl`)
+      const lines = (await readFile(sidecar, "utf8")).split("\n").filter((line) => !line.startsWith('{"_id":"lost",'))
+      await writeFile(sidecar, lines.join("\n"))
+      const reloaded = new EventStore(dataDir)
+      await reloaded.initialize()
+      expect(plan(reloaded.getClientTranscript(chat.id).messages, "exit-lost")).toBeUndefined()
+      // Losing an edit base also prevents later edits inventing a plan.
+      for (const entry of [
+        call("later-edit", "edit_file", { filePath: planPath, oldString: "Old", newString: "Invented" }), result("later-edit"), call("exit-after-lost", "exit_plan_mode", {}),
+      ]) await reloaded.appendMessage(chat.id, entry)
+      expect(plan(reloaded.getClientTranscript(chat.id).messages, "exit-after-lost")).toBeUndefined()
+      for (const entry of [call("fresh", "write_file", { filePath: planPath, content: "Fresh text" }), result("fresh"), call("exit-fresh", "exit_plan_mode", {})]) {
+        await reloaded.appendMessage(chat.id, entry)
+      }
+      expect(plan(reloaded.getClientTranscript(chat.id).messages, "exit-fresh")).toBe("Fresh text")
+    }
+  })
+
+  test("evicts large revision histories and recomputes historical plans and edit bases", async () => {
+    const { store, chat } = await setup()
+    const paths = [planPath, "/missing-project/.claude/plans/other.md"]
+    const expected: string[] = []
+    const read = spyOn(TranscriptPayloadIndex.prototype, "read")
+    const fullRead = spyOn(store, "getMessages")
+    try {
+      for (let revision = 0; revision < 6; revision += 1) {
+        const content = `Revision ${revision}\n` + "x".repeat(1024 * 1024)
+        expected.push(content)
+        for (const entry of [
+          call(`large-write-${revision}`, "write_file", { filePath: paths[revision % 2], content }),
+          result(`large-write-${revision}`), call(`large-exit-${revision}`, "exit_plan_mode", {}),
+        ]) await store.appendMessage(chat.id, entry)
+        const wire = store.getClientTranscript(chat.id, revision * 3 + 2).messages
+        expect(plan(wire, `large-exit-${revision}`)).toBe(content)
+        expect(wire).toHaveLength(1)
+      }
+      // Six distinct 1 MiB versions exceed the 4 MiB recovery budget even
+      // though the transcript cache holds only skinny headers. Repeating a
+      // historical request must read stored payloads again after eviction.
+      const before = read.mock.calls.length
+      const history = store.getClientTranscript(chat.id, 2).messages
+      expect(read.mock.calls.slice(before).map(([id]) => id)).toEqual(expected.map((_, revision) => `large-write-${revision}`))
+      for (let revision = 0; revision < expected.length; revision += 1) {
+        expect(plan(history, `large-exit-${revision}`)).toBe(expected[revision])
+      }
+      const again = read.mock.calls.length
+      expect(plan(store.getClientTranscript(chat.id, 17).messages, "large-exit-5")).toBe(expected[5])
+      expect(read.mock.calls.length).toBeGreaterThan(again)
+
+      const tailStart = store.getTranscriptLength(chat.id)
+      for (const entry of [
+        call("late-edit", "edit_file", { filePath: paths[0], oldString: "Revision 4", newString: "Edited fourth" }), result("late-edit"),
+        call("late-exit", "exit_plan_mode", {}), call("unrelated-exit", "exit_plan_mode", {}),
+      ]) await store.appendMessage(chat.id, entry)
+      const tail = store.getClientTranscript(chat.id, tailStart).messages
+      expect(plan(tail, "late-exit")).toBe(expected[4]!.replace("Revision 4", "Edited fourth"))
+      expect(plan(tail, "unrelated-exit")).toBeUndefined()
+      const historicalAfterEdit = store.getClientTranscript(chat.id).messages
+      for (let revision = 0; revision < expected.length; revision += 1) {
+        expect(plan(historicalAfterEdit, `large-exit-${revision}`)).toBe(expected[revision])
+      }
+      expect(plan(store.getEntriesById(chat.id, ["large-exit-0"]), "large-exit-0")).toBeUndefined()
+      expect(fullRead).not.toHaveBeenCalled()
+    } finally {
+      read.mockRestore()
+      fullRead.mockRestore()
+    }
+  })
+
+  test("a single oversized plan is transient and ordinary tail pushes do not rehydrate it", async () => {
+    const { store, chat } = await setup()
+    const content = "Large plan\n" + "x".repeat(3 * 1024 * 1024)
+    for (const entry of [call("oversized-write", "write_file", { filePath: planPath, content }), result("oversized-write"), call("oversized-exit", "exit_plan_mode", {})]) {
+      await store.appendMessage(chat.id, entry)
+    }
+    const read = spyOn(TranscriptPayloadIndex.prototype, "read")
+    try {
+      expect(plan(store.getClientTranscript(chat.id).messages, "oversized-exit")).toBe(content)
+      expect(read.mock.calls.map(([id]) => id)).toEqual(["oversized-write"])
+      expect(plan(store.getClientTranscript(chat.id, 2).messages, "oversized-exit")).toBe(content)
+      expect(read.mock.calls.map(([id]) => id)).toEqual(["oversized-write", "oversized-write"])
+      await store.appendMessage(chat.id, entry("assistant_text", 3, { text: "continuing" }))
+      const before = read.mock.calls.length
+      expect(store.getClientTranscript(chat.id, 3).messages).toEqual([entry("assistant_text", 3, { text: "continuing" })])
+      expect(read.mock.calls.length).toBe(before)
+      const reloaded = new EventStore(store.dataDir)
+      await reloaded.initialize()
+      expect(plan(reloaded.getClientTranscript(chat.id, 2).messages, "oversized-exit")).toBe(content)
+    } finally {
+      read.mockRestore()
+    }
+  })
+
+  test("accounts for large pending mismatched edit payloads without inventing a plan", async () => {
+    const { store, chat } = await setup()
+    for (const entry of [
+      call("small-write", "write_file", { filePath: planPath, content: "Known plan" }), result("small-write"), call("known-exit", "exit_plan_mode", {}),
+      call("large-mismatch", "edit_file", { filePath: planPath, oldString: "missing", newString: "x".repeat(3 * 1024 * 1024) }), result("large-mismatch"),
+      call("mismatched-exit", "exit_plan_mode", {}),
+    ]) await store.appendMessage(chat.id, entry)
+    const read = spyOn(TranscriptPayloadIndex.prototype, "read")
+    try {
+      const first = store.getClientTranscript(chat.id).messages
+      expect(plan(first, "known-exit")).toBe("Known plan")
+      expect(plan(first, "mismatched-exit")).toBeUndefined()
+      expect(read.mock.calls.map(([id]) => id)).toEqual(["small-write", "large-mismatch"])
+      const before = read.mock.calls.length
+      const second = store.getClientTranscript(chat.id).messages
+      expect(plan(second, "known-exit")).toBe("Known plan")
+      expect(plan(second, "mismatched-exit")).toBeUndefined()
+      expect(read.mock.calls.slice(before).map(([id]) => id)).toEqual(["small-write", "large-mismatch"])
+    } finally {
+      read.mockRestore()
+    }
   })
 })
