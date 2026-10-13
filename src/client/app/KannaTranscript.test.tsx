@@ -1208,4 +1208,20 @@ Please check the latest error first.`,
     expect(html).toContain('aria-label="Still open?"')
     expect(html).not.toContain('aria-label="Already answered?"')
   })
+
+
+  test("native async replies exclude history actions while ordinary prompts keep them", () => {
+    const options = { onEditUserPrompt: () => undefined, onForkUserPrompt: () => undefined }
+    const timestamp = new Date().toISOString()
+    const reply = renderTranscript([{ id: "answer", kind: "user_prompt", timestamp,
+      content: '<send_user_message_question_reply>[{"questionItemId":"q","question":"Cleanup?","answer":"All"}]</send_user_message_question_reply>',
+    }], options)
+    expect(reply).toContain("Cleanup?")
+    expect(reply).toContain("All")
+    expect(reply).not.toContain("Edit message")
+    expect(reply).not.toContain("Fork message")
+    const ordinary = renderTranscript([{ id: "prompt", kind: "user_prompt", timestamp, content: "Continue" }], options)
+    expect(ordinary).toContain("Edit message")
+    expect(ordinary).toContain("Fork message")
+  })
 })

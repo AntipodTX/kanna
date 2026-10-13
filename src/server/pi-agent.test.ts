@@ -1,14 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { normalizeToolCall } from "../shared/tools"
-import {
-  buildRegistryModel,
-  preparePiNativeSession,
-  extractPiToolResultContent,
-  normalizePiUsage,
-  translatePiTool,
-  PI_TOOL_NAMES,
-  type PiConnection,
-} from "./pi-agent"
+import { buildRegistryModel, preparePiNativeSession, extractPiToolResultContent, normalizePiUsage, translatePiTool, PI_TOOL_NAMES, type PiConnection } from "./pi-agent"
 
 describe("translatePiTool", () => {
   test("maps read onto Read/read_file with offset and limit", () => {

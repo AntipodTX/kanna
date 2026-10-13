@@ -2181,30 +2181,7 @@ export class AgentCoordinator {
     }
   }
 
-  private async preparePromptInput(args: {
-    provider: AgentProvider
-    chatId: string
-    content: string
-    steered?: boolean
-    cwd: string
-    awaitOwned?: <T>(operation: () => Promise<T>) => Promise<T>
-  }) {
-    const awaitOwned = args.awaitOwned ?? (async <T>(operation: () => Promise<T>) => await operation())
-    const isQuestionReply = args.provider === "codex" && parseCodexQuestionReplies(args.content).length > 0
-    const skills = isQuestionReply ? [] : await awaitOwned(() => this.resolvePromptSkills(args.provider, args.chatId, args.content))
-    let wireContent = args.steered && !isQuestionReply ? buildSteeredMessageContent(args.content) : args.content
-    if (args.provider !== "codex" && skills.length > 0) {
-      wireContent = appendSystemMessageBlock(wireContent, buildSkillSystemMessage(skills))
-    }
-    const concurrentAgentsNotice = buildConcurrentAgentsNotice(
-      this.collectConcurrentProjectChats(args.chatId, args.cwd)
-    )
-    if (concurrentAgentsNotice && !isQuestionReply) {
-      wireContent = appendSystemMessageBlock(wireContent, concurrentAgentsNotice)
-    }
-
-    return { skills, wireContent }
-  }
+  
 
   private async startTurnForChat(args: {
     chatId: string
@@ -2472,11 +2449,18 @@ export class AgentCoordinator {
       assertCurrent()
       if (shouldGenerateTitle) void this.generateTitleInBackground(args.chatId, args.content, project.localPath, optimisticTitle ?? "New Chat", args.provider)
 
-      const skills = await awaitOwned(() => this.resolvePromptSkills(args.provider, args.chatId, args.content))
-      let wireContent = args.steered ? buildSteeredMessageContent(args.content) : args.content
+
+      const isQuestionReply = args.provider === "codex" && parseCodexQuestionReplies(args.content).length > 0
+
+
+      const skills = isQuestionReply ? [] : await awaitOwned(() => this.resolvePromptSkills(args.provider, args.chatId, args.content))
+      let wireContent = args.steered && !isQuestionReply ? buildSteeredMessageContent(args.content) : args.content
       if (args.provider !== "codex" && skills.length > 0) wireContent = appendSystemMessageBlock(wireContent, buildSkillSystemMessage(skills))
       const concurrentAgentsNotice = buildConcurrentAgentsNotice(this.collectConcurrentProjectChats(args.chatId, project.localPath))
       if (concurrentAgentsNotice) wireContent = appendSystemMessageBlock(wireContent, concurrentAgentsNotice)
+
+      if (concurrentAgentsNotice && !isQuestionReply) wireContent = appendSystemMessageBlock(wireContent, concurrentAgentsNotice)
+
       let existingMessagesCache: ReturnType<typeof this.store.getMessages> | null = null
       const prepareWireContent = async (outcome: HarnessStartupOutcome) => {
         assertCurrent()
@@ -4759,6 +4743,9 @@ export class AgentCoordinator {
       // Guard against concurrent cancel() calls — only the first one does work.
       if (active.cancelRequested) return
       active.cancelRequested = true
+
+      active.startupAbort?.abort()
+
 
       // Keep in-flight stream entries (emitted before the interrupt lands)
       // from re-registering an active turn via resumeBackgroundTurn, and mark
