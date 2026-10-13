@@ -1,3 +1,4 @@
+import { timestamped } from "./transcript"
 import { describe, expect, test } from "bun:test"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
@@ -2849,6 +2850,353 @@ describe("CodexAppServerManager", () => {
       .find((entry) => entry.kind === "result")
     expect(resultEntry?.subtype).toBe("error")
     expect(resultEntry?.result).toBe("usage limit reached: resets at 5pm")
+  })
+
+
+  test("preserves async question choices without blocking the running turn", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: {} })
+      if (message.method === "thread/start") child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1" } } })
+      if (message.method === "turn/start") {
+        child.writeServerMessage({ id: message.id, result: { turn: { id: "turn-1", status: "inProgress" } } })
+        child.writeServerMessage({ method: "turn/plan/updated", params: {
+          threadId: "thread-1", turnId: "turn-1", explanation: null,
+          plan: [{ step: "Finish work", status: "inProgress" }],
+        } })
+        child.writeServerMessage({ method: "item/completed", params: {
+          threadId: "thread-1", turnId: "turn-1",
+          item: { type: "agentMessage", id: "question-item", text: "Cleanup?\n- All\n- Empty only", delivery: "async", phase: "final_answer",
+            questions: [{ title: "Cleanup?", options: ["All", "Empty only"] }, { title: "Cleanup?" }] },
+        } })
+        child.writeServerMessage({ method: "item/completed", params: {
+          threadId: "thread-1", turnId: "turn-1", item: { type: "agentMessage", id: "next", text: "Still working" },
+        } })
+        child.writeServerMessage({ method: "turn/completed", params: {
+          threadId: "thread-1", turn: { id: "turn-1", status: "completed", error: null },
+        } })
+      }
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    let blockingRequests = 0
+    const turn = await manager.startTurn({ chatId: "chat-1", model: "gpt-5.4", content: "Work", planMode: false,
+      onToolRequest: async () => { blockingRequests++; return {} },
+    })
+    const events = await collectStream(turn.stream)
+    expect(blockingRequests).toBe(0)
+    const question = events.find(event => event.entry?.tool?.toolKind === "ask_user_question")
+    expect(question?.entry.tool.input).toEqual({
+      codexAsync: { threadId: "thread-1" },
+      questions: [
+        { id: '["request_user_input_async","question-item",0]', question: "Cleanup?", options: [{ label: "All" }, { label: "Empty only" }] },
+        { id: '["request_user_input_async","question-item",1]', question: "Cleanup?" },
+      ],
+    })
+    expect(events.filter(event => event.entry?.kind === "assistant_text").map(event => event.entry.text)).toEqual(["Still working"])
+    const plans = events.filter(event => event.entry?.tool?.toolKind === "todo_write")
+    expect(plans.map(event => event.entry.tool.input.todos.map((todo: { status: string }) => todo.status))).toEqual([["in_progress"]])
+    expect(events.some(event => event.entry?.kind === "result")).toBe(true)
+  })
+
+
+  test("accepts a steer before its echoed user message is persisted", async () => {
+    let allowSteeredEntryPersistence!: () => void
+    const steeredEntryPersistenceGate = new Promise<void>((resolve) => {
+      allowSteeredEntryPersistence = resolve
+    })
+    let sawSteeredEntry = false
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-1", status: "inProgress", error: null } },
+        })
+      } else if (message.method === "turn/steer") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turnId: "turn-1" },
+        })
+        child.writeServerMessage({
+          method: "item/started",
+          params: {
+            threadId: "thread-1",
+            turnId: "turn-1",
+            item: {
+              type: "userMessage",
+              id: "item-steer-1",
+              clientId: "queued-1",
+              content: [{ type: "text", text: "steered prompt", text_elements: [] }],
+            },
+          },
+        })
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: "turn-1", status: "completed", error: null },
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    const turn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "initial prompt",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    })
+    const steeredEntry = timestamped({
+      kind: "user_prompt",
+      content: "steered prompt",
+      attachments: [],
+      steered: true,
+    }) as Extract<ReturnType<typeof timestamped>, { kind: "user_prompt" }>
+    const eventsPromise = (async () => {
+      const events: any[] = []
+      for await (const event of turn.stream) {
+        events.push(event)
+        if (event.entry === steeredEntry) {
+          sawSteeredEntry = true
+          await steeredEntryPersistenceGate
+        }
+        event.onPersisted?.()
+      }
+      return events
+    })()
+
+    await expect(manager.steerTurn({
+      chatId: "chat-1",
+      expectedTurnId: "stale-turn",
+      content: "stale steer",
+      clientUserMessageId: "queued-stale",
+      transcriptEntry: timestamped({ kind: "user_prompt", content: "stale steer", steered: true }) as
+        Extract<ReturnType<typeof timestamped>, { kind: "user_prompt" }>,
+    })).rejects.toThrow("Codex turn changed before steering")
+    expect(process.messages.some((message: any) => message.method === "turn/steer")).toBe(false)
+
+    const steer = manager.startSteerTurn({
+      chatId: "chat-1",
+      expectedTurnId: "turn-1",
+      content: "steered prompt",
+      clientUserMessageId: "queued-1",
+      transcriptEntry: steeredEntry,
+    })
+    await steer.accepted
+    let steerSettled = false
+    const steerPromise = steer.settled.then(() => {
+      steerSettled = true
+    })
+    while (!sawSteeredEntry) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    const settledBeforePersistence = steerSettled
+    allowSteeredEntryPersistence()
+    await steerPromise
+    expect(settledBeforePersistence).toBe(false)
+
+    const events = await eventsPromise
+    const steerRequest = process.messages.find((message: any) => message.method === "turn/steer") as
+      | { id: string; method: "turn/steer"; params: Record<string, unknown> }
+      | undefined
+    expect(steerRequest).toBeDefined()
+    if (!steerRequest) throw new Error("missing steer request")
+    expect(steerRequest).toEqual({
+      id: steerRequest.id,
+      method: "turn/steer",
+      params: {
+        threadId: "thread-1",
+        input: [
+          { type: "text", text: "steered prompt", text_elements: [] },
+        ],
+        expectedTurnId: "turn-1",
+        clientUserMessageId: "queued-1",
+      },
+    })
+    expect(process.messages.filter((message: any) => message.method === "turn/start")).toHaveLength(1)
+    expect(process.messages.some((message: any) => message.method === "turn/interrupt")).toBe(false)
+    expect(events.filter((event) => event.type === "transcript").map((event) => event.entry)).toContainEqual(steeredEntry)
+    expect(events.filter((event) => event.type === "transcript" && event.entry.kind === "result")).toHaveLength(1)
+  })
+
+
+  test("keeps selected skill intent on the steer wire when its path no longer matches discovery", async () => {
+    const selectedSkills = [{
+      name: "deploy-helper",
+      path: "/tmp/old-project/.agents/skills/deploy-helper/SKILL.md",
+    }]
+    const discoveredSkillPath = "/tmp/project/.agents/skills/deploy-helper/SKILL.md"
+    let resolvedSkillCount = 0
+    let modelVisibleText = ""
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-1", status: "inProgress", error: null } },
+        })
+      } else if (message.method === "turn/steer") {
+        // Codex silently skips structured skills whose paths no longer match
+        // discovery. The remaining text must still carry the selected intent.
+        resolvedSkillCount = message.params.input.filter((item: any) =>
+          item.type === "skill" && item.path === discoveredSkillPath
+        ).length
+        modelVisibleText = message.params.input
+          .filter((item: any) => item.type === "text")
+          .map((item: any) => item.text)
+          .join("\n")
+        child.writeServerMessage({ id: message.id, result: { turnId: "turn-1" } })
+        const echoedItem = {
+          type: "userMessage",
+          id: "item-steer-skill",
+          clientId: message.params.clientUserMessageId,
+          content: [{ type: "text", text: modelVisibleText, text_elements: [] }],
+        }
+        for (const method of ["item/started", "item/completed"]) {
+          child.writeServerMessage({
+            method,
+            params: { threadId: "thread-1", turnId: "turn-1", item: echoedItem },
+          })
+        }
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: "turn-1", status: "completed", error: null },
+          },
+        })
+      }
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    const turn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "initial prompt",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    })
+    const content = "  Use /deploy-helper for the next step  "
+    const steeredEntry = timestamped({ kind: "user_prompt", content, steered: true }) as
+      Extract<ReturnType<typeof timestamped>, { kind: "user_prompt" }>
+    const eventsPromise = (async () => {
+      const events: any[] = []
+      for await (const event of turn.stream) {
+        events.push(event)
+        event.onPersisted?.()
+      }
+      return events
+    })()
+
+    const steer = manager.startSteerTurn({
+      chatId: "chat-1",
+      expectedTurnId: "turn-1",
+      content,
+      selectedSkills,
+      clientUserMessageId: "queued-skill",
+      transcriptEntry: steeredEntry,
+    })
+    await steer.accepted
+    await steer.settled
+    const events = await eventsPromise
+    const steerRequest = process.messages.find((message: any) => message.method === "turn/steer") as any
+    expect(steerRequest.params.input.filter((item: any) => item.type === "skill")).toEqual([
+      { type: "skill", ...selectedSkills[0] },
+    ])
+    expect(resolvedSkillCount).toBe(0)
+    expect(modelVisibleText).toBe(
+      `${content.trim()}\n\n<system-message>the user would like to use the skill available at ${selectedSkills[0]!.path}</system-message>`
+    )
+    const userEvents = events.filter((event) => event.type === "transcript" && event.entry.kind === "user_prompt")
+    expect(userEvents).toHaveLength(1)
+    expect(userEvents[0].entry).toBe(steeredEntry)
+    expect(userEvents[0].entry.content).toBe(content)
+    expect(process.messages.filter((message: any) => message.method === "turn/start")).toHaveLength(1)
+    expect(process.messages.some((message: any) => message.method === "turn/interrupt")).toBe(false)
+  })
+
+
+  test("rejects steering when the active turn completes without echoing the queued message", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-1", status: "inProgress", error: null } },
+        })
+      } else if (message.method === "turn/steer") {
+        child.writeServerMessage({ id: message.id, result: { turnId: "turn-1" } })
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: "turn-1", status: "completed", error: null },
+          },
+        })
+      }
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+    const turn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "initial prompt",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    })
+    const eventsPromise = collectStream(turn.stream)
+
+    await expect(manager.steerTurn({
+      chatId: "chat-1",
+      expectedTurnId: "turn-1",
+      content: "late follow up",
+      clientUserMessageId: "queued-late",
+      transcriptEntry: timestamped({
+        kind: "user_prompt",
+        content: "late follow up",
+        steered: true,
+      }) as Extract<ReturnType<typeof timestamped>, { kind: "user_prompt" }>,
+    })).rejects.toThrow("Codex turn ended before steering was acknowledged")
+
+    const events = await eventsPromise
+    expect(events.some((event) => event.entry?.kind === "user_prompt")).toBe(false)
+    expect(events.filter((event) => event.entry?.kind === "result")).toHaveLength(1)
   })
 })
 

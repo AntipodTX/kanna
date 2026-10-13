@@ -1,4 +1,6 @@
 import { useMemo } from "react"
+import { formatCodexQuestionReply } from "../../../shared/codex-questions"
+import { parseUserMessageContent } from "../../../shared/user-message-content"
 import type { ChatAttachment } from "../../../shared/types"
 import { CornerUpLeft } from "lucide-react"
 import { TranscriptMarkdown } from "./shared"
@@ -29,17 +31,7 @@ interface Props {
  * startTurnForChat and never stored), so this strip only matters for
  * transcripts written before that change.
  */
-function parseSystemMessage(content: string) {
-  const match = content.match(/^<system-message>\s*([\s\S]*?)\s*<\/system-message>\s*([\s\S]*)$/)
-  if (!match) {
-    return { systemMessage: null, body: content }
-  }
-
-  return {
-    systemMessage: match[1]?.trim() || null,
-    body: match[2] ?? "",
-  }
-}
+export { parseUserMessageContent } from "../../../shared/user-message-content"
 
 /**
  * A prompt's attachments: images as previews, everything else as file cards.
@@ -104,7 +96,7 @@ export function UserMessageAttachments({ attachments }: { attachments: ChatAttac
 }
 
 export function UserMessage({ content, attachments = [], steered = false, flash = false }: Props) {
-  const parsedContent = useMemo(() => parseSystemMessage(content), [content])
+  const parsedContent = useMemo(() => parseUserMessageContent(content), [content])
 
   return (
     <>
@@ -130,7 +122,7 @@ export function UserMessage({ content, attachments = [], steered = false, flash 
               "min-w-0 flex-1 rounded-2xl border border-border bg-muted px-3.5 py-1.5 text-primary prose prose-sm prose-invert [&_p]:whitespace-pre-line",
               flash && "kanna-jump-flash",
             )}>
-              <TranscriptMarkdown text={parsedContent.body} />
+              <TranscriptMarkdown text={formatCodexQuestionReply(parsedContent.body)} />
             </div>
           </div>
         ) : null}
