@@ -45,6 +45,29 @@ const cancelledResult = (id: string) =>
   singleRow(id, { kind: "result", success: false, cancelled: true, result: "" })
 
 describe("buildTranscriptTurns", () => {
+  test("uses the visible user body without the hidden steering prefix", () => {
+    const rows = [prompt("p1", "<system-message>Internal steering instructions</system-message>\nVisible request"), assistant("a1", "done")]
+    expect(buildTranscriptTurns(rows)[0]).toMatchObject({
+      id: "p1", rowIndex: 0, endRowIndex: 1, prompt: "Visible request", replyRowId: "a1",
+    })
+    expect(rows[0]?.kind === "single" && rows[0].message.kind === "user_prompt" && rows[0].message.content)
+      .toContain("Internal steering instructions")
+  })
+
+  test("previews a native question reply as the question and answer shown in chat", () => {
+    const content = '<system-message>Hidden instructions</system-message>\n<send_user_message_question_reply>{"questionItemId":"q1","question":"Which version?","answer":"Version B"}</send_user_message_question_reply>'
+    expect(buildTranscriptTurns([prompt("reply", content)])[0]).toMatchObject({
+      id: "reply", rowIndex: 0, prompt: "> Which version?\n\nVersion B",
+    })
+  })
+
+  test("keeps literal tags and malformed reply text that the chat does not interpret", () => {
+    const literal = "Explain <system-message>examples</system-message> and <send_user_message_question_reply> tags"
+    const malformed = "<send_user_message_question_reply>{broken}</send_user_message_question_reply>"
+    expect(buildTranscriptTurns([prompt("literal", literal), prompt("malformed", malformed)]).map(turn => turn.prompt))
+      .toEqual([literal, malformed])
+  })
+
   test("opens a turn per user prompt and closes it at the next one", () => {
     const turns = buildTranscriptTurns([
       prompt("p1", "first question"),

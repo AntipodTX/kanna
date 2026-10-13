@@ -184,6 +184,21 @@ describe("buildTranscriptOutline", () => {
     expect(outline[1]!.preview.length).toBe(161)
     expect(outline[1]!.preview.endsWith("…")).toBe(true)
   })
+
+
+  test("removes hidden instructions before shortening the unloaded prompt preview", () => {
+    const source = prompt(`<system-message>${"hidden ".repeat(100)}</system-message>\n**Visible** request`)
+    const outline = buildTranscriptOutline([source])
+    expect(outline).toEqual([{ id: source._id, index: 0, preview: "Visible request", createdAt: source.createdAt }])
+    expect(source.kind === "user_prompt" && source.content).toContain("<system-message>")
+  })
+
+
+  test("decodes all native answers before flattening an unloaded preview", () => {
+    const content = '<send_user_message_question_reply>[{"questionItemId":"q1","question":"Which version?","answer":"Version B"},{"questionItemId":"q2","question":"Import sessions?","answer":"Yes"}]</send_user_message_question_reply>'
+    const outline = buildTranscriptOutline([prompt(content)])
+    expect(outline[0]?.preview).toBe("Which version? Version B Import sessions? Yes")
+  })
 })
 
 describe("trimTranscriptWindow", () => {
