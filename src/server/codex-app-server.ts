@@ -1047,6 +1047,10 @@ export function codexThreadItemToTranscriptEntries(item: ThreadItem): Transcript
 
 export class CodexAppServerManager {
   private readonly sessions = new Map<string, SessionContext>()
+  private readonly sessionStarts = new Map<
+    string,
+    Promise<{ sessionToken: string; resumeFellBack: boolean }>
+  >()
   private readonly spawnProcess: SpawnCodexAppServer
   private readonly compactionTimeoutMs: number
   private onRateLimits: ((snapshot: CodexRateLimitSnapshot) => void) | null = null
@@ -1212,10 +1216,15 @@ export class CodexAppServerManager {
   async startSession(args: StartCodexSessionArgs) {
     const existing = this.sessions.get(args.chatId)
     if (existing && !existing.closed && existing.cwd === args.cwd && !args.pendingForkSessionToken) {
-      return
-    }
-
-    if (existing) {
+      if (existing.sessionToken) {
+        return { sessionToken: existing.sessionToken, resumeFellBack: false }
+      }
+      const sessionStart = this.sessionStarts.get(args.chatId)
+      if (sessionStart) {
+        return await sessionStart
+      }
+      this.stopSession(args.chatId)
+    } else if (existing) {
       this.stopSession(args.chatId)
     }
 
@@ -1236,8 +1245,9 @@ export class CodexAppServerManager {
     this.sessions.set(args.chatId, context)
     this.attachListeners(context)
 
-    try {
-      await this.sendRequest(context, "initialize", {
+    const sessionStart = (async () => {
+      try {
+        await this.sendRequest(context, "initialize", {
         clientInfo: {
           name: "kanna_desktop",
           title: "Kanna",
@@ -1248,9 +1258,9 @@ export class CodexAppServerManager {
           requestAttestation: false,
         },
       } satisfies InitializeParams)
-      this.writeMessage(context, {
-        method: "initialized",
-      })
+        this.writeMessage(context, {
+          method: "initialized",
+        })
 
       // Resume and fork accept MCP config, but this CLI only accepts dynamic tools on thread/start.
       const toolConfig = customTools ? {
@@ -1313,11 +1323,20 @@ export class CodexAppServerManager {
         response = await this.sendRequest<ThreadStartResponse>(context, "thread/start", threadParams)
       }
 
-      context.sessionToken = response.thread.id
-      return { sessionToken: context.sessionToken, resumeFellBack }
-    } catch (error) {
-      this.stopSession(args.chatId)
-      throw error
+        context.sessionToken = response.thread.id
+        return { sessionToken: context.sessionToken, resumeFellBack }
+      } catch (error) {
+        this.stopSession(args.chatId)
+        throw error
+      }
+    })()
+    this.sessionStarts.set(args.chatId, sessionStart)
+    try {
+      return await sessionStart
+    } finally {
+      if (this.sessionStarts.get(args.chatId) === sessionStart) {
+        this.sessionStarts.delete(args.chatId)
+      }
     }
   }
 

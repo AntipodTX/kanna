@@ -16,6 +16,7 @@
 
 - Suppress stale Claude terminal results after steering.
 - Correct Claude chat lifecycle state after agent activity.
+- Avoid Codex thread initialization with an empty thread ID.
 - Preserve Claude plan transcript adjustments during rendering.
 
 <p align="center">
