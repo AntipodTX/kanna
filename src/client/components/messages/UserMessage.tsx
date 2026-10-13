@@ -1,22 +1,26 @@
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-  type FormEvent,
-} from "react"
+import { useMemo, useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react"
 import type { ChatAttachment } from "../../../shared/types"
-import { Check, CornerUpLeft, GitFork, GitMerge, Pencil, Combine, X } from "lucide-react"
+import { CornerUpLeft, Check, GitFork, GitMerge, Pencil, Combine, X } from "lucide-react"
 import { TranscriptMarkdown } from "./shared"
 import { classifyAttachmentPreview } from "./attachmentPreview"
 import { AttachmentFileCard, AttachmentImageCard } from "./AttachmentCard"
 import { openViewer, viewerAttachmentFromChat } from "../../stores/viewerStore"
 import { useTranscriptRenderOptions } from "./render-context"
+import { cn } from "../../lib/utils"
 import { Button } from "../ui/button"
 import { Textarea } from "../ui/textarea"
-import { cn } from "../../lib/utils"
+import { formatCodexQuestionReply } from "../../../shared/codex-questions"
+
+
+
+
+
+
+
+
+
+
+
 
 interface Props {
   messageId?: string
@@ -357,7 +361,7 @@ export function UserMessage({
               </form>
               </div>
             ) : (
-              <TranscriptMarkdown text={parsedContent.body} />
+              <TranscriptMarkdown text={formatCodexQuestionReply(parsedContent.body)} />
             )}
           </div>
           {actionControls}

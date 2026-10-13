@@ -19,6 +19,7 @@
 - Preserve chat history when local storage is corrupt.
 - Keep all chats, including empty drafts and old archived conversations, until explicitly archived or deleted. No automatic chat cleanup runs at startup, on a timer, or when serving snapshots.
 - Stop automatically injecting Kanna chat-link rules, Git attribution instructions, and agent-ID corrections into user messages or session prompts.
+- Show Codex asynchronous questions as interactive choice cards, with custom answers and retryable submission. Cards remain answerable after the turn ends; replies use native same-turn delivery while Codex is working and survive transcript reloads without duplicate sends.
 - Support reliable native Codex same-turn steering across the chat lifecycle.
 - Suppress stale Claude terminal results after steering.
 - Correct Claude chat lifecycle state after agent activity.

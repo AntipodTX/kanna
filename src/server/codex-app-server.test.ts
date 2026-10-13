@@ -4884,6 +4884,52 @@ describe("CodexAppServerManager", () => {
     expect(process.messages.some((message: any) => message.method === "thread/rollback")).toBe(false)
     expect(process.killed).toBe(true)
   })
+
+
+  test("preserves async question choices without blocking the running turn", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: {} })
+      if (message.method === "thread/start") child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1" } } })
+      if (message.method === "turn/start") {
+        child.writeServerMessage({ id: message.id, result: { turn: { id: "turn-1", status: "inProgress" } } })
+        child.writeServerMessage({ method: "turn/plan/updated", params: {
+          threadId: "thread-1", turnId: "turn-1", explanation: null,
+          plan: [{ step: "Finish work", status: "inProgress" }],
+        } })
+        child.writeServerMessage({ method: "item/completed", params: {
+          threadId: "thread-1", turnId: "turn-1",
+          item: { type: "agentMessage", id: "question-item", text: "Cleanup?\n- All\n- Empty only", delivery: "async", phase: "final_answer",
+            questions: [{ title: "Cleanup?", options: ["All", "Empty only"] }, { title: "Cleanup?" }] },
+        } })
+        child.writeServerMessage({ method: "item/completed", params: {
+          threadId: "thread-1", turnId: "turn-1", item: { type: "agentMessage", id: "next", text: "Still working" },
+        } })
+        child.writeServerMessage({ method: "turn/completed", params: {
+          threadId: "thread-1", turn: { id: "turn-1", status: "completed", error: null },
+        } })
+      }
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    let blockingRequests = 0
+    const turn = await manager.startTurn({ chatId: "chat-1", model: "gpt-5.4", content: "Work", planMode: false,
+      onToolRequest: async () => { blockingRequests++; return {} },
+    })
+    const events = await collectStream(turn.stream)
+    expect(blockingRequests).toBe(0)
+    const question = events.find(event => event.entry?.tool?.toolKind === "ask_user_question")
+    expect(question?.entry.tool.input).toEqual({
+      codexAsync: { threadId: "thread-1" },
+      questions: [
+        { id: '["request_user_input_async","question-item",0]', question: "Cleanup?", options: [{ label: "All" }, { label: "Empty only" }] },
+        { id: '["request_user_input_async","question-item",1]', question: "Cleanup?" },
+      ],
+    })
+    expect(events.filter(event => event.entry?.kind === "assistant_text").map(event => event.entry.text)).toEqual(["Still working"])
+    const plans = events.filter(event => event.entry?.tool?.toolKind === "todo_write")
+    expect(plans.map(event => event.entry.tool.input.todos.map((todo: { status: string }) => todo.status))).toEqual([["in_progress"]])
+    expect(events.some(event => event.entry?.kind === "result")).toBe(true)
+  })
 })
 
 describe("Codex shared tools", () => {

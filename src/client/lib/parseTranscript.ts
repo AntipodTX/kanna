@@ -1,5 +1,6 @@
 import { recoverClaudeExitPlans } from "../../shared/claude-plan-recovery"
 import { hydrateToolResult } from "../../shared/tools"
+import { parseCodexQuestionReplies } from "../../shared/codex-questions"
 import type { HydratedToolCall, HydratedTranscriptMessage, NormalizedToolCall, TranscriptEntry } from "../../shared/types"
 
 function createTimestamp(createdAt: number): string {
@@ -86,6 +87,7 @@ interface HydrationState {
   entries: TranscriptEntry[]
   pendingToolCalls: Map<string, PendingToolCall>
   agentCallIndexes: Map<string, number>
+  asyncQuestionIndexes: Map<string, number>
 }
 
 /** Every entry kind except `tool_result`, which folds into an earlier row instead. */
@@ -267,6 +269,7 @@ export function processTranscriptMessages(
 
   const pendingToolCalls = new Map<string, PendingToolCall>(resume?.state.pendingToolCalls)
   const agentCallIndexes = new Map<string, number>(resume?.state.agentCallIndexes)
+  const asyncQuestionIndexes = new Map<string, number>(resume?.state.asyncQuestionIndexes)
   const messages: HydratedTranscriptMessage[] = resume ? resume.messages.slice() : []
   const startIndex = resume ? resume.state.entries.length : 0
   let recoveredExitPlans: Map<string, string> | undefined
@@ -285,6 +288,18 @@ export function processTranscriptMessages(
 
   for (let entryIndex = startIndex; entryIndex < entries.length; entryIndex += 1) {
     const entry = entries[entryIndex]!
+
+    if (entry.kind === "user_prompt") {
+      for (const reply of parseCodexQuestionReplies(entry.content)) {
+        const index = asyncQuestionIndexes.get(reply.questionItemId)
+        if (index === undefined) continue
+        const question = messages[index]
+        if (question?.kind !== "tool" || question.toolKind !== "ask_user_question") continue
+        messages[index] = { ...question, result: { answers: {
+          ...question.result?.answers, [reply.questionItemId]: [reply.answer],
+        } } }
+      }
+    }
 
     if (entry.kind === "tool_result") {
       const pendingCall = pendingToolCalls.get(entry.toolId)
@@ -328,6 +343,11 @@ export function processTranscriptMessages(
     }
 
     if (entry.kind === "tool_call") {
+      if (entry.tool.toolKind === "ask_user_question" && entry.tool.input.codexAsync) {
+        for (const question of entry.tool.input.questions) {
+          if (question.id) asyncQuestionIndexes.set(question.id, messages.length)
+        }
+      }
       pendingToolCalls.set(entry.tool.toolId, { index: messages.length, normalized: entry.tool })
       if (entry.tool.toolKind === "subagent_task") {
         agentCallIndexes.set(entry.tool.toolId, messages.length)
@@ -336,6 +356,6 @@ export function processTranscriptMessages(
     messages.push(message)
   }
 
-  hydrationStates.set(messages, { entries, pendingToolCalls, agentCallIndexes })
+  hydrationStates.set(messages, { entries, pendingToolCalls, agentCallIndexes, asyncQuestionIndexes })
   return messages
 }

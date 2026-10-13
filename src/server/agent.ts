@@ -84,6 +84,7 @@ import { buildHandoffContext, buildHandoffMessageContent } from "./handoff"
 import { checkSessionArtifact, type SessionArtifactStatus } from "./session-artifacts"
 import { timestamped } from "./transcript"
 import { prepareClaudeTranscriptFork, type PreparedClaudeTranscriptFork } from "./claude-fork"
+import { encodeCodexQuestionReplies, parseCodexQuestionReplies, type CodexQuestionReply } from "../shared/codex-questions"
 import {
   findWorkflowOf,
   finishActivity,
@@ -1345,6 +1346,7 @@ export class AgentCoordinator {
     sessionToken: string
     transcriptPrefix: TranscriptEntry[]
   }>()
+  private readonly asyncQuestionResponses = new Map<string, Promise<void>>()
 
   constructor(args: AgentCoordinatorArgs) {
     this.store = args.store
@@ -2174,9 +2176,30 @@ export class AgentCoordinator {
     }
   }
 
-  
+  private async preparePromptInput(args: {
+    provider: AgentProvider
+    chatId: string
+    content: string
+    steered?: boolean
+    cwd: string
+    awaitOwned?: <T>(operation: () => Promise<T>) => Promise<T>
+  }) {
+    const awaitOwned = args.awaitOwned ?? (async <T>(operation: () => Promise<T>) => await operation())
+    const isQuestionReply = args.provider === "codex" && parseCodexQuestionReplies(args.content).length > 0
+    const skills = isQuestionReply ? [] : await awaitOwned(() => this.resolvePromptSkills(args.provider, args.chatId, args.content))
+    let wireContent = args.steered && !isQuestionReply ? buildSteeredMessageContent(args.content) : args.content
+    if (args.provider !== "codex" && skills.length > 0) {
+      wireContent = appendSystemMessageBlock(wireContent, buildSkillSystemMessage(skills))
+    }
+    const concurrentAgentsNotice = buildConcurrentAgentsNotice(
+      this.collectConcurrentProjectChats(args.chatId, args.cwd)
+    )
+    if (concurrentAgentsNotice && !isQuestionReply) {
+      wireContent = appendSystemMessageBlock(wireContent, concurrentAgentsNotice)
+    }
 
-  
+    return { skills, wireContent }
+  }
 
   private async startTurnForChat(args: {
     chatId: string
@@ -3709,8 +3732,9 @@ export class AgentCoordinator {
         }
 
         try {
-          const content = buildSteeredMessageContent(queuedMessage.content)
-          const selectedSkills = await this.resolvePromptSkills("codex", command.chatId, queuedMessage.content)
+          const isQuestionReply = parseCodexQuestionReplies(queuedMessage.content).length > 0
+          const content = isQuestionReply ? queuedMessage.content : buildSteeredMessageContent(queuedMessage.content)
+          const selectedSkills = isQuestionReply ? [] : await this.resolvePromptSkills("codex", command.chatId, queuedMessage.content)
           if (
             this.activeTurns.get(command.chatId) !== active
             || !this.store.getQueuedMessage(command.chatId, queuedMessage.id)
@@ -4805,6 +4829,22 @@ export class AgentCoordinator {
 
   async respondTool(command: Extract<ClientCommand, { type: "chat.respondTool" }>) {
     const active = this.activeTurns.get(command.chatId)
+    if (active?.pendingTool?.toolUseId !== command.toolUseId) {
+      const entry = [...this.store.getMessages(command.chatId)].reverse().find(entry => (
+        entry.kind === "tool_call" && entry.tool.toolId === command.toolUseId
+      ))
+      if (entry?.kind === "tool_call" && entry.tool.toolKind === "ask_user_question" && entry.tool.input.codexAsync) {
+        // Serialize across sockets as well as repeated clicks. Re-read durable
+        // answers inside the lock, so a retry after restart is idempotent too.
+        const previous = this.asyncQuestionResponses.get(command.chatId) ?? Promise.resolve()
+        const response = previous.catch(() => {}).then(() => this.respondAsyncQuestion(command))
+        this.asyncQuestionResponses.set(command.chatId, response)
+        try { await response } finally {
+          if (this.asyncQuestionResponses.get(command.chatId) === response) this.asyncQuestionResponses.delete(command.chatId)
+        }
+        return
+      }
+    }
     if (!active || !active.pendingTool) {
       throw new Error("No pending tool request")
     }
@@ -4887,6 +4927,58 @@ export class AgentCoordinator {
     pending.resolve(command.result)
 
     this.emitStateChange(command.chatId)
+  }
+
+  private async respondAsyncQuestion(command: Extract<ClientCommand, { type: "chat.respondTool" }>) {
+    const chat = this.store.requireChat(command.chatId)
+    const entries = this.store.getMessages(command.chatId)
+    const entry = [...entries].reverse().find(entry => entry.kind === "tool_call" && entry.tool.toolId === command.toolUseId)
+    if (entry?.kind !== "tool_call" || entry.tool.toolKind !== "ask_user_question" || !entry.tool.input.codexAsync) {
+      throw new Error("Question is no longer available")
+    }
+    if (chat.provider !== "codex") throw new Error("This question belongs to a Codex chat")
+    if (chat.sessionToken !== entry.tool.input.codexAsync.threadId) throw new Error("This question belongs to a different Codex session")
+    const answers = asRecord(asRecord(command.result)?.answers)
+    const sent = new Map(entries.flatMap(entry => entry.kind === "user_prompt" ? parseCodexQuestionReplies(entry.content) : [])
+      .map(reply => [reply.questionItemId, reply.answer]))
+    const queued = this.store.getQueuedMessages(command.chatId)
+    const queuedReplies = new Map(queued.flatMap(message => parseCodexQuestionReplies(message.content)
+      .map(reply => [reply.questionItemId, { answer: reply.answer, message }] as const)))
+    const replies: CodexQuestionReply[] = []
+    const queuedIds = new Set<string>()
+    for (const question of entry.tool.input.questions) {
+      const id = question.id!
+      const raw = answers?.[id]
+      if (raw === undefined && sent.has(id)) continue
+      if (!Array.isArray(raw) || raw.length !== 1 || typeof raw[0] !== "string" || !raw[0].trim()) {
+        throw new Error("Choose or enter an answer for each question")
+      }
+      const answer = raw[0].trim()
+      const previous = sent.get(id) ?? queuedReplies.get(id)?.answer
+      if (previous !== undefined && previous !== answer) throw new Error("An answer to this question has already been submitted")
+      if (sent.has(id)) continue
+      const pending = queuedReplies.get(id)
+      if (pending) queuedIds.add(pending.message.id)
+      else replies.push({ questionItemId: id, question: question.question, answer })
+    }
+    if (replies.length) {
+      const message = await this.enqueueMessage(command.chatId, encodeCodexQuestionReplies(replies), [], {
+        provider: "codex", planMode: chat.planMode, autoPlan: chat.autoPlan,
+      })
+      queuedIds.add(message.id)
+    }
+    for (const queuedMessageId of queuedIds) {
+      if (!this.store.getQueuedMessage(command.chatId, queuedMessageId) || this.hasPendingCodexSteer(command.chatId, queuedMessageId)) continue
+      const active = this.activeTurns.get(command.chatId)
+      // Never take the generic cancel/restart route for an asynchronous answer.
+      // A starting turn or a blocking tool will drain this durable input later.
+      if (active && (active.provider !== "codex" || !active.turn?.providerTurnId || active.pendingTool || active.cancelRequested)) continue
+      try {
+        await this.steer({ type: "message.steer", chatId: command.chatId, queuedMessageId })
+      } catch (error) {
+        if (this.store.getQueuedMessage(command.chatId, queuedMessageId)) throw error
+      }
+    }
   }
 
   private readonly prepareClaudeSessionFn: NonNullable<AgentCoordinatorArgs["prepareClaudeSession"]>
