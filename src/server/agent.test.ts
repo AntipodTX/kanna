@@ -3618,6 +3618,7 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
     events.close()
   })
 
+
 })
 
 describe("buildConcurrentAgentsNotice", () => {
