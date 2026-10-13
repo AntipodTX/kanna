@@ -14,6 +14,7 @@
 
 ### Fixes
 
+- Preserve chat history when local storage is corrupt.
 - Support reliable native Codex same-turn steering across the chat lifecycle.
 - Suppress stale Claude terminal results after steering.
 - Correct Claude chat lifecycle state after agent activity.
