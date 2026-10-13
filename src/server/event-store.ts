@@ -2186,34 +2186,50 @@ export class EventStore {
 
   async replaceTranscript(chatId: string, entries: TranscriptEntry[]) {
     this.requireChat(chatId)
+    return this.enqueueWrite(() => this.replaceTranscriptEntries(chatId, entries))
+  }
+
+  async moveUserPromptToEnd(chatId: string, messageId: string) {
+    this.requireChat(chatId)
+    return this.enqueueWrite(async () => {
+      // Read within the write queue so concurrent appends are retained.
+      const entries = this.getMessages(chatId)
+      const index = entries.findIndex(entry => entry._id === messageId
+        && entry.kind === "user_prompt" && !entry.hidden && !entry.parentToolUseId)
+      if (index < 0) throw new Error("Saved answer is no longer present in the chat")
+      if (index === entries.length - 1) return
+      const prompt = entries.splice(index, 1)[0]!
+      await this.replaceTranscriptEntries(chatId, [...entries, prompt])
+    })
+  }
+
+  private async replaceTranscriptEntries(chatId: string, entries: TranscriptEntry[]) {
     const transcriptPath = this.transcriptPath(chatId)
     const tempPath = `${transcriptPath}.${crypto.randomUUID()}.tmp`
-    return this.enqueueWrite(async () => {
-      await this.ensureTranscriptsDir()
-      const inlineToolIds = new Set(entries.flatMap(entry =>
-        entry.kind === "tool_call" && INLINE_TOOL_KINDS.has(entry.tool.toolKind) ? [entry.tool.toolId] : []))
-      const headers: TranscriptEntry[] = []
-      for (const entry of entries) {
-        const stored = await externalizeEntryImages(entry, { dataDir: this.dataDir, chatId })
-        const { header, payload } = splitTranscriptEntry(stored, toolId => inlineToolIds.has(toolId))
-        if (payload) await appendFile(this.payloadSidecarPath(chatId), serializeTranscriptPayload(payload), "utf8")
-        headers.push(header)
-      }
-      const text = headers.map(entry => JSON.stringify(entry)).join("\n")
-      await writeFile(tempPath, text ? `${text}\n` : "", "utf8")
-      await rename(tempPath, transcriptPath)
-      const metadataEvent = this.createTranscriptMetadataEvent(chatId, entries)
-      // The transcript rename committed the replacement. Publish its headers,
-      // payload index and derived metadata even if the journal append fails.
-      this.dropTranscriptCaches(chatId)
-      this.setCachedTranscript(chatId, cloneTranscriptEntries(headers))
-      this.applyEvent(metadataEvent)
-      try {
-        await appendFile(this.chatsLogPath, `${JSON.stringify(metadataEvent)}\n`, "utf8")
-      } finally {
-        this.onTranscriptReplaced?.(chatId)
-      }
-    })
+    await this.ensureTranscriptsDir()
+    const inlineToolIds = new Set(entries.flatMap(entry =>
+      entry.kind === "tool_call" && INLINE_TOOL_KINDS.has(entry.tool.toolKind) ? [entry.tool.toolId] : []))
+    const headers: TranscriptEntry[] = []
+    for (const entry of entries) {
+      const stored = await externalizeEntryImages(entry, { dataDir: this.dataDir, chatId })
+      const { header, payload } = splitTranscriptEntry(stored, toolId => inlineToolIds.has(toolId))
+      if (payload) await appendFile(this.payloadSidecarPath(chatId), serializeTranscriptPayload(payload), "utf8")
+      headers.push(header)
+    }
+    const text = headers.map(entry => JSON.stringify(entry)).join("\n")
+    await writeFile(tempPath, text ? `${text}\n` : "", "utf8")
+    await rename(tempPath, transcriptPath)
+    const metadataEvent = this.createTranscriptMetadataEvent(chatId, entries)
+    // The transcript rename committed the replacement. Publish its headers,
+    // payload index and derived metadata even if the journal append fails.
+    this.dropTranscriptCaches(chatId)
+    this.setCachedTranscript(chatId, cloneTranscriptEntries(headers))
+    this.applyEvent(metadataEvent)
+    try {
+      await appendFile(this.chatsLogPath, `${JSON.stringify(metadataEvent)}\n`, "utf8")
+    } finally {
+      this.onTranscriptReplaced?.(chatId)
+    }
   }
 
   async enqueueMessage(chatId: string, message: Omit<QueuedChatMessage, "id" | "createdAt"> & Partial<Pick<QueuedChatMessage, "id" | "createdAt">>) {

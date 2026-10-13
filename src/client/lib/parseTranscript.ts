@@ -276,7 +276,11 @@ export function processTranscriptMessages(
         if (index === undefined) continue
         const question = messages[index]
         if (question?.kind !== "tool" || question.toolKind !== "ask_user_question") continue
-        messages[index] = { ...question, result: { answers: {
+        messages[index] = { ...question, input: { ...question.input, codexAsync: {
+          ...question.input.codexAsync!, replyMessageIds: {
+            ...question.input.codexAsync?.replyMessageIds, [reply.questionItemId]: entry._id,
+          },
+        } }, result: { answers: {
           ...question.result?.answers, [reply.questionItemId]: [reply.answer],
         } } }
       }
