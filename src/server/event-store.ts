@@ -255,6 +255,13 @@ export type StartupRecoveryIncident = {
   reason: string
 }
 
+class StartupRecoveryBackupError extends Error {
+  constructor(sourcePath: string, cause: unknown) {
+    super(`Cannot back up recovery source ${sourcePath}; startup stopped to preserve the original data: ${cause instanceof Error ? cause.message : String(cause)}`, { cause })
+    this.name = "StartupRecoveryBackupError"
+  }
+}
+
 async function writeFileAtomically(filePath: string, payload: string) {
   const tempPath = `${filePath}.${crypto.randomUUID()}.tmp`
   await writeFile(tempPath, payload, "utf8")
@@ -518,20 +525,23 @@ export class EventStore {
   }
 
   private async recordStartupRecoveryIncident(incident: Omit<StartupRecoveryIncident, "backupPath">) {
-    let backupPath: string | null = null
-    let reason = incident.reason
+    let backupPath: string
 
     try {
       backupPath = await this.backupRecoverySource(incident.sourcePath)
     } catch (error) {
       const backupError = error instanceof Error ? error.message : String(error)
       console.warn(`${LOG_PREFIX} Failed to back up recovery source ${path.basename(incident.sourcePath)}:`, error)
-      reason = `${reason}; backup failed: ${backupError}`
+      this.startupRecoveryIncidents.push({
+        ...incident,
+        reason: `${incident.reason}; backup failed: ${backupError}`,
+        backupPath: null,
+      })
+      throw new StartupRecoveryBackupError(incident.sourcePath, error)
     }
 
     this.startupRecoveryIncidents.push({
       ...incident,
-      reason,
       backupPath,
     })
   }
@@ -610,6 +620,7 @@ export class EventStore {
         }
       }
     } catch (error) {
+      if (error instanceof StartupRecoveryBackupError) throw error
       console.warn(`${LOG_PREFIX} Failed to load snapshot, ignoring it and replaying logs:`, error)
       await this.recordStartupRecoveryIncident({
         kind: "snapshot",
@@ -781,6 +792,7 @@ export class EventStore {
           lineIndex: index,
         })
       } catch (error) {
+        if (error instanceof StartupRecoveryBackupError) throw error
         if (index === lastNonEmpty) {
           console.warn(`${LOG_PREFIX} Ignoring corrupt trailing line in ${path.basename(filePath)}`)
           return parsedEvents
