@@ -1642,6 +1642,23 @@ describe("EventStore", () => {
     expect(store.getChat(chat.id)?.lastUserMessagePreview).toBe("Version? B")
     expect(store.getMessages(chat.id)).toEqual(messages)
   })
+
+
+  test("replacement previews ignore child user prompts", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(dataDir, "Project")
+    const chat = await store.createChat(project.id)
+    const root = entry("user_prompt", 100, { content: "Main request" })
+    const child: TranscriptEntry = { _id: "child-prompt", createdAt: 200, kind: "user_prompt",
+      content: "Subagent request", parentToolUseId: "parent-tool" }
+    await store.replaceTranscript(chat.id, [root, child])
+    expect(store.getChat(chat.id)?.lastUserMessagePreview).toBe("Main request")
+    expect(store.getChat(chat.id)?.lastMessageAt).toBe(200)
+    await store.replaceTranscript(chat.id, [child])
+    expect(store.getChat(chat.id)?.lastUserMessagePreview).toBeUndefined()
+  })
 })
 
 describe("on-demand tool payloads", () => {
