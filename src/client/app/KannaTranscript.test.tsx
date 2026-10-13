@@ -9,23 +9,19 @@ import { buildResolvedTranscriptRows, computeStableResolvedTranscriptRows, Kanna
 const ROW_WRAPPER_CLASS = "mx-auto max-w-[800px] pb-5"
 
 // Minimal test harness mirroring how ChatTranscriptViewport renders resolved rows.
-function TestTranscript({ messages,
+function TestTranscript({
+  messages,
   onEditUserPrompt,
   isEditUserPromptDisabled,
   onForkUserPrompt,
-  isForkUserPromptDisabled }: { messages: HydratedTranscriptMessage[]
-
+  isForkUserPromptDisabled,
+}: {
+  messages: HydratedTranscriptMessage[]
   onEditUserPrompt?: (messageId: string, content: string) => void
-
-
   isEditUserPromptDisabled?: boolean
-
-
   onForkUserPrompt?: (messageId: string) => void
-
-
   isForkUserPromptDisabled?: boolean
- }) {
+}) {
   const rows = buildResolvedTranscriptRows(messages, {
     isLoading: false,
     latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, CodexApproval: null, TodoWrite: null },
@@ -44,7 +40,11 @@ function TestTranscript({ messages,
             onToolGroupExpandedChange={() => undefined}
             onAskUserQuestionSubmit={() => undefined}
             onExitPlanModeConfirm={() => undefined}
-            onCodexApprovalDecision={() => undefined} onEditUserPrompt={onEditUserPrompt} isEditUserPromptDisabled={isEditUserPromptDisabled} onForkUserPrompt={onForkUserPrompt} isForkUserPromptDisabled={isForkUserPromptDisabled}
+            {...{ onCodexApprovalDecision: () => undefined }}
+            onEditUserPrompt={onEditUserPrompt}
+            isEditUserPromptDisabled={isEditUserPromptDisabled}
+            onForkUserPrompt={onForkUserPrompt}
+            isForkUserPromptDisabled={isForkUserPromptDisabled}
           />
         </div>
       ))}

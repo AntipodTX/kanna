@@ -1141,6 +1141,7 @@ export function ChatPage() {
       resolveHistoryAction: recoverHistoryAction,
       historyActions: historyActionsCurrent ? historyActionState.actions : {},
       historyMessages: historyActionsCurrent ? historyActionState.messages ?? {} : {},
+      queuedMessageIds: state.queuedMessages.filter(message => !message.steering).map(message => message.id),
       historyActionsRequired: state.runtime?.provider === "codex",
       historyActionGapId: historyActionsCurrent ? historyActionState.gapId ?? null : null,
       historyActionsLoading: historyActionsCurrent
@@ -1155,6 +1156,7 @@ export function ChatPage() {
       recoverHistoryAction,
       historyActionState,
       historyActionsCurrent,
+      state.queuedMessages,
       state.runtime?.provider,
     ],
   )
