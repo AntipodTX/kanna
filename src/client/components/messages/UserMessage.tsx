@@ -1,5 +1,6 @@
 import { useMemo, useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react"
 import { formatCodexQuestionReply, parseCodexQuestionReplies } from "../../../shared/codex-questions"
+import { parseUserMessageContent } from "../../../shared/user-message-content"
 import type { ChatAttachment } from "../../../shared/types"
 import { CornerUpLeft, Check, GitFork, GitMerge, Pencil, Combine, X } from "lucide-react"
 import { TranscriptMarkdown } from "./shared"
@@ -64,29 +65,13 @@ export function getUserMessageEditTextareaMaxHeight({
   return Math.max(MIN_EDIT_TEXTAREA_MAX_HEIGHT, viewportHeight - EDIT_TEXTAREA_VIEWPORT_MARGIN * 2)
 }
 
+
 /**
  * Legacy compatibility: steered prompts used to persist the injected
  * <system-message> block inside transcript content. The prefix stays hidden
  * while rendering and is preserved when that old prompt is edited.
  */
-export function parseUserMessageContent(content: string) {
-  const match = content.match(/^(<system-message>\s*[\s\S]*?\s*<\/system-message>\s*)([\s\S]*)$/)
-  if (!match) {
-    return { systemPrefix: null, systemMessage: null, body: content }
-  }
-
-  const systemPrefix = match[1] ?? ""
-  const systemMessage = systemPrefix
-    .replace(/^<system-message>\s*/, "")
-    .replace(/\s*<\/system-message>\s*$/, "")
-    .trim()
-
-  return {
-    systemPrefix,
-    systemMessage: systemMessage || null,
-    body: match[2] ?? "",
-  }
-}
+export { parseUserMessageContent } from "../../../shared/user-message-content"
 
 export function buildUserMessageEditContent(content: string, editedBody: string) {
   const parsedContent = parseUserMessageContent(content)

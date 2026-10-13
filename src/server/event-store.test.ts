@@ -1986,6 +1986,51 @@ describe("EventStore", () => {
       warn.mockRestore()
     }
   })
+
+
+  test.each([
+    [`<system-message>${"hidden instructions ".repeat(30)}</system-message>\n**Visible** request`, "Visible request"],
+    ['<send_user_message_question_reply>[{"questionItemId":"q1","question":"Version?","answer":"B"},{"questionItemId":"q2","question":"Import?","answer":"Yes"}]</send_user_message_question_reply>', "Version? B Import? Yes"],
+  ])("forms a visible user preview before shortening it: %s", async (content, expected) => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.appendMessage(chat.id, entry("user_prompt", 1_000, { content }))
+    const assistantText = "<system-message>Literal example</system-message>"
+    await store.appendMessage(chat.id, entry("assistant_text", 2_000, { text: assistantText }))
+
+    expect(store.getChat(chat.id)?.lastUserMessagePreview).toBe(expected)
+    expect(store.getChat(chat.id)?.lastAgentMessagePreview).toBe(assistantText)
+    expect(store.getMessages(chat.id)[0]).toMatchObject({ content })
+  })
+
+
+  test("forms a visible fork preview without changing the source signature", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const source = await store.createChat(project.id)
+    await store.setChatProvider(source.id, "claude")
+    await store.setSessionToken(source.id, "session-1")
+    await store.recordTurnStarted(source.id)
+    const content = "<system-message>Hidden instructions</system-message>\nVisible request"
+    await store.appendMessage(source.id, entry("user_prompt", 1_000, { content }))
+    await store.appendMessage(source.id, entry("assistant_text", 2_000, { text: "Done" }))
+    await store.appendMessage(source.id, entry("result", 3_000, { result: "ok" }))
+    await store.recordTurnFinished(source.id)
+    await store.recordTurnStarted(source.id)
+    await store.appendMessage(source.id, entry("user_prompt", 4_000, { content: "Next request" }))
+    const before = store.getMessages(source.id)
+    const fork = await store.forkChat(source.id, { atLastCompletedTurn: true })
+
+    expect(fork.lastUserMessagePreview).toBe("Visible request")
+    expect(store.getChat(source.id)?.lastUserMessagePreview).toBe("Next request")
+    expect(store.getMessages(source.id)).toEqual(before)
+    expect(store.getMessages(fork.id)[0]).toMatchObject({ content })
+  })
 })
 
 describe("on-demand tool payloads", () => {
