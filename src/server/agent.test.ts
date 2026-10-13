@@ -6486,6 +6486,61 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
     })
   }
 
+
+  test("an autonomous Claude result cannot finish a user turn waiting for session configuration", async () => {
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    const promptIds: string[] = []
+    let configurationStarted!: () => void
+    const configuring = new Promise<void>((resolve) => { configurationStarted = resolve })
+    let releaseConfiguration!: () => void
+    const configurationReady = new Promise<void>((resolve) => { releaseConfiguration = resolve })
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => ({
+        provider: "claude", stream: events, echoesPromptIds: true,
+        interrupt: async () => {}, close: () => events.close(),
+        setModel: async () => {},
+        setPermissionMode: async () => { configurationStarted(); await configurationReady },
+        sendPrompt: async (_content, promptId) => { promptIds.push(promptId!) },
+      }),
+    })
+    const result = (text: string) => timestamped({
+      kind: "result" as const, subtype: "success", isError: false, durationMs: 0, result: text,
+    })
+    const send = (planMode: boolean) => coordinator.send({
+      type: "chat.send", chatId: "chat-1", provider: "claude", content: "user input", model: "claude-opus-4-1", planMode,
+    })
+    try {
+      await send(false)
+      events.push({ type: "transcript", entry: result("first complete"), promptIds: [promptIds[0]] })
+      await waitFor(() => store.turnFinishedCount === 1)
+      const second = send(true)
+      await configuring
+      events.push({ type: "transcript", entry: result("autonomous completion") })
+      const barrier = timestamped({ kind: "status", status: "running" })
+      events.push({ type: "transcript", entry: barrier })
+      await waitFor(() => store.messages.some((entry) => entry._id === barrier._id))
+      expect(store.turnFinishedCount).toBe(1)
+      expect(coordinator.getActiveStatuses().get("chat-1")).toBe("starting")
+      releaseConfiguration()
+      await second
+      expect(promptIds).toHaveLength(2)
+      events.push({ type: "transcript", entry: result("second complete"), promptIds: [promptIds[1]] })
+      await waitFor(() => store.turnFinishedCount === 2)
+      // A genuine autonomous turn still completes without a submitted UUID.
+      events.push({ type: "transcript", entry: timestamped({ kind: "assistant_text", text: "background wakeup" }) })
+      await waitFor(() => coordinator.getActiveStatuses().has("chat-1"))
+      events.push({ type: "transcript", entry: result("background complete") })
+      await waitFor(() => store.turnFinishedCount === 3)
+      expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+    } finally {
+      releaseConfiguration()
+      events.close()
+    }
+  })
+
 })
 
 describe("buildConcurrentAgentsNotice", () => {
