@@ -2099,7 +2099,7 @@ export class EventStore {
       if (entry.kind === "user_prompt") {
         lastMessageAt = Math.max(lastMessageAt ?? 0, entry.createdAt)
         if (!entry.hidden) {
-          const preview = buildChatMessagePreview(entry.content)
+          const preview = buildChatUserMessagePreview(entry.content)
           if (preview) lastUserMessagePreview = preview
         }
       } else if (entry.kind === "assistant_text" && !entry.hidden && !entry.parentToolUseId) {

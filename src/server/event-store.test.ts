@@ -1627,6 +1627,21 @@ describe("EventStore", () => {
     expect(store.getMessages(source.id)).toEqual(before)
     expect(store.getMessages(fork.id)[0]).toMatchObject({ content })
   })
+
+
+  test("forms a visible user preview when replacing a transcript", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    const content = '<system-message>Hidden instructions</system-message>\n<send_user_message_question_reply>{"questionItemId":"q","question":"Version?","answer":"B"}</send_user_message_question_reply>'
+    const messages = [entry("user_prompt", 1_000, { content })]
+    await store.replaceTranscript(chat.id, messages)
+
+    expect(store.getChat(chat.id)?.lastUserMessagePreview).toBe("Version? B")
+    expect(store.getMessages(chat.id)).toEqual(messages)
+  })
 })
 
 describe("on-demand tool payloads", () => {
