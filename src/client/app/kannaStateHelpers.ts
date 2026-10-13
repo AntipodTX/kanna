@@ -195,7 +195,6 @@ export function getMostRecentlyActiveProjectId(projectGroups: SidebarData["proje
   // is as good an answer as any.
   return bestId ?? projectGroups[0]?.groupKey ?? null
 }
-
 export function getProjectIdForChat(projectGroups: SidebarData["projectGroups"], chatId: string | null) {
   if (!chatId) return null
   // Archived chats are viewable in place, so they resolve project context too.

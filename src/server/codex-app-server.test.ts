@@ -1,3 +1,4 @@
+import { timestamped } from "./transcript"
 import { describe, expect, test } from "bun:test"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
@@ -53,6 +54,261 @@ async function collectStream(stream: AsyncIterable<any>) {
   }
   return items
 }
+
+for (const side of ["before", "after"] as const)
+  test(`saved ${side} boundary forks without reading either native history`, async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: {} })
+      else if (message.method === "thread/fork") child.writeServerMessage({ id: message.id, result: { thread: { id: "prepared" } } })
+      else if (message.method) child.writeServerMessage({ id: message.id, error: { code: -32601, message: "Unexpected native history read" } })
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    try {
+      const args = { cwd: "/repo", threadId: "source", model: "gpt-5.4" }
+      expect(await (side === "before"
+        ? manager.forkBeforeTurn({ ...args, beforeTurnId: "turn-a" })
+        : manager.forkAfterTurn({ ...args, afterTurnId: "turn-a" }))).toBe("prepared")
+      const requests = process.messages.filter((m: any) => m.id !== undefined) as any[]
+      expect(requests.map((m) => m.method)).toEqual(["initialize", "thread/fork"])
+      expect(requests[1].params).toMatchObject({ threadId: "source", includeTurns: false,
+        ...(side === "before" ? { beforeTurnId: "turn-a" } : { lastTurnId: "turn-a" }) })
+      expect(process.killed).toBe(true)
+    } finally { manager.stopAll() }
+  })
+
+function historyTestHarness(options: {
+  pages?: readonly unknown[]
+  listError?: { code: number; message: string }
+  revertError?: { code: number; message: string }
+  beforeListResponse?: () => void
+} = {}) {
+  let pageIndex = 0
+  const process = new FakeCodexProcess((message, child) => {
+    if (message.method === "initialize") {
+      child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+    } else if (message.method === "thread/start" || message.method === "thread/resume") {
+      child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1" } } })
+    } else if (message.method === "turn/start") {
+      child.writeServerMessage({ id: message.id, result: { turn: { id: "running", status: "inProgress", error: null } } })
+    } else if (message.method === "thread/turns/list") {
+      options.beforeListResponse?.()
+      child.writeServerMessage(options.listError
+        ? { id: message.id, error: options.listError }
+        : { id: message.id, result: options.pages && pageIndex < options.pages.length
+          ? options.pages[pageIndex++] : { data: [], nextCursor: null } })
+    } else if (message.method === "thread/revert") {
+      child.writeServerMessage(options.revertError
+        ? { id: message.id, error: options.revertError }
+        : { id: message.id, result: { thread: { id: "thread-1", turns: [] } } })
+    } else if (message.method === "thread/rollback") {
+      child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1", turns: [] } } })
+    }
+  })
+  const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+  const requests = (method: string) => process.messages.filter((message: any) => message.method === method) as Array<{ params: Record<string, unknown> }>
+  return { manager, process, requests }
+}
+
+function historyPage(ids: string[], nextCursor: string | null = null) {
+  return {
+    data: ids.map((id) => ({ id, status: "completed", itemsView: "summary", items: [{ type: "userMessage" }], error: null })),
+    nextCursor,
+    backwardsCursor: null,
+  }
+}
+
+describe("Codex history revert compatibility", () => {
+  test("counts user-bearing turns instead of compaction and other service turns", async () => {
+    const page = historyPage(["trailing-compact", "third", "service", "second", "middle-compact", "first"])
+    for (const turn of page.data) {
+      if (turn.id.includes("compact")) turn.items = [{ type: "contextCompaction" }]
+      if (turn.id === "service") turn.items = [{ type: "agentMessage" }]
+    }
+    const { manager, requests } = historyTestHarness({ pages: [page] })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 3 })
+    expect(requests("thread/turns/list")).toMatchObject([{ params: { itemsView: "summary" } }])
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: "first" } }])
+  })
+
+  test("continues through service-only pages to the only user message", async () => {
+    const servicePage = historyPage(["compact-2", "compact-1"], "older")
+    for (const turn of servicePage.data) turn.items = []
+    const { manager, requests } = historyTestHarness({ pages: [servicePage, historyPage(["first"])] })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })
+    expect(requests("thread/turns/list")).toMatchObject([
+      { params: { limit: 1 } }, { params: { limit: 1, cursor: "older" } },
+    ])
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: "first" } }])
+  })
+
+  test("does not count inline compaction as another user turn", async () => {
+    const page = historyPage(["second", "first"])
+    page.data[0]!.items.push({ type: "contextCompaction" })
+    const { manager, requests } = historyTestHarness({ pages: [page] })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 2 })
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: "first" } }])
+  })
+
+  test.each([
+    { name: "no user messages", items: [], itemsView: "summary" },
+    { name: "missing items", items: undefined, itemsView: "summary" },
+    { name: "items not loaded", items: [], itemsView: "notLoaded" },
+    { name: "invalid item", items: [null], itemsView: "summary" },
+  ])("refuses an uncertain user-message boundary: $name", async ({ items, itemsView }) => {
+    const { manager, requests } = historyTestHarness({ pages: [{ data: [{ id: "service", status: "completed", items, itemsView }] }] })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 }))
+      .rejects.toThrow("Cannot determine Codex rollback boundary")
+    expect(requests("thread/revert")).toEqual([])
+    expect(requests("thread/rollback")).toEqual([])
+  })
+
+  test.each([1, 3])("excludes the exact boundary when reverting %s turns", async (numTurns) => {
+    const { manager, process, requests } = historyTestHarness({ pages: [historyPage(["newest", "middle", "oldest"])] })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    await manager.rollbackThread({ chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", numTurns })
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: numTurns === 1 ? "newest" : "oldest" } }])
+    expect(requests("thread/rollback")).toEqual([])
+    expect(requests("thread/resume")).toEqual([])
+    expect(process.killed).toBe(false)
+    manager.stopSession("chat-1")
+  })
+
+  test("follows older pages in bounded batches before reverting", async () => {
+    const firstIds = Array.from({ length: 100 }, (_, index) => `turn-${102 - index}`)
+    const { manager, requests } = historyTestHarness({ pages: [
+      historyPage(firstIds, "page-two"), historyPage(["turn-2", "turn-1"]),
+    ] })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 102 })
+    expect(requests("thread/turns/list")).toMatchObject([
+      { params: { limit: 100, sortDirection: "desc", itemsView: "summary" } },
+      { params: { limit: 2, cursor: "page-two", sortDirection: "desc", itemsView: "summary" } },
+    ])
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: "turn-1" } }])
+  })
+
+  test.each([-32600, -32601])("uses legacy rollback when revert is explicitly unsupported (%s)", async (code) => {
+    const { manager, requests } = historyTestHarness({
+      pages: [historyPage(["turn-1"])],
+      revertError: { code, message: code === -32600 ? "Invalid request: unknown variant `thread/revert`" : "Method not found" },
+    })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })
+    expect(requests("thread/revert")).toHaveLength(1)
+    expect(requests("thread/rollback")).toMatchObject([{ params: { threadId: "thread-1", numTurns: 1 } }])
+  })
+
+  test("keeps the user-turn count for legacy rollback when only revert is unsupported", async () => {
+    const page = historyPage(["compact", "first"])
+    page.data[0]!.items = [{ type: "contextCompaction" }]
+    const { manager, requests } = historyTestHarness({
+      pages: [page], revertError: { code: -32601, message: "Method not found" },
+    })
+    await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })
+    expect(requests("thread/revert")).toMatchObject([{ params: { beforeTurnId: "first" } }])
+    expect(requests("thread/rollback")).toMatchObject([{ params: { numTurns: 1 } }])
+  })
+
+  test.each(["listError", "revertError"] as const)("does not fall back on an ordinary %s", async (field) => {
+    const { manager, process, requests } = historyTestHarness({
+      pages: [historyPage(["turn-1"])],
+      [field]: { code: -32603, message: "Disk write failed" },
+    })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })).rejects.toThrow("Disk write failed")
+    expect(requests("thread/rollback")).toEqual([])
+    expect(process.killed).toBe(true)
+  })
+
+  test("does not treat an unknown parameter variant as an unsupported method", async () => {
+    const { manager, requests } = historyTestHarness({ listError: { code: -32600, message: "unknown variant `notLoaded`" } })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })).rejects.toThrow("unknown variant `notLoaded`")
+    expect(requests("thread/rollback")).toEqual([])
+  })
+
+  test("does not retry legacy-format rejection with the removed rollback command", async () => {
+    const { manager, process, requests } = historyTestHarness({
+      pages: [historyPage(["turn-1"])],
+      revertError: { code: -32600, message: "thread/revert only supports paginated threads" },
+    })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 }))
+      .rejects.toThrow("thread/revert only supports paginated threads")
+    expect(requests("thread/revert")).toHaveLength(1)
+    expect(requests("thread/rollback")).toEqual([])
+    expect(process.killed).toBe(true)
+  })
+
+  test.each([undefined, "unknown"])("refuses an unrecognized turn status %s before reverting", async (status) => {
+    const { manager, requests } = historyTestHarness({ pages: [{ data: [{ id: "turn-1", status }] }] })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 }))
+      .rejects.toThrow("Cannot determine Codex rollback boundary")
+    expect(requests("thread/revert")).toEqual([])
+    expect(requests("thread/rollback")).toEqual([])
+  })
+
+  test.each([0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])("rejects invalid count %s before issuing any request", async (numTurns) => {
+    const { manager, process } = historyTestHarness()
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns })).rejects.toThrow("positive integer")
+    expect(process.messages).toEqual([])
+  })
+
+  test.each([
+    { name: "empty history", pages: [historyPage([])] },
+    { name: "insufficient history", pages: [historyPage(["turn-1"])] },
+    { name: "missing data", pages: [{}] },
+    { name: "null page", pages: [null] },
+    { name: "missing ID", pages: [{ data: [{}] }] },
+    { name: "blank ID", pages: [historyPage(["  "])] },
+    { name: "duplicate turn", pages: [historyPage(["turn-1", "turn-1"])] },
+    { name: "duplicate across pages", pages: [historyPage(["turn-1"], "older"), historyPage(["turn-1"])] },
+    { name: "repeated cursor", pages: [historyPage(["turn-3"], "older"), historyPage(["turn-2"], "older")] },
+  ])("refuses ambiguous boundaries: $name", async ({ pages }) => {
+    const { manager, process, requests } = historyTestHarness({ pages })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 3 })).rejects.toThrow("Cannot determine Codex rollback boundary")
+    expect(requests("thread/revert")).toEqual([])
+    expect(requests("thread/rollback")).toEqual([])
+    expect(process.killed).toBe(true)
+  })
+
+  test("refuses to revert a running turn returned by Codex", async () => {
+    const { manager, requests } = historyTestHarness({ pages: [{ data: [{ id: "turn-1", status: "inProgress" }] }] })
+    await expect(manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })).rejects.toThrow("while a turn is running")
+    expect(requests("thread/revert")).toEqual([])
+    expect(requests("thread/rollback")).toEqual([])
+  })
+
+  test("keeps the active-turn guard before reading or truncating history", async () => {
+    const { manager, requests } = historyTestHarness()
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    await manager.startTurn({ chatId: "chat-1", model: "gpt-5.4", content: "test", planMode: false, onToolRequest: async () => ({}) })
+    await expect(manager.rollbackThread({ chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 })).rejects.toThrow("while a turn is running")
+    expect(requests("thread/turns/list")).toEqual([])
+    expect(requests("thread/revert")).toEqual([])
+    expect(requests("thread/rollback")).toEqual([])
+    manager.stopSession("chat-1")
+  })
+
+  test("refuses to revert when a turn starts while history is being read", async () => {
+    let startedTurn: ReturnType<CodexAppServerManager["startTurn"]> | undefined
+    const { manager, requests } = historyTestHarness({
+      pages: [historyPage(["turn-1"])],
+      beforeListResponse: () => {
+        startedTurn = manager.startTurn({
+          chatId: "chat-1", model: "gpt-5.4", content: "new turn", planMode: false,
+          onToolRequest: async () => ({}),
+        })
+      },
+    })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    try {
+      await expect(manager.rollbackThread({ chatId: "chat-1", cwd: "/tmp/project", threadId: "thread-1", numTurns: 1 }))
+        .rejects.toThrow("while a turn is running")
+      await startedTurn
+      expect(requests("thread/turns/list")).toHaveLength(1)
+      expect(requests("thread/revert")).toEqual([])
+      expect(requests("thread/rollback")).toEqual([])
+    } finally {
+      manager.stopSession("chat-1")
+    }
+  })
+})
 
 describe("CodexAppServerManager", () => {
   test("initializes app-server and starts a fresh thread", async () => {
@@ -112,13 +368,18 @@ describe("CodexAppServerManager", () => {
       sessionToken: "missing-thread",
     })
 
-    expect(started).toEqual({ sessionToken: "thread-2", resumeFellBack: true })
+    expect(started).toEqual({ sessionToken: "thread-2", resumeFellBack: true, startupOutcome: { kind: "fresh" } })
     expect(process.messages.map((message: any) => message.method)).toEqual([
       "initialize",
       "initialized",
       "thread/resume",
       "thread/start",
     ])
+    expect((process.messages[2] as any).params.persistExtendedHistory).toBe(true)
+    expect((process.messages[3] as any).params.persistExtendedHistory).toBe(true)
+    const reused = await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: "thread-2" })
+    expect(reused).toEqual({ sessionToken: "thread-2", resumeFellBack: false, startupOutcome: { kind: "reused" } })
+    expect(process.messages.filter((message: any) => message.method === "thread/start")).toHaveLength(1)
   })
 
   // Regression coverage for the real-world "thread/resume failed: thread X
@@ -213,12 +474,153 @@ describe("CodexAppServerManager", () => {
       pendingForkSessionToken: "thread-source",
     })
 
-    expect(started).toEqual({ sessionToken: "thread-fork-1", resumeFellBack: false })
+    expect(started).toEqual({ sessionToken: "thread-fork-1", resumeFellBack: false, startupOutcome: { kind: "forked" } })
     expect(process.messages.map((message: any) => message.method)).toEqual([
       "initialize",
       "initialized",
       "thread/fork",
     ])
+  })
+
+  test("rolls back an active app-server thread through the live session", async () => {
+    const processes: FakeCodexProcess[] = []
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => {
+        const process = new FakeCodexProcess((message, child) => {
+          if (message.method === "initialize") {
+            child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+          } else if (message.method === "thread/start") {
+            child.writeServerMessage({
+              id: message.id,
+              result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+            })
+          } else if (message.method === "thread/turns/list") {
+            child.writeServerMessage({ id: message.id, error: { code: -32601, message: "Method not found" } })
+          } else if (message.method === "thread/rollback") {
+            child.writeServerMessage({
+              id: message.id,
+              result: { thread: { id: "thread-1", turns: [] } },
+            })
+          }
+        })
+        processes.push(process)
+        return process as never
+      },
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    const thread = await manager.rollbackThread({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+      numTurns: 1,
+    })
+
+    expect(thread.id).toBe("thread-1")
+    expect(processes).toHaveLength(1)
+    expect(processes[0]?.messages.map((message: any) => message.method)).toEqual([
+      "initialize",
+      "initialized",
+      "thread/start",
+      "thread/turns/list",
+      "thread/rollback",
+    ])
+    const rollback = processes[0]?.messages.find((message: any) => message.method === "thread/rollback") as
+      | { method: "thread/rollback"; params: { threadId?: string; numTurns?: number } }
+      | undefined
+    expect(rollback?.params).toMatchObject({
+      threadId: "thread-1",
+      numTurns: 1,
+    })
+  })
+
+  test("resumes a stored thread before rolling back when no live session is available", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/resume") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "thread/turns/list") {
+        child.writeServerMessage({ id: message.id, error: { code: -32601, message: "Method not found" } })
+      } else if (message.method === "thread/rollback") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1", turns: [] } },
+        })
+      }
+    })
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    const thread = await manager.rollbackThread({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+      numTurns: 2,
+    })
+
+    expect(thread.id).toBe("thread-1")
+    expect(process.messages.map((message: any) => message.method)).toEqual([
+      "initialize",
+      "initialized",
+      "thread/resume",
+      "thread/turns/list",
+      "thread/rollback",
+    ])
+    expect((process.messages[0] as any).params.capabilities).toEqual({
+      experimentalApi: true,
+      requestAttestation: false,
+    })
+    expect((process.messages[2] as any).params).toMatchObject({
+      threadId: "thread-1",
+      cwd: "/tmp/project",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+      persistExtendedHistory: true,
+    })
+  })
+
+  test("reverts before the Nth newest turn when Codex has removed thread/rollback", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/resume") {
+        child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1" } } })
+      } else if (message.method === "thread/rollback") {
+        child.writeServerMessage({ id: message.id, error: {
+          code: -32600,
+          message: "Invalid request: unknown variant `thread/rollback`, expected one of `thread/revert`, `thread/turns/list`",
+        } })
+      } else if (message.method === "thread/turns/list") {
+        child.writeServerMessage({ id: message.id, result: {
+          data: historyPage(["turn-3", "turn-2"]).data,
+          nextCursor: "older-turns",
+          backwardsCursor: null,
+        } })
+      } else if (message.method === "thread/revert") {
+        child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1", turns: [] } } })
+      }
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+
+    expect(await manager.rollbackThread({ cwd: "/tmp/project", threadId: "thread-1", numTurns: 2 }))
+      .toMatchObject({ id: "thread-1", turns: [] })
+    expect(process.messages.filter((message: any) => message.method === "thread/turns/list"))
+      .toMatchObject([{ params: { threadId: "thread-1", sortDirection: "desc", itemsView: "summary", limit: 2 } }])
+    expect(process.messages.filter((message: any) => message.method === "thread/revert"))
+      .toMatchObject([{ params: { threadId: "thread-1", beforeTurnId: "turn-2" } }])
+    expect(process.messages.some((message: any) => message.method === "thread/rollback")).toBe(false)
+    expect(process.killed).toBe(true)
   })
 
   test("maps fast mode and reasoning into app-server params", async () => {
@@ -2446,6 +2848,353 @@ describe("CodexAppServerManager", () => {
     expect(resultEntry?.subtype).toBe("error")
     expect(resultEntry?.result).toBe("usage limit reached: resets at 5pm")
   })
+
+
+  test("preserves async question choices without blocking the running turn", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: {} })
+      if (message.method === "thread/start") child.writeServerMessage({ id: message.id, result: { thread: { id: "thread-1" } } })
+      if (message.method === "turn/start") {
+        child.writeServerMessage({ id: message.id, result: { turn: { id: "turn-1", status: "inProgress" } } })
+        child.writeServerMessage({ method: "turn/plan/updated", params: {
+          threadId: "thread-1", turnId: "turn-1", explanation: null,
+          plan: [{ step: "Finish work", status: "inProgress" }],
+        } })
+        child.writeServerMessage({ method: "item/completed", params: {
+          threadId: "thread-1", turnId: "turn-1",
+          item: { type: "agentMessage", id: "question-item", text: "Cleanup?\n- All\n- Empty only", delivery: "async", phase: "final_answer",
+            questions: [{ title: "Cleanup?", options: ["All", "Empty only"] }, { title: "Cleanup?" }] },
+        } })
+        child.writeServerMessage({ method: "item/completed", params: {
+          threadId: "thread-1", turnId: "turn-1", item: { type: "agentMessage", id: "next", text: "Still working" },
+        } })
+        child.writeServerMessage({ method: "turn/completed", params: {
+          threadId: "thread-1", turn: { id: "turn-1", status: "completed", error: null },
+        } })
+      }
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    let blockingRequests = 0
+    const turn = await manager.startTurn({ chatId: "chat-1", model: "gpt-5.4", content: "Work", planMode: false,
+      onToolRequest: async () => { blockingRequests++; return {} },
+    })
+    const events = await collectStream(turn.stream)
+    expect(blockingRequests).toBe(0)
+    const question = events.find(event => event.entry?.tool?.toolKind === "ask_user_question")
+    expect(question?.entry.tool.input).toEqual({
+      codexAsync: { threadId: "thread-1" },
+      questions: [
+        { id: '["request_user_input_async","question-item",0]', question: "Cleanup?", options: [{ label: "All" }, { label: "Empty only" }] },
+        { id: '["request_user_input_async","question-item",1]', question: "Cleanup?" },
+      ],
+    })
+    expect(events.filter(event => event.entry?.kind === "assistant_text").map(event => event.entry.text)).toEqual(["Still working"])
+    const plans = events.filter(event => event.entry?.tool?.toolKind === "todo_write")
+    expect(plans.map(event => event.entry.tool.input.todos.map((todo: { status: string }) => todo.status))).toEqual([["in_progress"]])
+    expect(events.some(event => event.entry?.kind === "result")).toBe(true)
+  })
+
+
+  test("accepts a steer before its echoed user message is persisted", async () => {
+    let allowSteeredEntryPersistence!: () => void
+    const steeredEntryPersistenceGate = new Promise<void>((resolve) => {
+      allowSteeredEntryPersistence = resolve
+    })
+    let sawSteeredEntry = false
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-1", status: "inProgress", error: null } },
+        })
+      } else if (message.method === "turn/steer") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turnId: "turn-1" },
+        })
+        child.writeServerMessage({
+          method: "item/started",
+          params: {
+            threadId: "thread-1",
+            turnId: "turn-1",
+            item: {
+              type: "userMessage",
+              id: "item-steer-1",
+              clientId: "queued-1",
+              content: [{ type: "text", text: "steered prompt", text_elements: [] }],
+            },
+          },
+        })
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: "turn-1", status: "completed", error: null },
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    const turn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "initial prompt",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    })
+    const steeredEntry = timestamped({
+      kind: "user_prompt",
+      content: "steered prompt",
+      attachments: [],
+      steered: true,
+    }) as Extract<ReturnType<typeof timestamped>, { kind: "user_prompt" }>
+    const eventsPromise = (async () => {
+      const events: any[] = []
+      for await (const event of turn.stream) {
+        events.push(event)
+        if (event.entry === steeredEntry) {
+          sawSteeredEntry = true
+          await steeredEntryPersistenceGate
+        }
+        event.onPersisted?.()
+      }
+      return events
+    })()
+
+    await expect(manager.steerTurn({
+      chatId: "chat-1",
+      expectedTurnId: "stale-turn",
+      content: "stale steer",
+      clientUserMessageId: "queued-stale",
+      transcriptEntry: timestamped({ kind: "user_prompt", content: "stale steer", steered: true }) as
+        Extract<ReturnType<typeof timestamped>, { kind: "user_prompt" }>,
+    })).rejects.toThrow("Codex turn changed before steering")
+    expect(process.messages.some((message: any) => message.method === "turn/steer")).toBe(false)
+
+    const steer = manager.startSteerTurn({
+      chatId: "chat-1",
+      expectedTurnId: "turn-1",
+      content: "steered prompt",
+      clientUserMessageId: "queued-1",
+      transcriptEntry: steeredEntry,
+    })
+    await steer.accepted
+    let steerSettled = false
+    const steerPromise = steer.settled.then(() => {
+      steerSettled = true
+    })
+    while (!sawSteeredEntry) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    const settledBeforePersistence = steerSettled
+    allowSteeredEntryPersistence()
+    await steerPromise
+    expect(settledBeforePersistence).toBe(false)
+
+    const events = await eventsPromise
+    const steerRequest = process.messages.find((message: any) => message.method === "turn/steer") as
+      | { id: string; method: "turn/steer"; params: Record<string, unknown> }
+      | undefined
+    expect(steerRequest).toBeDefined()
+    if (!steerRequest) throw new Error("missing steer request")
+    expect(steerRequest).toEqual({
+      id: steerRequest.id,
+      method: "turn/steer",
+      params: {
+        threadId: "thread-1",
+        input: [
+          { type: "text", text: "steered prompt", text_elements: [] },
+        ],
+        expectedTurnId: "turn-1",
+        clientUserMessageId: "queued-1",
+      },
+    })
+    expect(process.messages.filter((message: any) => message.method === "turn/start")).toHaveLength(1)
+    expect(process.messages.some((message: any) => message.method === "turn/interrupt")).toBe(false)
+    expect(events.filter((event) => event.type === "transcript").map((event) => event.entry)).toContainEqual(steeredEntry)
+    expect(events.filter((event) => event.type === "transcript" && event.entry.kind === "result")).toHaveLength(1)
+  })
+
+
+  test("keeps selected skill intent on the steer wire when its path no longer matches discovery", async () => {
+    const selectedSkills = [{
+      name: "deploy-helper",
+      path: "/tmp/old-project/.agents/skills/deploy-helper/SKILL.md",
+    }]
+    const discoveredSkillPath = "/tmp/project/.agents/skills/deploy-helper/SKILL.md"
+    let resolvedSkillCount = 0
+    let modelVisibleText = ""
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-1", status: "inProgress", error: null } },
+        })
+      } else if (message.method === "turn/steer") {
+        // Codex silently skips structured skills whose paths no longer match
+        // discovery. The remaining text must still carry the selected intent.
+        resolvedSkillCount = message.params.input.filter((item: any) =>
+          item.type === "skill" && item.path === discoveredSkillPath
+        ).length
+        modelVisibleText = message.params.input
+          .filter((item: any) => item.type === "text")
+          .map((item: any) => item.text)
+          .join("\n")
+        child.writeServerMessage({ id: message.id, result: { turnId: "turn-1" } })
+        const echoedItem = {
+          type: "userMessage",
+          id: "item-steer-skill",
+          clientId: message.params.clientUserMessageId,
+          content: [{ type: "text", text: modelVisibleText, text_elements: [] }],
+        }
+        for (const method of ["item/started", "item/completed"]) {
+          child.writeServerMessage({
+            method,
+            params: { threadId: "thread-1", turnId: "turn-1", item: echoedItem },
+          })
+        }
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: "turn-1", status: "completed", error: null },
+          },
+        })
+      }
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    await manager.startSession({ chatId: "chat-1", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null })
+    const turn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "initial prompt",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    })
+    const content = "  Use /deploy-helper for the next step  "
+    const steeredEntry = timestamped({ kind: "user_prompt", content, steered: true }) as
+      Extract<ReturnType<typeof timestamped>, { kind: "user_prompt" }>
+    const eventsPromise = (async () => {
+      const events: any[] = []
+      for await (const event of turn.stream) {
+        events.push(event)
+        event.onPersisted?.()
+      }
+      return events
+    })()
+
+    const steer = manager.startSteerTurn({
+      chatId: "chat-1",
+      expectedTurnId: "turn-1",
+      content,
+      selectedSkills,
+      clientUserMessageId: "queued-skill",
+      transcriptEntry: steeredEntry,
+    })
+    await steer.accepted
+    await steer.settled
+    const events = await eventsPromise
+    const steerRequest = process.messages.find((message: any) => message.method === "turn/steer") as any
+    expect(steerRequest.params.input.filter((item: any) => item.type === "skill")).toEqual([
+      { type: "skill", ...selectedSkills[0] },
+    ])
+    expect(resolvedSkillCount).toBe(0)
+    expect(modelVisibleText).toBe(
+      `${content.trim()}\n\n<system-message>the user would like to use the skill available at ${selectedSkills[0]!.path}</system-message>`
+    )
+    const userEvents = events.filter((event) => event.type === "transcript" && event.entry.kind === "user_prompt")
+    expect(userEvents).toHaveLength(1)
+    expect(userEvents[0].entry).toBe(steeredEntry)
+    expect(userEvents[0].entry.content).toBe(content)
+    expect(process.messages.filter((message: any) => message.method === "turn/start")).toHaveLength(1)
+    expect(process.messages.some((message: any) => message.method === "turn/interrupt")).toBe(false)
+  })
+
+
+  test("rejects steering when the active turn completes without echoing the queued message", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-1", status: "inProgress", error: null } },
+        })
+      } else if (message.method === "turn/steer") {
+        child.writeServerMessage({ id: message.id, result: { turnId: "turn-1" } })
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: "turn-1", status: "completed", error: null },
+          },
+        })
+      }
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+    const turn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "initial prompt",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    })
+    const eventsPromise = collectStream(turn.stream)
+
+    await expect(manager.steerTurn({
+      chatId: "chat-1",
+      expectedTurnId: "turn-1",
+      content: "late follow up",
+      clientUserMessageId: "queued-late",
+      transcriptEntry: timestamped({
+        kind: "user_prompt",
+        content: "late follow up",
+        steered: true,
+      }) as Extract<ReturnType<typeof timestamped>, { kind: "user_prompt" }>,
+    })).rejects.toThrow("Codex turn ended before steering was acknowledged")
+
+    const events = await eventsPromise
+    expect(events.some((event) => event.entry?.kind === "user_prompt")).toBe(false)
+    expect(events.filter((event) => event.entry?.kind === "result")).toHaveLength(1)
+  })
 })
 
 describe("Codex shared tools", () => {
@@ -2477,4 +3226,385 @@ describe("Codex shared tools", () => {
       }
     })
   }
+})
+
+
+describe("Codex exact prompt history", () => {
+  for (const terminal of [false, true])
+    test(`gap replay forks exactly after a confirmed ${terminal ? "terminal" : "earlier"} turn`, async () => {
+      const turn = (id: string, user = true) => ({ id, status: "completed", items: user
+        ? [{ type: "userMessage", content: [{ type: "text", text: id }] }]
+        : [{ type: "contextCompaction" }] })
+      const retained = [turn("a")]
+      const original = terminal ? retained : [...retained, turn("service", false), turn("c")]
+      const process = new FakeCodexProcess((message, child) => {
+        if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: {} })
+        if (message.method === "thread/read") child.writeServerMessage({ id: message.id,
+          result: { thread: { id: message.params.threadId, turns: message.params.threadId === "source" ? original : retained } } })
+        if (message.method === "thread/fork") child.writeServerMessage({ id: message.id, result: { thread: { id: "prepared" } } })
+      })
+      const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+      try {
+        expect(manager.forkAfterTurn).toBeDefined()
+        expect(await manager.forkAfterTurn({ cwd: "/repo", threadId: "source", afterTurnId: "a", model: "gpt-5.4" })).toBe("prepared")
+        expect(process.messages.filter((m: any) => m.method === "thread/fork"))
+          .toMatchObject([{ params: { threadId: "source", lastTurnId: "a" } }])
+        expect(process.messages.some((m: any) => m.method === "thread/rollback" || m.method === "thread/revert")).toBe(false)
+      } finally { manager.stopAll() }
+    })
+  test("legacy boundary verification never opens the provider journal", async () => {
+    const turn = (id: string) => ({ id, status: "completed", items: [
+      { type: "userMessage", content: [{ type: "text", text: id }] },
+    ] })
+    const process = new FakeCodexProcess((message, child) => {
+      const reply = (result: unknown) => child.writeServerMessage({ id: message.id, result })
+      if (message.method === "initialize") reply({})
+      if (message.method === "thread/fork") reply({ thread: { id: "replacement" } })
+      if (message.method === "thread/read") reply({ thread: {
+        id: message.params.threadId, path: "/provider-journal-must-not-be-opened.jsonl",
+        turns: message.params.threadId === "source" ? [turn("prior"), turn("target"), turn("later")] : [turn("prior")],
+      } })
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    try {
+      expect(await manager.forkBeforeTurn({ cwd: "/repo", threadId: "source", beforeTurnId: "target", model: "gpt-5.4" })).toBe("replacement")
+      expect(process.messages.some((message: any) => message.method === "thread/rollback")).toBe(false)
+    } finally { manager.stopAll() }
+  })
+  test("reads every paginated native user input including mid-turn messages", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize")
+        child.writeServerMessage({ id: message.id, result: {} })
+      if (message.method === "thread/read")
+        child.writeServerMessage({
+          id: message.id,
+          result: {
+            thread: { id: "source", historyMode: "paginated", turns: [] },
+          },
+        })
+      if (message.method === "thread/turns/list")
+        child.writeServerMessage({
+          id: message.id,
+          result: {
+            data: [{ id: "turn", status: "completed", items: [] }],
+            nextCursor: null,
+          },
+        })
+      if (message.method === "thread/items/list")
+        child.writeServerMessage({
+          id: message.id,
+          result: {
+            data: [
+              {
+                turnId: "turn",
+                item: {
+                  type: "userMessage",
+                  id: message.params.cursor ? "i2" : "i1",
+                  clientId: message.params.cursor ? "p2" : "p1",
+                  content: [
+                    {
+                      type: "text",
+                      text: message.params.cursor ? "Search" : "Catalogue",
+                    },
+                  ],
+                },
+              },
+            ],
+            nextCursor: message.params.cursor ? null : "next",
+          },
+        })
+    })
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+    const history = await manager.readPromptHistory({
+      cwd: "/tmp/project",
+      threadId: "source",
+    })
+    expect(history.inputs).toEqual([
+      { turnId: "turn", userIndex: 0, promptId: "p1", text: "Catalogue" },
+      { turnId: "turn", userIndex: 1, promptId: "p2", text: "Search" },
+    ])
+    expect(process.killed).toBe(true)
+  })
+  test("forks directly before an explicit native turn, leaving original untouched", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize")
+        child.writeServerMessage({ id: message.id, result: {} })
+      if (message.method === "thread/fork")
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "replacement", turns: [] } },
+        })
+      if (message.method === "thread/read")
+        child.writeServerMessage({
+          id: message.id,
+          result: {
+            thread: {
+              id: message.params.threadId,
+              turns:
+                message.params.threadId === "source"
+                  ? [
+                      {
+                        id: "target",
+                        status: "completed",
+                        items: [
+                          {
+                            type: "userMessage",
+                            id: "i1",
+                            content: [{ type: "text", text: "Search" }],
+                          },
+                        ],
+                      },
+                    ]
+                  : [],
+            },
+          },
+        })
+    })
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+    expect(
+      await manager.forkBeforeTurn({
+        cwd: "/tmp/project",
+        threadId: "source",
+        beforeTurnId: "target",
+        model: "gpt-5.4",
+      }),
+    ).toBe("replacement")
+    expect(
+      process.messages.filter((m: any) => m.method === "thread/fork"),
+    ).toMatchObject([
+      { params: { threadId: "source", beforeTurnId: "target" } },
+    ])
+    expect(
+      process.messages.some(
+        (m: any) =>
+          m.method === "thread/revert" || m.method === "thread/rollback",
+      ),
+    ).toBe(false)
+  })
+  test("delegates stale boundary validation to Codex and propagates its error", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: {} })
+      if (message.method === "thread/fork") child.writeServerMessage({ id: message.id,
+        error: { code: -32600, message: "beforeTurnId 'missing' was not found: invalid boundary" } })
+    })
+    const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+    try {
+      await expect(manager.forkBeforeTurn({ cwd: "/repo", threadId: "source", beforeTurnId: "missing", model: "gpt-5.4" })).rejects.toThrow("invalid boundary")
+      expect(process.messages.some((m: any) => m.method === "thread/fork")).toBe(true)
+      expect(process.messages.some((m: any) => m.method === "thread/read")).toBe(false)
+      expect(process.killed).toBe(true)
+    } finally { manager.stopAll() }
+  })
+
+  for (const id of ["source", "", undefined])
+    test(`rejects an invalid fork identity ${id ?? "missing"}`, async () => {
+      const process = new FakeCodexProcess((message, child) => {
+        if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: {} })
+        if (message.method === "thread/fork") child.writeServerMessage({ id: message.id, result: { thread: { id } } })
+      })
+      const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+      try {
+        await expect(manager.forkBeforeTurn({ cwd: "/repo", threadId: "source", beforeTurnId: "target", model: "gpt-5.4" })).rejects.toThrow("isolated")
+      } finally { manager.stopAll() }
+    })
+
+})
+
+test("Codex cancelled serialized startup retires its own process before a successor starts", async () => {
+  let entered!: () => void
+  const observed = new Promise<void>(resolve => { entered = resolve })
+  const first = new FakeCodexProcess((message, child) => {
+    if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: { userAgent: "test" } })
+    if (message.method === "thread/start") entered()
+  })
+  const second = new FakeCodexProcess((message, child) => {
+    if (message.method === "initialize") child.writeServerMessage({ id: message.id, result: { userAgent: "test" } })
+    if (message.method === "thread/start") child.writeServerMessage({ id: message.id, result: { thread: { id: "successor-thread" } } })
+  })
+  let spawns = 0
+  const manager = new CodexAppServerManager({ spawnProcess: () => (spawns++ === 0 ? first : second) as never })
+  const abort = new AbortController()
+  const old = manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null, signal: abort.signal } as any)
+  const settled = old.catch(error => error)
+  try {
+    await observed
+    abort.abort()
+    expect(first.killed).toBe(true)
+    const result = await manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null })
+    expect(result).toEqual({ sessionToken: "successor-thread", resumeFellBack: false, startupOutcome: { kind: "fresh" } })
+    expect(await settled).toBeInstanceOf(Error)
+    expect(first.killed).toBe(true)
+    expect(second.killed).toBe(false)
+    expect(spawns).toBe(2)
+  } finally { manager.stopAll(); await settled }
+})
+
+class ReviewProcess extends EventEmitter {
+  readonly stdin = new PassThrough()
+  readonly stdout = new PassThrough()
+  readonly stderr = new PassThrough()
+  killed = false
+  constructor(onMessage: (message: any, child: ReviewProcess) => void) {
+    super()
+    let buffer = ""
+    this.stdin.on("data", chunk => {
+      buffer += chunk.toString()
+      const lines = buffer.split("\n")
+      buffer = lines.pop() ?? ""
+      for (const line of lines) if (line.trim()) onMessage(JSON.parse(line), this)
+    })
+  }
+  reply(id: number, result: unknown) { this.stdout.write(`${JSON.stringify({ id, result })}\n`) }
+  fail(id: number) { this.stdout.write(`${JSON.stringify({ id, error: { message: "thread/resume failed: thread not found" } })}\n`) }
+  kill() { this.killed = true; this.emit("close", 0) }
+}
+
+test("main integration: cancelling a pending native turn/start stops its owned process", async () => {
+  let entered!: () => void
+  const started = new Promise<void>(resolve => { entered = resolve })
+  const processes: ReviewProcess[] = []
+  const manager = new CodexAppServerManager({ spawnProcess: () => {
+    const child = new ReviewProcess((message, child) => {
+      if (message.method === "initialize") child.reply(message.id, {})
+      else if (message.method === "thread/start") child.reply(message.id, { thread: { id: "thread" } })
+      else if (message.method === "turn/start") entered()
+    })
+    processes.push(child)
+    return child as never
+  } })
+  const abort = new AbortController()
+  let pending: Promise<unknown> | undefined
+  try {
+    await manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null })
+    pending = manager.startTurn({ chatId: "chat", model: "gpt-5.4", content: "cancel me", planMode: false,
+      onToolRequest: async () => ({}), signal: abort.signal } as any).catch(error => error)
+    await started
+    abort.abort()
+    expect(processes[0]?.killed).toBe(true)
+    expect(await pending).toBeInstanceOf(Error)
+    await manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null })
+    expect(processes).toHaveLength(2)
+    expect(processes[1]?.killed).toBe(false)
+  } finally { manager.stopAll(); await pending }
+})
+
+test("main integration: an old native turn handle cannot interrupt its successor", async () => {
+  let turns = 0
+  const interrupts: string[] = []
+  const process = new ReviewProcess((message, child) => {
+    if (message.method === "initialize") child.reply(message.id, {})
+    else if (message.method === "thread/start") child.reply(message.id, { thread: { id: "thread" } })
+    else if (message.method === "turn/start") child.reply(message.id, { turn: { id: `turn-${++turns}` } })
+    else if (message.method === "turn/interrupt") { interrupts.push(message.params.turnId); child.reply(message.id, {}) }
+  })
+  const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+  const args = { chatId: "chat", model: "gpt-5.4", content: "go", planMode: false, onToolRequest: async () => ({}) }
+  try {
+    await manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null })
+    const old = await manager.startTurn(args)
+    process.stdout.write(`${JSON.stringify({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn-1", status: "completed", error: null } } })}\n`)
+    await collectStream(old.stream)
+    const current = await manager.startTurn(args)
+    await old.interrupt()
+    expect(interrupts).toEqual([])
+    await current.interrupt()
+    expect(interrupts).toEqual(["turn-2"])
+  } finally { manager.stopAll() }
+})
+
+test("main integration: a late native turn/start acknowledgement cannot overwrite the successor turn ID", async () => {
+  let entered!: () => void
+  const started = new Promise<void>(resolve => { entered = resolve })
+  let release!: () => void
+  let turns = 0
+  const interrupts: string[] = []
+  const process = new ReviewProcess((message, child) => {
+    if (message.method === "initialize") child.reply(message.id, {})
+    else if (message.method === "thread/start") child.reply(message.id, { thread: { id: "thread" } })
+    else if (message.method === "turn/start") {
+      if (++turns === 1) { release = () => child.reply(message.id, { turn: { id: "turn-1" } }); entered() }
+      else child.reply(message.id, { turn: { id: "turn-2" } })
+    } else if (message.method === "turn/interrupt") { interrupts.push(message.params.turnId); child.reply(message.id, {}) }
+  })
+  const manager = new CodexAppServerManager({ spawnProcess: () => process as never })
+  const args = { chatId: "chat", model: "gpt-5.4", content: "go", planMode: false, onToolRequest: async () => ({}) }
+  let pending: Promise<unknown> | undefined
+  try {
+    await manager.startSession({ chatId: "chat", cwd: "/repo", model: "gpt-5.4", sessionToken: null })
+    pending = manager.startTurn(args).catch(error => error)
+    await started
+    process.stdout.write(`${JSON.stringify({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn-1", status: "completed", error: null } } })}\n`)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const current = await manager.startTurn(args)
+    release()
+    await pending
+    await current.interrupt()
+    expect(interrupts).toEqual(["turn-2"])
+  } finally { release?.(); manager.stopAll(); await pending }
+})
+
+test("main integration: current Codex successor does not inherit cancelled initialization ownership", async () => {
+  let entered!: () => void
+  const initialized = new Promise<void>(resolve => { entered = resolve })
+  let release!: () => void
+  const processes: ReviewProcess[] = []
+  const manager = new CodexAppServerManager({ spawnProcess: () => {
+    const ordinal = processes.length
+    const child = new ReviewProcess((message, child) => {
+      if (message.method === "initialize") {
+        if (ordinal === 0) { release = () => child.reply(message.id, {}); entered() }
+        else child.reply(message.id, {})
+      } else if (message.method === "thread/start") child.reply(message.id, { thread: { id: "replacement-thread" } })
+    })
+    processes.push(child)
+    return child as never
+  } })
+  let ownsFirst = true
+  const abortFirst = new AbortController()
+  const args = { chatId: "chat", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: null }
+  const first = manager.startSession({ ...args, isCurrentTurn: () => ownsFirst, signal: abortFirst.signal }).catch(error => error)
+  try {
+    await initialized
+    ownsFirst = false
+    abortFirst.abort()
+    const second = manager.startSession({ ...args, isCurrentTurn: () => true }).catch(error => error)
+    release()
+    expect(await first).toBeInstanceOf(Error)
+    const result = await second
+    expect(result).not.toBeInstanceOf(Error)
+    expect(result).toMatchObject({ sessionToken: "replacement-thread", startupOutcome: { kind: "fresh" } })
+    expect(processes).toHaveLength(2)
+  } finally { release?.(); manager.stopSession("chat"); await first }
+})
+
+test("main integration: a fresh Codex fallback cannot count as continuation of a different requested native token", async () => {
+  const processes: ReviewProcess[] = []
+  const manager = new CodexAppServerManager({ spawnProcess: () => {
+    const ordinal = processes.length
+    const child = new ReviewProcess((message, child) => {
+      if (message.method === "initialize") child.reply(message.id, {})
+      else if (message.method === "thread/resume") child.fail(message.id)
+      else if (message.method === "thread/start") child.reply(message.id, { thread: { id: `fresh-${ordinal}` } })
+    })
+    processes.push(child)
+    return child as never
+  } })
+  let ownsFirst = true
+  const abortFirst = new AbortController()
+  const args = { chatId: "chat", cwd: "/tmp/project", model: "gpt-5.4", sessionToken: "missing-original" }
+  try {
+    const first = await manager.startSession({ ...args, isCurrentTurn: () => ownsFirst, signal: abortFirst.signal })
+    expect(first?.startupOutcome.kind).toBe("fresh")
+    ownsFirst = false // old caller cancelled before publishing native token / preparing restoration
+    abortFirst.abort()
+    const second = await manager.startSession({ ...args, isCurrentTurn: () => true })
+    expect(second?.startupOutcome.kind).toBe("fresh")
+    expect(second?.sessionToken).toBe("fresh-1")
+    expect(processes[0]?.killed).toBe(true)
+  } finally { manager.stopSession("chat") }
+
 })

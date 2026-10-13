@@ -22,6 +22,7 @@ export interface InitializeParams {
   }
   capabilities: {
     experimentalApi: boolean
+    requestAttestation?: boolean
   }
 }
 
@@ -48,6 +49,9 @@ export interface ThreadResumeParams {
 }
 
 export interface ThreadForkParams {
+  includeTurns?: boolean
+  beforeTurnId?: string
+  lastTurnId?: string
   config?: Record<string, unknown>
   threadId: string
   model?: string | null
@@ -57,6 +61,44 @@ export interface ThreadForkParams {
   sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null
   ephemeral?: boolean
   persistExtendedHistory: boolean
+}
+
+export interface ThreadRollbackParams {
+  threadId: string
+  numTurns: number
+}
+
+export interface Thread {
+  id: string
+  turns?: unknown[]
+}
+
+export interface ThreadRollbackResponse {
+  thread: Thread
+}
+
+export interface ThreadTurnsListParams {
+  threadId: string
+  cursor?: string | null
+  limit: number
+  sortDirection: "desc"
+  itemsView: "summary"
+}
+
+export interface ThreadTurnsListResponse {
+  data: Array<{ id: string; status: string; itemsView?: string; items: Array<{ type: string }> }>
+  nextCursor?: string | null
+}
+
+export interface ThreadRevertParams {
+  threadId: string
+  /** Excludes this turn and every later turn; does not revert file changes. */
+  beforeTurnId: string
+}
+
+export interface ThreadRevertResponse {
+  /** Metadata only: turns are empty, retained history is paginated separately. */
+  thread: Thread
 }
 
 export interface TextUserInput {
@@ -91,6 +133,7 @@ export interface CollaborationMode {
 export type ReasoningEffort = CodexReasoningEffort
 
 export interface TurnStartParams {
+  clientUserMessageId?: string
   threadId: string
   input: CodexUserInput[]
   approvalPolicy?: "never" | "on-request" | "on-failure" | "untrusted" | null
@@ -98,6 +141,13 @@ export interface TurnStartParams {
   effort?: ReasoningEffort | null
   serviceTier?: ServiceTier | null
   collaborationMode?: CollaborationMode | null
+}
+
+export interface TurnSteerParams {
+  threadId: string
+  input: CodexUserInput[]
+  expectedTurnId: string
+  clientUserMessageId: string
 }
 
 export interface TurnInterruptParams {
@@ -216,6 +266,10 @@ export interface TurnSummary {
 
 export interface TurnStartResponse {
   turn: TurnSummary
+}
+
+export interface TurnSteerResponse {
+  turnId: string
 }
 
 export interface ThreadStartedNotification {
@@ -397,6 +451,7 @@ export type ServerRequest =
 export interface UserMessageItem {
   type: "userMessage"
   id: string
+  clientId?: string | null
   content: Array<{
     type: "text"
     text: string
@@ -416,6 +471,8 @@ export interface AgentMessageItem {
   id: string
   text: string
   phase?: string
+  delivery?: "async" | null
+  questions?: import("../shared/codex-questions").CodexAsyncQuestion[] | null
 }
 
 export interface PlanItem {

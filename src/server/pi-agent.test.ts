@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { normalizeToolCall } from "../shared/tools"
 import {
   buildRegistryModel,
+  preparePiNativeSession,
   extractPiToolResultContent,
   normalizePiUsage,
   translatePiTool,
@@ -182,4 +183,178 @@ describe("buildRegistryModel", () => {
     })
     expect(model.compat?.thinkingFormat).toBe("openai")
   })
+})
+
+
+describe("Pi native startup outcome", () => {
+  test("classifies real loaded, forked and missing context before any prompt", async () => {
+    const { SessionManager } = await import("@mariozechner/pi-coding-agent")
+    const { mkdtemp, rm } = await import("node:fs/promises")
+    const { tmpdir } = await import("node:os")
+    const { join } = await import("node:path")
+    const dir = await mkdtemp(join(tmpdir(), "pi-outcome-"))
+    try {
+      const native = SessionManager.create(dir, dir)
+      native.appendMessage({ role: "user", content: "old", timestamp: 1 })
+      native.appendMessage({ role: "assistant", content: [{ type: "text", text: "reply" }], api: "openai-completions", provider: "openai", model: "test", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 2 })
+      const token = native.getSessionFile()!
+      const resumed = preparePiNativeSession(SessionManager, { cwd: dir, sessionsDir: dir, sessionToken: token, forkSession: false })
+      expect(resumed.startupOutcome).toEqual({ kind: "resumed" })
+      expect(resumed.sessionManager.getSessionId()).toBe(native.getSessionId())
+      const forked = preparePiNativeSession(SessionManager, { cwd: dir, sessionsDir: dir, sessionToken: token, forkSession: true })
+      expect(forked.startupOutcome).toEqual({ kind: "forked" })
+      expect(forked.sessionManager.getSessionId()).not.toBe(native.getSessionId())
+      expect(forked.sessionManager.getBranch()).toEqual(native.getBranch())
+      await rm(token)
+      expect(preparePiNativeSession(SessionManager, { cwd: dir, sessionsDir: dir, sessionToken: token, forkSession: false }).startupOutcome).toEqual({ kind: "fresh" })
+    } finally { await rm(dir, { recursive: true, force: true }) }
+  }, 120000)
+
+  test("does not silently truncate a corrupt native resume artifact", async () => {
+    const { SessionManager } = await import("@mariozechner/pi-coding-agent")
+    const { mkdtemp, rm, writeFile, readFile } = await import("node:fs/promises")
+    const { tmpdir } = await import("node:os")
+    const { join } = await import("node:path")
+    const dir = await mkdtemp(join(tmpdir(), "pi-corrupt-"))
+    const token = join(dir, "corrupt.jsonl")
+    try {
+      await writeFile(token, "{broken native artifact")
+      expect(() => preparePiNativeSession(SessionManager, { cwd: dir, sessionsDir: dir, sessionToken: token, forkSession: false })).toThrow("Cannot verify Pi session")
+      expect(await readFile(token, "utf8")).toBe("{broken native artifact")
+    } finally { await rm(dir, { recursive: true, force: true }) }
+  })
+})
+
+test("Pi rejects a misplaced native header and preserves its original bytes", async () => {
+  const { SessionManager } = await import("@mariozechner/pi-coding-agent")
+  const { mkdtemp, rm, writeFile, readFile } = await import("node:fs/promises")
+  const { tmpdir } = await import("node:os")
+  const { join } = await import("node:path")
+  const dir = await mkdtemp(join(tmpdir(), "pi-header-"))
+  const token = join(dir, "misplaced.jsonl")
+  const original = JSON.stringify({ type: "message", id: "u", parentId: null, message: { role: "user", content: "kept", timestamp: 1 } }) + "\n" + JSON.stringify({ type: "session", id: "native-id", version: 3, cwd: dir, timestamp: new Date().toISOString() }) + "\n"
+  try {
+    await writeFile(token, original)
+    expect(() => preparePiNativeSession(SessionManager, { cwd: dir, sessionsDir: dir, sessionToken: token, forkSession: false })).toThrow("Cannot verify Pi session")
+    expect(await readFile(token, "utf8")).toBe(original)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+}, 120000)
+
+test("Pi refuses an unverifiable legacy fork before creating a truncated native copy", async () => {
+  const { SessionManager } = await import("@mariozechner/pi-coding-agent")
+  const { mkdtemp, rm, writeFile, readdir } = await import("node:fs/promises")
+  const { tmpdir } = await import("node:os")
+  const { join } = await import("node:path")
+  const dir = await mkdtemp(join(tmpdir(), "pi-legacy-"))
+  const token = join(dir, "legacy.jsonl")
+  const original = [
+    { type: "session", id: "legacy", version: 1, cwd: dir, timestamp: new Date().toISOString() },
+    { type: "message", message: { role: "user", content: "first", timestamp: 1 } },
+    { type: "message", message: { role: "user", content: "second", timestamp: 2 } },
+  ].map(value => JSON.stringify(value)).join("\n") + "\n"
+  try {
+    await writeFile(token, original)
+    expect(() => preparePiNativeSession(SessionManager, { cwd: dir, sessionsDir: dir, sessionToken: token, forkSession: true })).toThrow("Cannot verify Pi session")
+    expect(await readdir(dir)).toEqual(["legacy.jsonl"])
+  } finally { await rm(dir, { recursive: true, force: true }) }
+}, 120000)
+
+test("Pi warm native reuse waits for lazy content preparation before accepting input", async () => {
+  const { PiAgentManager } = await import("./pi-agent")
+  const manager = new PiAgentManager({ dataDir: "/unused/pi-test" })
+  const prompts: string[] = []
+  let prepared!: () => void
+  const blocked = new Promise<void>(resolve => { prepared = resolve })
+  const session = {
+    isStreaming: false, messages: [], sessionFile: "/missing/native/session.jsonl",
+    subscribe: () => () => {}, prompt: async (content: string) => { prompts.push(content) }, dispose: () => {},
+  }
+  ;(manager as any).sessions.set("chat", { session, authStorage: { setRuntimeApiKey: () => {} },
+    cwd: "/repo", model: "model", effort: "off", connectionProvider: "openrouter", connectionBaseUrl: "https://example.invalid", promptAgentId: "pi/model" })
+  let observed: unknown
+  const starting = manager.startTurn({ chatId: "chat", cwd: "/repo", content: "unprepared", model: "model", effort: "off", sessionToken: session.sessionFile, forkSession: false,
+    connection: { provider: "openrouter", apiKey: "unused", baseUrl: "https://example.invalid" },
+    prepareContent: async outcome => { observed = outcome; await blocked; return "prepared" },
+  })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  expect(observed).toEqual({ kind: "reused" })
+  expect(prompts).toEqual([])
+  prepared()
+  const turn = await starting
+  expect(prompts[0]).toContain("prepared")
+  expect(prompts[0]).not.toContain("unprepared")
+  turn.close()
+  manager.dispose()
+})
+
+test("Pi detects a legacy native history replacement during the actual open", async () => {
+  const { SessionManager } = await import("@mariozechner/pi-coding-agent")
+  const { mkdtemp, rm, writeFile } = await import("node:fs/promises")
+  const { writeFileSync } = await import("node:fs")
+  const { tmpdir } = await import("node:os")
+  const { join } = await import("node:path")
+  const dir = await mkdtemp(join(tmpdir(), "pi-legacy-change-"))
+  const token = join(dir, "legacy.jsonl")
+  const header = JSON.stringify({ type: "session", id: "legacy", version: 1, cwd: dir, timestamp: new Date().toISOString() })
+  const source = header + "\n" + JSON.stringify({ type: "message", message: { role: "user", content: "original", timestamp: 1 } }) + "\n"
+  try {
+    await writeFile(token, source)
+    const nativeApi = { open: () => { writeFileSync(token, source.replace("original", "different")); return SessionManager.open(token, dir, dir) } }
+    expect(() => preparePiNativeSession(nativeApi as never, { cwd: dir, sessionsDir: dir, sessionToken: token, forkSession: false })).toThrow("Cannot verify Pi session")
+  } finally { await rm(dir, { recursive: true, force: true }) }
+}, 120000)
+
+for (const replacement of [false, true]) {
+  test(`Pi cancelled preparation disposes only its newly owned unsent handle (replacement=${replacement})`, async () => {
+    const { PiAgentManager } = await import("./pi-agent")
+    const manager = new PiAgentManager({ dataDir: "/unused/pi-test" })
+    let release!: () => void, entered!: () => void
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const observed = new Promise<void>(resolve => { entered = resolve })
+    let current = true, disposed = 0, replacementDisposed = 0
+    const prompts: string[] = []
+    const native = { session: { isStreaming: false, dispose: () => { disposed++ }, prompt: async (content: string) => { prompts.push(content) } }, startupOutcome: { kind: "fresh" } }
+    const next = { session: { dispose: () => { replacementDisposed++ } } }
+    ;(manager as any).openSession = async () => { (manager as any).sessions.set("chat", native); return native }
+    const starting = manager.startTurn({ chatId: "chat", cwd: "/repo", content: "unprepared", model: "model", effort: "off", sessionToken: null, forkSession: false,
+      connection: { provider: "openrouter", apiKey: "unused", baseUrl: "https://example.invalid" }, isCurrentTurn: () => current,
+      prepareContent: async () => { entered(); await blocked; return "cancelled input" },
+    })
+    try {
+      await observed
+      current = false
+      if (replacement) (manager as any).sessions.set("chat", next)
+      release()
+      await expect(starting).rejects.toThrow("cancelled or replaced")
+      expect(prompts).toEqual([])
+      expect(disposed).toBe(1)
+      expect(replacementDisposed).toBe(0)
+      expect((manager as any).sessions.get("chat")).toBe(replacement ? next : undefined)
+    } finally { release(); await starting.catch(() => {}); manager.dispose() }
+  })
+}
+
+test("Pi cancellation while aborting an old streaming run prevents the prepared input", async () => {
+  const { PiAgentManager } = await import("./pi-agent")
+  const manager = new PiAgentManager({ dataDir: "/unused/pi-test" })
+  let release!: () => void, entered!: () => void
+  const blocked = new Promise<void>(resolve => { release = resolve })
+  const observed = new Promise<void>(resolve => { entered = resolve })
+  let current = true, disposed = 0
+  const prompts: string[] = []
+  const session = { isStreaming: true, dispose: () => { disposed++ }, abort: async () => { entered(); await blocked }, prompt: async (content: string) => { prompts.push(content) } }
+  const native = { session, startupOutcome: { kind: "reused" } }
+  ;(manager as any).sessions.set("chat", native)
+  ;(manager as any).openSession = async () => native
+  const starting = manager.startTurn({ chatId: "chat", cwd: "/repo", content: "unprepared", model: "model", effort: "off", sessionToken: null, forkSession: false,
+    connection: { provider: "openrouter", apiKey: "unused", baseUrl: "https://example.invalid" }, isCurrentTurn: () => current,
+    prepareContent: async () => "prepared input",
+  })
+  try {
+    await observed; current = false; release()
+    await expect(starting).rejects.toThrow("cancelled or replaced")
+    expect(prompts).toEqual([])
+    expect(disposed).toBe(0)
+    expect((manager as any).sessions.get("chat")).toBe(native)
+  } finally { release(); await starting.catch(() => {}); manager.dispose() }
 })

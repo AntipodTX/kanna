@@ -1,3 +1,4 @@
+const CODEX_APPROVAL_POLICY = "never" as const
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { createInterface } from "node:readline"
@@ -10,7 +11,7 @@ import type {
   TodoItem,
   TranscriptEntry,
 } from "../shared/types"
-import type { HarnessEvent, HarnessToolRequest, HarnessTurn } from "./harness-types"
+import type { HarnessEvent, HarnessStartupOutcome, HarnessToolRequest, HarnessTurn } from "./harness-types"
 import { appendSystemMessageBlock, buildSkillSystemMessage } from "./harness-skills"
 import { buildKannaAgentId } from "./attribution"
 import { buildKannaSystemInstructions } from "./harness-instructions"
@@ -19,6 +20,8 @@ import type { KannaToolHost } from "./kanna-tools"
 import { createKannaMcpServer } from "./kanna-mcp"
 import { asNumber, asRecord } from "../shared/json"
 import { timestamped } from "./transcript"
+import type { CodexNativeInput } from "./codex-prompt-history"
+import { codexAsyncQuestionTool } from "../shared/codex-questions"
 import {
   type AccountRateLimitsUpdatedNotification,
   type CollabAgentToolCallItem,
@@ -51,7 +54,14 @@ import {
   type ModelListResponse,
   type SkillsListParams,
   type SkillsListResponse,
+  type Thread,
   type ThreadItem,
+  type ThreadRollbackParams,
+  type ThreadRollbackResponse,
+  type ThreadTurnsListParams,
+  type ThreadTurnsListResponse,
+  type ThreadRevertParams,
+  type ThreadRevertResponse,
   type ThreadResumeParams,
   type ThreadResumeResponse,
   type ThreadForkParams,
@@ -68,6 +78,8 @@ import {
   type TurnInterruptParams,
   type TurnStartParams,
   type TurnStartResponse,
+  type TurnSteerParams,
+  type TurnSteerResponse,
   isJsonRpcResponse,
   isServerNotification,
   isServerRequest,
@@ -93,6 +105,17 @@ interface PendingRequest<TResult> {
   reject: (error: Error) => void
 }
 
+type UserPromptTranscriptEntry = Extract<TranscriptEntry, { kind: "user_prompt" }>
+
+interface PendingSteeredEntry {
+  entry: UserPromptTranscriptEntry
+  echoReceived: boolean
+  settled: boolean
+  persisted: Promise<void>
+  resolvePersisted: () => void
+  rejectPersisted: (error: Error) => void
+}
+
 interface PendingTurn {
   turnId: string | null
   model: string
@@ -113,6 +136,7 @@ interface PendingTurn {
    * notification that follows can be empty.
    */
   retryCause: CodexError | null
+  pendingSteeredEntries: Map<string, PendingSteeredEntry>
   resolved: boolean
   onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
   onApprovalRequest?: (
@@ -142,7 +166,16 @@ interface SessionContext {
   closed: boolean
 }
 
+interface NativePromptHistoryThread {
+  id: string
+  path?: string
+  historyMode?: string
+  turns?: Array<{id:string;status:string;completedAt?:number|null;items:Array<{type:string;clientId?:string;content?:Array<{type:string;text?:string}>}>}>
+}
+
 export interface StartCodexSessionArgs {
+  isCurrentTurn?: () => boolean
+  signal?: AbortSignal
   customTools?: KannaToolHost
   chatId: string
   cwd: string
@@ -153,6 +186,9 @@ export interface StartCodexSessionArgs {
 }
 
 export interface StartCodexTurnArgs {
+  isCurrentTurn?: () => boolean
+  signal?: AbortSignal
+  clientUserMessageId?: string
   chatId: string
   model: string
   effort?: CodexReasoningEffort
@@ -170,6 +206,22 @@ export interface StartCodexTurnArgs {
   planMode: boolean
   onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
   onApprovalRequest?: PendingTurn["onApprovalRequest"]
+}
+
+export interface SteerCodexTurnArgs {
+  chatId: string
+  expectedTurnId: string
+  content: string
+  selectedSkills?: { name: string; path: string }[]
+  clientUserMessageId: string
+  transcriptEntry: UserPromptTranscriptEntry
+}
+
+export interface CodexSteerHandle {
+  /** Resolves when Codex accepts the turn/steer request. */
+  accepted: Promise<void>
+  /** Resolves only after the correlated userMessage has been persisted. */
+  settled: Promise<void>
 }
 
 export interface GenerateStructuredArgs {
@@ -195,6 +247,20 @@ function codexSystemInitEntry(model: string): TranscriptEntry {
 function errorMessage(value: unknown): string {
   if (value instanceof Error) return value.message
   return String(value)
+}
+
+export class CodexRequestError extends Error {
+  constructor(readonly method: string, readonly code: number | undefined, message: string) {
+    super(`${method} failed: ${message}`)
+  }
+}
+
+/** Only an actual provider rejection of a selected turn proves a stale
+ * boundary. Socket/auth failures and unsupported methods do not. */
+export function isMissingCodexHistoryBoundary(error: unknown): boolean {
+  if (!(error instanceof CodexRequestError) || error.method !== "thread/fork") return false
+  if (/\b(?:auth\w*|unauthorized|forbidden|unsupported|schema)\b|unknown field|unknown parameter|unrecognized field|invalid type/i.test(error.message)) return false
+  return /\b(?:beforeTurnId|lastTurnId|turn|boundary)\b.*?(?:not found|does not exist|missing|unknown)|\b(?:missing|unknown|no such)\b.*?\b(?:turn|boundary)\b/i.test(error.message)
 }
 
 /**
@@ -757,6 +823,10 @@ function itemToToolResults(item: ThreadItem): TranscriptEntry[] {
 
 export class CodexAppServerManager {
   private readonly sessions = new Map<string, SessionContext>()
+  private readonly sessionStarts = new Map<
+    string,
+    Promise<{ sessionToken: string; resumeFellBack: boolean; startupOutcome: HarnessStartupOutcome }>
+  >()
   private readonly spawnProcess: SpawnCodexAppServer
   private onRateLimits: ((snapshot: CodexRateLimitSnapshot) => void) | null = null
 
@@ -797,14 +867,7 @@ export class CodexAppServerManager {
       this.sendRequest<GetAccountRateLimitsResponse>(context, "account/rateLimits/read", {}))
   }
 
-  /**
-   * The models the signed-in account can run, from `model/list`. Reuses a
-   * live session's app-server process when one exists; otherwise spawns a
-   * short-lived probe. Hidden rows (internal models the picker should not
-   * show) are left out. Returns null only when Codex is unusable (binary
-   * missing). Throws on protocol errors, including "method not found" from a
-   * codex older than model/list — callers keep the static catalog then.
-   */
+  
   async listModels(probeCwd: string): Promise<CodexModelSummary[] | null> {
     for (const context of this.sessions.values()) {
       if (context.closed) continue
@@ -868,13 +931,338 @@ export class CodexAppServerManager {
     }
   }
 
-  async startSession(args: StartCodexSessionArgs) {
-    const existing = this.sessions.get(args.chatId)
-    if (existing && !existing.closed && existing.cwd === args.cwd && !args.pendingForkSessionToken) {
-      return
+  /** Read full native user history for an explicit history action, never for ordinary send. */
+  async readPromptHistory(args: {
+    cwd: string
+    threadId: string
+  }): Promise<{ inputs: CodexNativeInput[]; path?: string; historyMode?: "paginated" }> {
+    return this.withUtilityContext(args.cwd, (context) =>
+      this.readPromptHistoryInContext(context, args.threadId),
+    )
+  }
+
+  private async readPromptHistoryInContext(
+    context: SessionContext,
+    threadId: string,
+  ) {
+    const response = await this.sendRequest<{
+      thread: NativePromptHistoryThread
+    }>(context, "thread/read", { threadId, includeTurns: true })
+    const thread = response.thread
+    if (thread?.id !== threadId)
+      throw new Error("Codex returned a different thread history")
+    const inputs: CodexNativeInput[] = []
+    const historyTurns: Array<{ id: string; items: unknown[] }> = []
+    const orderedItems: Array<{ turnId: string; item: unknown; startedAtMs?: number }> = []
+    const completedAtUpperBounds = new Map<string, number>()
+    const addItems = (
+      turnId: string,
+      items: Array<{
+        type: string
+        clientId?: string
+        content?: Array<{ type: string; text?: string }>
+      }>,
+    ) => {
+      historyTurns.push({
+        id: turnId,
+        items: items.map((item) => {
+          const { id: _id, ...content } = item as typeof item & { id?: string }
+          return content
+        }),
+      })
+      let userIndex = 0
+      for (const item of items) {
+        if (item.type !== "userMessage") continue
+        if (!Array.isArray(item.content))
+          throw new Error("Incomplete Codex user history")
+        inputs.push({
+          turnId,
+          userIndex: userIndex++,
+          text: item.content
+            .filter((block) => block.type === "text")
+            .map((block) => block.text ?? "")
+            .join("\n"),
+          ...(item.clientId ? { promptId: item.clientId } : {}),
+        })
+      }
+    }
+    const validateTurn = (turn: { id: string; status: string; completedAt?: number | null }) => {
+      if (
+        !turn.id ||
+        !["completed", "failed", "interrupted"].includes(turn.status)
+      )
+        throw new Error(
+          "Cannot read stable Codex history while a turn is running or invalid",
+        )
+      // Turn timestamps have second precision; item timestamps have millisecond
+      // precision. Only the next whole second proves an item was created later.
+      if (typeof turn.completedAt === "number" && turn.completedAt >= 0 &&
+        Number.isSafeInteger(turn.completedAt) && Number.isSafeInteger((turn.completedAt + 1) * 1000))
+        completedAtUpperBounds.set(turn.id, (turn.completedAt + 1) * 1000)
+    }
+    if (thread.historyMode !== "paginated") {
+      if (!Array.isArray(thread.turns))
+        throw new Error("Incomplete Codex thread history")
+      const seen = new Set<string>()
+      for (const turn of thread.turns) {
+        validateTurn(turn)
+        if (seen.has(turn.id) || !Array.isArray(turn.items))
+          throw new Error("Invalid Codex turn history")
+        seen.add(turn.id)
+        addItems(turn.id, turn.items)
+      }
+    } else {
+      const turns: Array<{ id: string; status: string; completedAt?: number | null }> = []
+      const seen = new Set<string>()
+      const cursors = new Set<string>()
+      let cursor: string | undefined
+      do {
+        const page = await this.sendRequest<{
+          data: Array<{ id: string; status: string; completedAt?: number | null }>
+          nextCursor?: string | null
+        }>(context, "thread/turns/list", {
+          threadId,
+          cursor,
+          limit: 100,
+          sortDirection: "asc",
+          itemsView: "summary",
+        })
+        if (!Array.isArray(page.data))
+          throw new Error("Incomplete Codex turn page")
+        for (const turn of page.data) {
+          validateTurn(turn)
+          if (seen.has(turn.id)) throw new Error("Repeated Codex turn history")
+          seen.add(turn.id)
+          turns.push(turn)
+        }
+        cursor = page.nextCursor ?? undefined
+        if (cursor) {
+          if (cursors.has(cursor) || !page.data.length)
+            throw new Error("Repeated or empty Codex turn page")
+          cursors.add(cursor)
+        }
+      } while (cursor)
+      // Page across the thread to retain persistence order. A background result
+      // can belong to an earlier turn while being first recorded in a later one.
+      type Item = {
+        type: string
+        clientId?: string
+        content?: Array<{ type: string; text?: string }>
+      }
+      const byTurn = new Map(turns.map((turn) => [turn.id, [] as Item[]]))
+      const itemCursors = new Set<string>()
+      type ItemPage = {
+        data: Array<{ turnId: string; item: Item; startedAtMs?: number | null }>
+        nextCursor?: string | null
+      }
+      cursor = undefined
+      do {
+        const page: ItemPage = await this.sendRequest<ItemPage>(context, "thread/items/list", {
+          threadId,
+          cursor,
+          limit: 100,
+          sortDirection: "asc",
+        })
+        if (
+          !Array.isArray(page.data) ||
+          page.data.some((entry) => !byTurn.has(entry.turnId) || !entry.item)
+        )
+          throw new Error("Incomplete Codex item page")
+        for (const entry of page.data) {
+          byTurn.get(entry.turnId)!.push(entry.item)
+          const { id: _id, ...item } = entry.item as Item & { id?: string }
+          orderedItems.push({ turnId: entry.turnId, item,
+            ...(typeof entry.startedAtMs === "number" && entry.startedAtMs >= 0 && Number.isSafeInteger(entry.startedAtMs)
+              ? { startedAtMs: entry.startedAtMs } : {}),
+          })
+        }
+        cursor = page.nextCursor ?? undefined
+        if (cursor) {
+          if (itemCursors.has(cursor) || !page.data.length)
+            throw new Error("Repeated or empty Codex item page")
+          itemCursors.add(cursor)
+        }
+      } while (cursor)
+      for (const turn of turns) addItems(turn.id, byTurn.get(turn.id)!)
+    }
+    return {
+      inputs,
+      turns: historyTurns,
+      completedAtUpperBounds,
+      ...(thread.historyMode === "paginated" ? { historyMode: "paginated" as const, orderedItems } : {}),
+      ...(typeof thread.path === "string" ? { path: thread.path } : {}),
+    }
+  }
+
+  /** Prepare an isolated replacement at a saved canonical turn boundary. */
+  async forkBeforeTurn(args: {
+    cwd: string
+    threadId: string
+    beforeTurnId: string
+    model: string
+    serviceTier?: ServiceTier
+  }) {
+    return this.forkAtTurnBoundary(args)
+  }
+
+  async forkAfterTurn(args: {
+    cwd: string
+    threadId: string
+    afterTurnId: string
+    model: string
+    serviceTier?: ServiceTier
+  }) {
+    return this.forkAtTurnBoundary(args)
+  }
+
+  private async forkAtTurnBoundary(args: {
+    cwd: string
+    threadId: string
+    beforeTurnId?: string
+    afterTurnId?: string
+    model: string
+    serviceTier?: ServiceTier
+  }) {
+    return this.withUtilityContext(args.cwd, async (context) => {
+      const boundary: Pick<ThreadForkParams, "beforeTurnId" | "lastTurnId"> =
+        args.afterTurnId ? { lastTurnId: args.afterTurnId } : { beforeTurnId: args.beforeTurnId }
+      // Codex validates and applies the saved turn boundary. Loading both
+      // histories here would defeat the purpose of durable prompt bindings.
+      const response = await this.sendRequest<ThreadForkResponse>(context, "thread/fork", {
+        threadId: args.threadId, ...boundary, includeTurns: false,
+        model: args.model, cwd: args.cwd, serviceTier: args.serviceTier,
+        approvalPolicy: CODEX_APPROVAL_POLICY, sandbox: "danger-full-access",
+        persistExtendedHistory: true,
+      } satisfies ThreadForkParams)
+      const threadId = response.thread?.id
+      if (!threadId || threadId === args.threadId)
+        throw new Error("Codex did not return an isolated forked session")
+      return threadId
+    })
+  }
+
+  async rollbackThread(args: { chatId?: string; cwd: string; threadId: string; numTurns: number }): Promise<Thread> {
+    if (!Number.isSafeInteger(args.numTurns) || args.numTurns < 1) {
+      throw new Error("Codex history rollback requires a positive integer number of turns")
+    }
+    const activeContext = args.chatId ? this.sessions.get(args.chatId) : null
+    if (activeContext && !activeContext.closed && activeContext.cwd === args.cwd && activeContext.sessionToken === args.threadId) {
+      if (activeContext.pendingTurn) {
+        throw new Error("Cannot rollback Codex thread while a turn is running")
+      }
+      return await this.rollbackThreadInContext(activeContext, args.threadId, args.numTurns)
     }
 
-    if (existing) {
+    return await this.withUtilityContext(args.cwd, async (context) => {
+      await this.sendRequest<ThreadResumeResponse>(context, "thread/resume", {
+        threadId: args.threadId,
+        cwd: args.cwd,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+        persistExtendedHistory: true,
+      } satisfies ThreadResumeParams)
+      return await this.rollbackThreadInContext(context, args.threadId, args.numTurns)
+    })
+  }
+
+  private async rollbackThreadInContext(context: SessionContext, threadId: string, numTurns: number): Promise<Thread> {
+    try {
+      const beforeTurnId = await this.findRevertBoundary(context, threadId, numTurns)
+      if (context.pendingTurn) {
+        throw new Error("Cannot rollback Codex thread while a turn is running")
+      }
+      const response = await this.sendRequest<ThreadRevertResponse>(context, "thread/revert", {
+        threadId,
+        beforeTurnId,
+      } satisfies ThreadRevertParams)
+      return response.thread
+    } catch (error) {
+      // Only an explicit unsupported method permits a legacy fallback. An
+      // ordinary revert failure may have already changed the durable history.
+      const unsupported = error instanceof CodexRequestError
+        && (error.method === "thread/turns/list" || error.method === "thread/revert")
+        && (error.code === -32601 || (error.code === -32600
+          && error.message.includes(`unknown variant \`${error.method}\``)))
+      if (!unsupported) throw error
+    }
+    if (context.pendingTurn) {
+      throw new Error("Cannot rollback Codex thread while a turn is running")
+    }
+    const response = await this.sendRequest<ThreadRollbackResponse>(context, "thread/rollback", {
+      threadId,
+      numTurns,
+    } satisfies ThreadRollbackParams)
+    return response.thread
+  }
+
+  private async findRevertBoundary(context: SessionContext, threadId: string, numTurns: number) {
+    // New Codex versions use an exclusive turn-id boundary instead of a count.
+    // Kanna counts user prompts, but native history also contains standalone
+    // compaction/service turns. Summary includes the first user item without
+    // loading tool payloads; only user-bearing turns advance the prompt count.
+    // Refuse ambiguous history instead of guessing a destructive boundary.
+    const turnIds = new Set<string>()
+    const cursors = new Set<string>()
+    let userTurnCount = 0
+    let cursor: string | undefined
+    let beforeTurnId: string | undefined
+    while (!beforeTurnId) {
+      const page = await this.sendRequest<ThreadTurnsListResponse>(context, "thread/turns/list", {
+        threadId,
+        ...(cursor === undefined ? {} : { cursor }),
+        limit: Math.min(100, numTurns - userTurnCount),
+        sortDirection: "desc",
+        itemsView: "summary",
+      } satisfies ThreadTurnsListParams)
+      if (!Array.isArray(page?.data) || page.data.length === 0) {
+        throw new Error("Cannot determine Codex rollback boundary: missing turn history")
+      }
+      for (const turn of page.data) {
+        if (typeof turn?.id !== "string" || !turn.id.trim() || turnIds.has(turn.id)) {
+          throw new Error("Cannot determine Codex rollback boundary: invalid or duplicate turn ID")
+        }
+        if (turn.status === "inProgress") {
+          throw new Error("Cannot rollback Codex thread while a turn is running")
+        }
+        if (turn.status !== "completed" && turn.status !== "interrupted" && turn.status !== "failed") {
+          throw new Error("Cannot determine Codex rollback boundary: invalid turn status")
+        }
+        if ((turn.itemsView !== undefined && turn.itemsView !== "summary" && turn.itemsView !== "full")
+          || !Array.isArray(turn.items)
+          || turn.items.some((item) => typeof item?.type !== "string" || !item.type)) {
+          throw new Error("Cannot determine Codex rollback boundary: missing turn items")
+        }
+        turnIds.add(turn.id)
+        if (turn.items.some((item) => item.type === "userMessage")) userTurnCount += 1
+        if (userTurnCount === numTurns) {
+          beforeTurnId = turn.id
+          break
+        }
+      }
+      if (beforeTurnId) break
+      if (typeof page.nextCursor !== "string" || !page.nextCursor || cursors.has(page.nextCursor)) {
+        throw new Error("Cannot determine Codex rollback boundary: incomplete or repeated history page")
+      }
+      cursor = page.nextCursor
+      cursors.add(cursor)
+    }
+    return beforeTurnId
+  }
+
+  async startSession(args: StartCodexSessionArgs) {
+    args.signal?.throwIfAborted()
+    const existing = this.sessions.get(args.chatId)
+    if (existing && !existing.closed && existing.cwd === args.cwd && !args.pendingForkSessionToken
+      && (!existing.sessionToken || !args.sessionToken || existing.sessionToken === args.sessionToken)) {
+      if (existing.sessionToken) {
+        return { sessionToken: existing.sessionToken, resumeFellBack: false, startupOutcome: { kind: "reused" as const } }
+      }
+      const sessionStart = this.sessionStarts.get(args.chatId)
+      if (sessionStart) {
+        return await sessionStart
+      }
+      this.stopSession(args.chatId)
+    } else if (existing) {
       this.stopSession(args.chatId)
     }
 
@@ -894,7 +1282,18 @@ export class CodexAppServerManager {
     this.sessions.set(args.chatId, context)
     this.attachListeners(context)
 
-    try {
+    const assertCurrent = () => {
+      if (context.closed || this.sessions.get(args.chatId) !== context || (args.isCurrentTurn && !args.isCurrentTurn())) {
+        throw new Error("Codex startup was cancelled or replaced")
+      }
+    }
+    const onStartupAbort = () => {
+      if (this.sessions.get(args.chatId) === context) this.stopSession(args.chatId)
+    }
+    args.signal?.addEventListener("abort", onStartupAbort, { once: true })
+    if (args.signal?.aborted) onStartupAbort()
+    const sessionStart = (async () => {
+      try {
       await this.sendRequest(context, "initialize", {
         clientInfo: {
           name: "kanna_desktop",
@@ -905,9 +1304,10 @@ export class CodexAppServerManager {
           experimentalApi: true,
         },
       } satisfies InitializeParams)
+      assertCurrent()
       this.writeMessage(context, {
-        method: "initialized",
-      })
+          method: "initialized",
+        })
 
       // Resume and fork accept MCP config, but this CLI only accepts dynamic tools on thread/start.
       const toolConfig = customTools ? {
@@ -926,7 +1326,7 @@ export class CodexAppServerManager {
         approvalPolicy: "never",
         sandbox: "danger-full-access",
         experimentalRawEvents: false,
-        persistExtendedHistory: false,
+        persistExtendedHistory: true,
         ...toolConfig,
       } satisfies ThreadStartParams
 
@@ -943,7 +1343,7 @@ export class CodexAppServerManager {
           serviceTier: args.serviceTier,
           approvalPolicy: "never",
           sandbox: "danger-full-access",
-          persistExtendedHistory: false,
+          persistExtendedHistory: true,
           ...toolConfig,
         } satisfies ThreadForkParams)
       } else if (args.sessionToken) {
@@ -955,14 +1355,15 @@ export class CodexAppServerManager {
             serviceTier: args.serviceTier,
             approvalPolicy: "never",
             sandbox: "danger-full-access",
-            persistExtendedHistory: false,
+            persistExtendedHistory: true,
             ...toolConfig,
           } satisfies ThreadResumeParams)
         } catch (error) {
           if (!isRecoverableResumeError(error)) {
-            this.stopSession(args.chatId)
+            if (this.sessions.get(args.chatId) === context) this.stopSession(args.chatId)
             throw error
           }
+          assertCurrent()
           response = await this.sendRequest<ThreadStartResponse>(context, "thread/start", threadParams)
           resumeFellBack = true
         }
@@ -970,16 +1371,39 @@ export class CodexAppServerManager {
         response = await this.sendRequest<ThreadStartResponse>(context, "thread/start", threadParams)
       }
 
+      assertCurrent()
       context.sessionToken = response.thread.id
-      return { sessionToken: context.sessionToken, resumeFellBack }
-    } catch (error) {
-      this.stopSession(args.chatId)
-      throw error
+      return { sessionToken: context.sessionToken, resumeFellBack, startupOutcome: {
+          kind: args.pendingForkSessionToken ? "forked" as const : resumeFellBack || !args.sessionToken ? "fresh" as const : "resumed" as const,
+        } }
+      } catch (error) {
+        if (this.sessions.get(args.chatId) === context) this.stopSession(args.chatId)
+        throw error
+      }
+    })()
+    this.sessionStarts.set(args.chatId, sessionStart)
+    try { return await sessionStart } finally {
+      args.signal?.removeEventListener("abort", onStartupAbort)
+      if (this.sessionStarts.get(args.chatId) === sessionStart) {
+        this.sessionStarts.delete(args.chatId)
+      }
     }
   }
 
   async startTurn(args: StartCodexTurnArgs): Promise<HarnessTurn> {
     const context = this.requireSession(args.chatId)
+    const assertOwner = () => {
+      if (args.signal?.aborted || (args.isCurrentTurn && !args.isCurrentTurn())) {
+        throw new Error("Codex turn startup was cancelled or replaced")
+      }
+    }
+    const assertCurrent = () => {
+      assertOwner()
+      if (context.closed || this.sessions.get(args.chatId) !== context) {
+        throw new Error("Codex turn startup was cancelled or replaced")
+      }
+    }
+    assertCurrent()
     if (context.pendingTurn) {
       throw new Error("Codex turn is already running")
     }
@@ -1004,13 +1428,21 @@ export class CodexAppServerManager {
       todoSequence: 0,
       pendingWebSearchResultToolId: null,
       retryCause: null,
+      pendingSteeredEntries: new Map(),
       resolved: false,
       onToolRequest: args.onToolRequest,
       onApprovalRequest: args.onApprovalRequest,
     }
     context.pendingTurn = pendingTurn
+    const onStartupAbort = () => {
+      if (this.sessions.get(args.chatId) === context && context.pendingTurn === pendingTurn) {
+        this.stopSession(args.chatId)
+      }
+    }
+    args.signal?.addEventListener("abort", onStartupAbort, { once: true })
 
     try {
+      assertCurrent()
       const input: CodexUserInput[] = [
         {
           type: "text",
@@ -1025,6 +1457,7 @@ export class CodexAppServerManager {
       }
       const response = await this.sendRequest<TurnStartResponse>(context, "turn/start", {
         threadId: context.sessionToken ?? "",
+        clientUserMessageId: args.clientUserMessageId,
         input,
         approvalPolicy: "never",
         model: args.model,
@@ -1042,26 +1475,28 @@ export class CodexAppServerManager {
           },
         },
       } satisfies TurnStartParams)
-      if (context.pendingTurn) {
-        context.pendingTurn.turnId = response.turn.id
-      } else {
-        pendingTurn.turnId = response.turn.id
-      }
+      // A native error can close context immediately after ACK; keep its
+      // queued result observable when this caller still owns the turn.
+      assertOwner()
+      pendingTurn.turnId = response.turn.id
     } catch (error) {
-      context.pendingTurn = null
+      if (context.pendingTurn === pendingTurn) context.pendingTurn = null
       queue.finish()
       throw error
+    } finally {
+      args.signal?.removeEventListener("abort", onStartupAbort)
     }
 
     return {
       provider: "codex",
+      providerTurnId: pendingTurn.turnId ?? undefined,
       stream: queue,
       interrupt: async () => {
-        const pendingTurn = context.pendingTurn
-        if (!pendingTurn) return
+        if (context.pendingTurn !== pendingTurn) return
 
         context.pendingTurn = null
         pendingTurn.resolved = true
+        this.failPendingSteers(pendingTurn, "Codex turn was interrupted", { includeEchoed: true })
         pendingTurn.queue.finish()
 
         if (!pendingTurn.turnId || !context.sessionToken) return
@@ -1095,6 +1530,86 @@ export class CodexAppServerManager {
     } catch {
       return null
     }
+  }
+
+  startSteerTurn(args: SteerCodexTurnArgs): CodexSteerHandle {
+    const context = this.requireSession(args.chatId)
+    const pendingTurn = context.pendingTurn
+    if (!pendingTurn || pendingTurn.resolved || !pendingTurn.turnId || !context.sessionToken) {
+      throw new Error("Codex turn is not ready for steering")
+    }
+    if (pendingTurn.turnId !== args.expectedTurnId) {
+      throw new Error("Codex turn changed before steering")
+    }
+    if (pendingTurn.pendingSteeredEntries.has(args.clientUserMessageId)) {
+      throw new Error("Codex queued message is already being steered")
+    }
+
+    const expectedTurnId = args.expectedTurnId
+    let resolvePersisted!: () => void
+    let rejectPersisted!: (error: Error) => void
+    const persisted = new Promise<void>((resolve, reject) => {
+      resolvePersisted = resolve
+      rejectPersisted = reject
+    })
+    // A turn notification can reject the record before the settlement consumer
+    // attaches. Keep that short handoff window handled.
+    void persisted.catch(() => undefined)
+    const pendingEntry: PendingSteeredEntry = {
+      entry: args.transcriptEntry,
+      echoReceived: false,
+      settled: false,
+      persisted,
+      resolvePersisted,
+      rejectPersisted,
+    }
+    pendingTurn.pendingSteeredEntries.set(args.clientUserMessageId, pendingEntry)
+
+    const accepted = this.sendRequest<TurnSteerResponse>(context, "turn/steer", {
+      threadId: context.sessionToken,
+      input: [{
+        type: "text",
+        text: args.selectedSkills?.length
+          ? appendSystemMessageBlock(args.content, buildSkillSystemMessage(args.selectedSkills))
+          : args.content,
+        text_elements: [],
+      }, ...(args.selectedSkills ?? []).map((skill) => ({
+        type: "skill" as const,
+        name: skill.name,
+        path: skill.path,
+      }))],
+      expectedTurnId,
+      clientUserMessageId: args.clientUserMessageId,
+    } satisfies TurnSteerParams).then((response) => {
+      if (response.turnId !== expectedTurnId) {
+        throw new Error(`Codex steered unexpected turn ${response.turnId}`)
+      }
+    }).catch((error) => {
+      const failure = error instanceof Error ? error : new Error(String(error))
+      this.rejectPendingSteeredEntry(
+        pendingTurn,
+        args.clientUserMessageId,
+        pendingEntry,
+        failure,
+      )
+      throw error
+    })
+    void accepted.catch(() => undefined)
+
+    const settled = Promise.all([accepted, pendingEntry.persisted]).then(() => {
+      if (!pendingEntry.echoReceived || !pendingEntry.settled) {
+        throw new Error("Codex turn ended before steering was acknowledged")
+      }
+    })
+    // A turn notification may reject persistence before the caller attaches
+    // its lifecycle handler. Keep that short handoff window handled.
+    void settled.catch(() => undefined)
+    return { accepted, settled }
+  }
+
+  async steerTurn(args: SteerCodexTurnArgs): Promise<void> {
+    const steer = this.startSteerTurn(args)
+    await steer.settled
   }
 
   async generateStructured(args: GenerateStructuredArgs): Promise<string | null> {
@@ -1159,6 +1674,47 @@ export class CodexAppServerManager {
     }
   }
 
+  private async withUtilityContext<TResult>(cwd: string, callback: (context: SessionContext) => Promise<TResult>) {
+    const child = this.spawnProcess(cwd)
+    const context: SessionContext = {
+      chatId: `utility-${randomUUID()}`,
+      cwd,
+      child,
+      pendingRequests: new Map(),
+      pendingTurn: null,
+      sessionToken: null,
+      stderrLines: [],
+      closed: false,
+    }
+    this.attachListeners(context)
+
+    try {
+      await this.sendRequest(context, "initialize", {
+        clientInfo: {
+          name: "kanna_desktop",
+          title: "Kanna",
+          version: "0.1.0",
+        },
+        capabilities: {
+          experimentalApi: true,
+          requestAttestation: false,
+        },
+      } satisfies InitializeParams)
+      this.writeMessage(context, {
+        method: "initialized",
+      })
+      return await callback(context)
+    } finally {
+      context.closed = true
+      context.pendingTurn?.queue.finish()
+      try {
+        context.child.kill("SIGKILL")
+      } catch {
+        // ignore kill failures
+      }
+    }
+  }
+
   private requireSession(chatId: string) {
     const context = this.sessions.get(chatId)
     if (!context || context.closed) {
@@ -1218,7 +1774,7 @@ export class CodexAppServerManager {
     if (!pending) return
     context.pendingRequests.delete(response.id)
     if (response.error) {
-      pending.reject(new Error(`${pending.method} failed: ${response.error.message ?? "Unknown error"}`))
+      pending.reject(new CodexRequestError(pending.method, response.error.code, response.error.message ?? "Unknown error"))
       return
     }
     pending.resolve(response.result)
@@ -1399,10 +1955,20 @@ export class CodexAppServerManager {
         this.handlePlanUpdated(pendingTurn, notification.params)
         return
       case "item/started":
-        this.handleItemStarted(pendingTurn, notification.params)
+        this.handleItemStarted(
+          pendingTurn,
+          notification.params,
+          (!context.sessionToken || notification.params.threadId === context.sessionToken)
+            && (!pendingTurn.turnId || notification.params.turnId === pendingTurn.turnId)
+        )
         return
       case "item/completed":
-        this.handleItemCompleted(pendingTurn, notification.params)
+        this.handleItemCompleted(
+          pendingTurn,
+          notification.params,
+          (!context.sessionToken || notification.params.threadId === context.sessionToken)
+            && (!pendingTurn.turnId || notification.params.turnId === pendingTurn.turnId)
+        )
         return
       case "item/plan/delta":
         this.handlePlanDelta(pendingTurn, notification.params)
@@ -1421,7 +1987,16 @@ export class CodexAppServerManager {
     }
   }
 
-  private handleItemStarted(pendingTurn: PendingTurn, notification: ItemStartedNotification) {
+  private handleItemStarted(
+    pendingTurn: PendingTurn,
+    notification: ItemStartedNotification,
+    isActiveTurn: boolean
+  ) {
+    if (notification.item.type === "userMessage") {
+      this.handleSteeredUserMessage(pendingTurn, notification.item.clientId, isActiveTurn)
+      return
+    }
+
     if (notification.item.type === "plan") {
       pendingTurn.planTextByItemId.set(notification.item.id, notification.item.text)
       pendingTurn.latestPlanText = notification.item.text
@@ -1454,11 +2029,21 @@ export class CodexAppServerManager {
     }
   }
 
-  private handleItemCompleted(pendingTurn: PendingTurn, notification: ItemCompletedNotification) {
+  private handleItemCompleted(
+    pendingTurn: PendingTurn,
+    notification: ItemCompletedNotification,
+    isActiveTurn: boolean
+  ) {
+    if (notification.item.type === "userMessage") {
+      this.handleSteeredUserMessage(pendingTurn, notification.item.clientId, isActiveTurn)
+      return
+    }
+
     if (notification.item.type === "agentMessage") {
+      const question = codexAsyncQuestionTool(notification.item, notification.threadId)
       pendingTurn.queue.push({
         type: "transcript",
-        entry: timestamped({
+        entry: question ? timestamped({ kind: "tool_call", tool: question }) : timestamped({
           kind: "assistant_text",
           text: notification.item.text,
         }),
@@ -1505,6 +2090,63 @@ export class CodexAppServerManager {
       if (notification.item.type === "webSearch" && entry.kind === "tool_result" && !entry.isError) {
         pendingTurn.pendingWebSearchResultToolId = notification.item.id
       }
+    }
+  }
+
+  private handleSteeredUserMessage(
+    pendingTurn: PendingTurn,
+    clientId: string | null | undefined,
+    isActiveTurn: boolean
+  ) {
+    if (!isActiveTurn || !clientId) return
+    const pendingEntry = pendingTurn.pendingSteeredEntries.get(clientId)
+    if (!pendingEntry || pendingEntry.echoReceived) return
+    pendingEntry.echoReceived = true
+    pendingTurn.queue.push({
+      type: "transcript",
+      entry: pendingEntry.entry,
+      onPersisted: (error) => {
+        if (error) {
+          this.rejectPendingSteeredEntry(pendingTurn, clientId, pendingEntry, error)
+          return
+        }
+        if (pendingEntry.settled) return
+        pendingEntry.settled = true
+        if (pendingTurn.pendingSteeredEntries.get(clientId) === pendingEntry) {
+          pendingTurn.pendingSteeredEntries.delete(clientId)
+        }
+        pendingEntry.resolvePersisted()
+      },
+    })
+  }
+
+  private rejectPendingSteeredEntry(
+    pendingTurn: PendingTurn,
+    clientId: string,
+    pendingEntry: PendingSteeredEntry,
+    error: Error,
+  ) {
+    if (pendingEntry.settled) return
+    pendingEntry.settled = true
+    if (pendingTurn.pendingSteeredEntries.get(clientId) === pendingEntry) {
+      pendingTurn.pendingSteeredEntries.delete(clientId)
+    }
+    pendingEntry.rejectPersisted(error)
+  }
+
+  private failPendingSteers(
+    pendingTurn: PendingTurn,
+    message: string,
+    options?: { includeEchoed?: boolean },
+  ) {
+    for (const [clientId, pendingEntry] of pendingTurn.pendingSteeredEntries) {
+      if (pendingEntry.echoReceived && !options?.includeEchoed) continue
+      this.rejectPendingSteeredEntry(
+        pendingTurn,
+        clientId,
+        pendingEntry,
+        new Error(message),
+      )
     }
   }
 
@@ -1563,6 +2205,7 @@ export class CodexAppServerManager {
     const isCancelled = status === "interrupted"
     const isError = status === "failed"
     pendingTurn.pendingWebSearchResultToolId = null
+    this.failPendingSteers(pendingTurn, "Codex turn ended before steering was acknowledged")
 
     if (!isCancelled && !isError && pendingTurn.planMode) {
       const planText = pendingTurn.latestPlanText?.trim()
@@ -1648,6 +2291,7 @@ export class CodexAppServerManager {
     context.customTools?.close()
     const pendingTurn = context.pendingTurn
     if (pendingTurn && !pendingTurn.resolved) {
+      this.failPendingSteers(pendingTurn, message, { includeEchoed: true })
       pendingTurn.queue.push({
         type: "transcript",
         entry: timestamped({

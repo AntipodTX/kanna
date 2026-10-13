@@ -9,6 +9,7 @@ function findLatestUnresolvedToolId(messages: HydratedTranscriptMessage[], toolN
     const message = messages[index]
     if (message.kind !== "tool") continue
     const toolCall = message as ProcessedToolCall
+    if (toolCall.toolKind === "ask_user_question" && toolCall.input.codexAsync) continue
     const matches = toolCall.toolName === toolName
       || (toolName === "AskUserQuestion" && toolCall.toolKind === "ask_user_question")
     if (matches && !toolCall.result) {

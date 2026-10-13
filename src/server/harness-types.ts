@@ -6,6 +6,7 @@ export interface HarnessEvent {
   sessionToken?: string
   /** Claude results: the ids of the prompts this turn answered, as the CLI echoes them. */
   promptIds?: string[]
+  onPersisted?: (error?: Error) => void
 }
 
 export interface HarnessToolRequest {
@@ -15,7 +16,16 @@ export interface HarnessToolRequest {
   validateResult?: (result: unknown) => void
 }
 
+/** Report only verified native continuity; a requested token is not proof. */
+export type HarnessStartupOutcome =
+  | { kind: "reused" | "resumed" | "forked" | "fresh" }
+  | { kind: "unknown"; reason: string }
+
+export type PrepareHarnessContent = (outcome: HarnessStartupOutcome) => Promise<string>
+
 export interface HarnessTurn {
+  startupOutcome?: HarnessStartupOutcome
+  providerTurnId?: string
   provider: AgentProvider
   stream: AsyncIterable<HarnessEvent>
   getAccountInfo?: () => Promise<AccountInfo | null>
