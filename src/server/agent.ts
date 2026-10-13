@@ -1462,9 +1462,6 @@ export class AgentCoordinator {
     for (const reservation of this.codexHistoryChecks.values()) this.cancelledCodexHistoryChecks.add(reservation)
     for (const operation of this.historyOperations.values()) operation.cancelled = true
     this.startingClaudeTurns.clear()
-    for (const chatId of [...this.idleSessionTimers.keys()]) {
-      this.clearIdleSessionTimer(chatId)
-    }
     for (const [chatId, active] of this.activeTurns) {
       if (active.provider !== "codex" && !active.startupPending && !active.contextRestorationId) continue
       active.cancelRequested = true
@@ -1473,6 +1470,9 @@ export class AgentCoordinator {
       this.activeTurns.delete(chatId)
     }
     this.activeCodexCommands.clear()
+    for (const chatId of [...this.idleSessionTimers.keys()]) {
+      this.clearIdleSessionTimer(chatId)
+    }
     for (const session of this.claudeSessions.values()) {
       session.forceClosed = true
       session.releasePublication()
@@ -1795,7 +1795,6 @@ export class AgentCoordinator {
   }
 
   async closeChat(chatId: string) {
-    this.clearIdleSessionTimer(chatId)
     const checking = this.codexHistoryChecks.get(chatId)
     if (checking) this.cancelledCodexHistoryChecks.add(checking)
     const historyOperation = this.historyOperations.get(chatId)
@@ -1808,12 +1807,7 @@ export class AgentCoordinator {
       startup.customTools?.abort()
       this.activeTurns.delete(chatId)
     }
-    const steerOwner = this.activeTurns.get(chatId)
-    if (steerOwner?.provider === "codex") {
-      steerOwner.cancelRequested = true
-      steerOwner.customTools?.abort()
-      this.activeTurns.delete(chatId)
-    }
+    this.clearIdleSessionTimer(chatId)
     this.activeCodexCommands.delete(chatId)
     await this.stopDraining(chatId)
     const claudeSession = this.claudeSessions.get(chatId)
@@ -3473,6 +3467,7 @@ export class AgentCoordinator {
   }
 
   async editUserPrompt(command: Extract<ClientCommand, { type: "chat.editUserPrompt" }>) {
+    if (this.activeCodexCommands.has(command.chatId)) throw new Error("A Codex command is already running")
     if (this.store.requireChat(command.chatId).provider === "codex") {
       return this.withHistoryOperation(command.chatId, () => this.performEditUserPrompt(command))
     }
@@ -3480,6 +3475,9 @@ export class AgentCoordinator {
   }
 
   private async performEditUserPrompt(command: Extract<ClientCommand, { type: "chat.editUserPrompt" }>) {
+
+    if (this.activeCodexCommands.has(command.chatId)) throw new Error("A Codex command is already running")
+
     let content = command.content.trim()
     if (!content) {
       throw new Error("Message cannot be empty")
@@ -4039,12 +4037,13 @@ export class AgentCoordinator {
       ? { type: "chat.fork" as const, chatId: commandOrChatId }
       : commandOrChatId
 
+    if (this.activeCodexCommands.has(command.chatId)) throw new Error("A Codex command is already running")
+
     if (command.messageId) {
       return await this.forkChatAtUserPrompt(command)
     }
 
     const chatId = command.chatId
-    if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
     if (this.codexHistoryChecks.has(chatId)) throw new Error("A Codex history check is running; retry after it finishes")
     const chat = this.store.requireChat(chatId)
     if (!chat.provider) {
@@ -4141,6 +4140,7 @@ export class AgentCoordinator {
   }
 
   private async forkChatAtUserPrompt(command: Extract<ClientCommand, { type: "chat.fork" }>) {
+    if (this.activeCodexCommands.has(command.chatId)) throw new Error("A Codex command is already running")
     if (this.store.requireChat(command.chatId).provider === "codex") {
       return this.withHistoryOperation(command.chatId, () => this.performForkChatAtUserPrompt(command))
     }
