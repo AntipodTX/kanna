@@ -19,6 +19,7 @@
 - Correct Claude chat lifecycle state after agent activity.
 - Route Codex subagent completion notifications to the correct turn.
 - Avoid Codex thread initialization with an empty thread ID.
+- Emit Codex system initialization only once per session.
 - Preserve Claude plan transcript adjustments during rendering.
 
 <p align="center">
