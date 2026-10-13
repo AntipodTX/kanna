@@ -379,6 +379,7 @@ describe("AgentCoordinator codex integration", () => {
     const titleGate = new Promise<void>((resolve) => {
       releaseTitle = resolve
     })
+    const titleCalls: Array<{ messageContent: string; cwd: string; preferredProvider?: "claude" | "codex" }> = []
     const fakeCodexManager = {
       async startSession() {},
       async startTurn(): Promise<HarnessTurn> {
@@ -421,7 +422,8 @@ describe("AgentCoordinator codex integration", () => {
       store: store as never,
       onStateChange: () => {},
       codexManager: fakeCodexManager as never,
-      generateTitle: async () => {
+      generateTitle: async (messageContent, cwd, preferredProvider) => {
+        titleCalls.push({ messageContent, cwd, preferredProvider })
         await titleGate
         return {
           title: "Generated title",
@@ -440,6 +442,11 @@ describe("AgentCoordinator codex integration", () => {
     })
 
     expect(store.chat.title).toBe("first message")
+    expect(titleCalls).toEqual([{
+      messageContent: "first message",
+      cwd: "/tmp/project",
+      preferredProvider: "codex",
+    }])
     releaseTitle()
     await waitFor(() => store.chat.title === "Generated title")
     expect(store.messages[0]?.kind).toBe("user_prompt")
@@ -2257,7 +2264,7 @@ describe("concurrent agents notice injection", () => {
     await coordinator.send({ type: "chat.send", chatId: "chat-2", provider: "claude", content: "second prompt", model: "claude-opus-4-1" })
 
     expect(prompts).toHaveLength(2)
-    // chat-1 started alone — nothing is appended.
+    // chat-1 started alone — no automatic instructions.
     expect(prompts[0]).toBe("first prompt")
     // chat-2 started while chat-1 was running in the same directory.
     expect(prompts[1]?.startsWith("second prompt")).toBe(true)

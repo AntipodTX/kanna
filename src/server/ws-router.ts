@@ -23,6 +23,7 @@ import { readProjectQuickActions, writeProjectQuickActions } from "./project-qui
 import { installSkill, listGlobalSkillsWithSources, listInstalledSkills, searchSkills, uninstallSkill } from "./skills"
 import { writeStandaloneTranscriptExport } from "./standalone-export"
 import { TerminalManager } from "./terminal-manager"
+import type { StartupSyncProgress } from "./startup-sync"
 import type { WorktreeProbe } from "./worktree-probe"
 import type { ProjectIcons } from "./project-icons"
 import type { ProviderAuthManager } from "./provider-auth"
@@ -71,6 +72,8 @@ export interface ClientState {
    * `chat.loadOlder`, never forward. See shared/transcript-window.ts.
    */
   chatWindowStarts?: Map<string, number>
+  /** Retained entry identity at each window start, used after replacement. */
+  chatWindowEntryIds?: Map<string, string>
   /**
    * Outline length last sent per chat subscription. The outline rides only
    * on pushes where it changed, so this is what "changed" is measured
@@ -121,6 +124,7 @@ interface CreateWsRouterArgs {
   getDiscoveredProjects: () => DiscoveredProject[]
   machineDisplayName: string
   updateManager: UpdateManager | null
+  startupSync?: Pick<StartupSyncProgress, "getSnapshot" | "onChange">
   usageLimits?: Pick<UsageLimitsManager, "getSnapshot" | "refresh" | "onChange"> | null
   providerAuth?: Pick<
     ProviderAuthManager,
@@ -143,6 +147,7 @@ interface SnapshotBroadcastFilter {
   includeSidebar?: boolean
   includeLocalProjects?: boolean
   includeUpdate?: boolean
+  includeStartupSync?: boolean
   includeKeybindings?: boolean
   includeAppSettings?: boolean
   includeUsageLimits?: boolean
@@ -243,6 +248,7 @@ export function createWsRouter({
   getDiscoveredProjects,
   machineDisplayName,
   updateManager,
+  startupSync,
   usageLimits,
   providerAuth,
   backgroundChatPushIntervalMs = BACKGROUND_CHAT_PUSH_INTERVAL_MS,
@@ -322,6 +328,9 @@ export function createWsRouter({
     }
     if (topic.type === "update") {
       return Boolean(filter.includeUpdate)
+    }
+    if (topic.type === "startup-sync") {
+      return Boolean(filter.includeStartupSync)
     }
     if (topic.type === "keybindings") {
       return Boolean(filter.includeKeybindings)
@@ -575,6 +584,26 @@ export function createWsRouter({
       }
     }
 
+    if (topic.type === "startup-sync") {
+      return {
+        v: PROTOCOL_VERSION,
+        type: "snapshot",
+        id,
+        snapshot: {
+          type: "startup-sync",
+          data: startupSync?.getSnapshot() ?? {
+            enabled: false,
+            mode: "session-sync",
+            status: "idle",
+            messages: [],
+            startedAt: null,
+            completedAt: null,
+            error: null,
+          },
+        },
+      }
+    }
+
     if (topic.type === "terminal") {
       return {
         v: PROTOCOL_VERSION,
@@ -663,6 +692,14 @@ export function createWsRouter({
     return ws.data.chatWindowStarts
   }
 
+  function setChatWindowStart(ws: ServerWebSocket<ClientState>, subscriptionId: string, chatId: string, start: number) {
+    ensureChatWindowStarts(ws).set(subscriptionId, start)
+    const boundaries = ws.data.chatWindowEntryIds ??= new Map()
+    const entryId = store.getEntryIdAt(chatId, start)
+    if (entryId) boundaries.set(subscriptionId, entryId)
+    else boundaries.delete(subscriptionId)
+  }
+
   function ensureChatOutlineCounts(ws: ServerWebSocket<ClientState>) {
     if (!ws.data.chatOutlineCounts) {
       ws.data.chatOutlineCounts = new Map()
@@ -678,11 +715,18 @@ export function createWsRouter({
   function getChatWindowStart(ws: ServerWebSocket<ClientState>, subscriptionId: string, chatId: string) {
     const starts = ensureChatWindowStarts(ws)
     const existing = starts.get(subscriptionId)
-    if (existing !== undefined) return existing
+    if (existing !== undefined) {
+      // An empty subscription can receive its first entries later. Capture
+      // that boundary before a subsequent replacement changes its indices.
+      if (!ws.data.chatWindowEntryIds?.has(subscriptionId)) {
+        setChatWindowStart(ws, subscriptionId, chatId, existing)
+      }
+      return existing
+    }
     const start = store.getChat(chatId)
       ? store.getInitialTranscriptWindowStart(chatId, transcriptWindowAssistantMessages())
       : 0
-    starts.set(subscriptionId, start)
+    setChatWindowStart(ws, subscriptionId, chatId, start)
     return start
   }
 
@@ -757,7 +801,7 @@ export function createWsRouter({
     // only applies when it reaches further back than the cache does.
     const defaultStart = getChatWindowStart(ws, subscriptionId, topic.chatId)
     if (span.start < defaultStart) {
-      ensureChatWindowStarts(ws).set(subscriptionId, span.start)
+      setChatWindowStart(ws, subscriptionId, topic.chatId, span.start)
     }
   }
 
@@ -842,7 +886,7 @@ export function createWsRouter({
         if (end !== undefined && ws.data.chatFollowing?.get(id) && end - (checks.get(id) ?? windowStart) >= 64) {
           checks.set(id, end)
           windowStart = store.getRollingTranscriptWindowStart(topic.chatId, windowStart, transcriptWindowAssistantMessages())
-          ensureChatWindowStarts(ws).set(id, windowStart)
+          setChatWindowStart(ws, id, topic.chatId, windowStart)
         }
         const previous = spans.get(id)
         const advanced = previous && windowStart > previous.start
@@ -1082,6 +1126,12 @@ export function createWsRouter({
         send(ws, envelope)
       }
     }
+  }) ?? (() => {})
+
+  const disposeStartupSyncEvents = startupSync?.onChange(() => {
+    void broadcastFilteredSnapshots({
+      includeStartupSync: true,
+    })
   }) ?? (() => {})
 
   const disposeUsageLimitsEvents = usageLimits?.onChange(() => {
@@ -1729,7 +1779,6 @@ export function createWsRouter({
           if (!store.getChat(command.chatId)) {
             throw new Error("Chat not found")
           }
-          const starts = ensureChatWindowStarts(ws)
           let startIndex = 0
           for (const [subscriptionId, topic] of ws.data.subscriptions.entries()) {
             if (topic.type !== "chat" || topic.chatId !== command.chatId || topic.background) continue
@@ -1739,7 +1788,7 @@ export function createWsRouter({
               ...(command.untilMessageId !== undefined ? { untilMessageId: command.untilMessageId } : {}),
               ...(command.all ? { all: true } : {}),
             })
-            starts.set(subscriptionId, next)
+            setChatWindowStart(ws, subscriptionId, command.chatId, next)
             ws.data.chatFollowing?.set(subscriptionId, false)
             startIndex = next
             await pushSnapshots(ws, { skipPrune: true, onlySubscriptionId: subscriptionId })
@@ -2047,6 +2096,7 @@ export function createWsRouter({
       ws.data.chatProvidersSent?.clear()
       ws.data.chatOutlineCounts?.clear()
       ws.data.chatWindowStarts?.clear()
+      ws.data.chatWindowEntryIds?.clear()
       ws.data.chatFollowing?.clear()
       ws.data.chatWindowChecks?.clear()
       ws.data.sidebarPatchBases?.clear()
@@ -2086,6 +2136,7 @@ export function createWsRouter({
         // A (re)subscribe starts from nothing, so the next push sends a full window.
         ws.data.chatEntrySpans?.delete(parsed.id)
         ws.data.chatWindowStarts?.delete(parsed.id)
+        ws.data.chatWindowEntryIds?.delete(parsed.id)
         ws.data.chatOutlineCounts?.delete(parsed.id)
         ws.data.chatProvidersSent?.delete(parsed.id)
         ws.data.chatFollowing?.delete(parsed.id)
@@ -2141,6 +2192,7 @@ export function createWsRouter({
         // A (re)subscribe starts from nothing, so the next push sends a full window.
         ws.data.chatEntrySpans?.delete(parsed.id)
         ws.data.chatWindowStarts?.delete(parsed.id)
+        ws.data.chatWindowEntryIds?.delete(parsed.id)
         ws.data.chatOutlineCounts?.delete(parsed.id)
         ws.data.chatProvidersSent?.delete(parsed.id)
         ws.data.chatFollowing?.delete(parsed.id)
@@ -2153,6 +2205,42 @@ export function createWsRouter({
 
       await handleCommand(ws, parsed)
     },
+    invalidateChatTranscript(chatId: string) {
+      // Transcript streams normally append by absolute index. A provider
+      // replacement needs the next push to send a full window again.
+      for (const ws of sockets) {
+        for (const [id, topic] of ws.data.subscriptions) {
+          if (topic.type !== "chat" || topic.chatId !== chatId) continue
+          ensureSnapshotSignatures(ws).delete(id)
+          ws.data.chatEntrySpans?.delete(id)
+          const boundaryId = ws.data.chatWindowEntryIds?.get(id)
+          let translatedStart = -1
+          if (boundaryId && store.getChat(chatId)) {
+            // Replacement has installed the new headers. Reading identities
+            // avoids loading any payload sidecars while translating readers.
+            const length = store.getTranscriptLength(chatId)
+            for (let index = 0; index < length; index += 1) {
+              if (store.getEntryIdAt(chatId, index) === boundaryId) {
+                translatedStart = index
+                break
+              }
+            }
+          }
+          if (translatedStart >= 0) {
+            // Retained IDs can acquire parent attribution during replacement.
+            // Widen to the containing row while preserving the held range.
+            setChatWindowStart(ws, id, chatId, store.snapTranscriptWindowStart(chatId, translatedStart))
+          } else {
+            ws.data.chatWindowStarts?.delete(id)
+            ws.data.chatWindowEntryIds?.delete(id)
+          }
+          ws.data.chatOutlineCounts?.delete(id)
+          ws.data.chatProvidersSent?.delete(id)
+          ws.data.chatWindowChecks?.delete(id)
+          clearBackgroundChatPush(ws, id)
+        }
+      }
+    },
     dispose() {
       if (pendingBroadcastTimer) {
         clearTimeout(pendingBroadcastTimer)
@@ -2162,6 +2250,7 @@ export function createWsRouter({
       disposeKeybindingEvents()
       disposeAppSettingsEvents()
       disposeUpdateEvents()
+      disposeStartupSyncEvents()
       disposeUsageLimitsEvents()
       disposeProviderAuthEvents()
     },
