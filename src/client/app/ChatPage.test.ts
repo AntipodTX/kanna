@@ -9,6 +9,31 @@ import {
   shouldUseMobileRightSidebarOverlay,
   shouldAutoFollowTranscriptResize,
 } from "./ChatPage"
+import { readChatJumpLocationState } from "../lib/chat-navigation"
+import { getProjectSearchResultNavigation } from "./projectSearch"
+
+describe("project search result navigation", () => {
+  test("uses the shared transcript jump state for the result's rendered row and nested entry", () => {
+    const navigation = getProjectSearchResultNavigation({
+      chatId: "chat-2",
+      chatTitle: "Second chat",
+      isArchived: true,
+      entryId: "tool-result",
+      revealEntryId: "nested-tool",
+      targetEntryId: "agent-call",
+      kind: "tool_result",
+      createdAt: 1,
+      matchCount: 1,
+      preview: "needle",
+    })
+
+    expect(navigation.pathname).toBe("/chat/chat-2")
+    expect(readChatJumpLocationState(navigation.state)?.target).toEqual({
+      entryId: "agent-call",
+      revealEntryId: "nested-tool",
+    })
+  })
+})
 
 describe("hasFileDragTypes", () => {
   test("returns true when file drags are present", () => {

@@ -30,9 +30,11 @@ import type { KannaSocket } from "../socket"
 import type { ChatReadAnchorState, ReadAnchorLayout, ReadAnchorLayoutSource } from "../useChatReadAnchor"
 import {
   buildRowIndexByMessageId,
+  findEntryRowIndex,
   getLatestUserPrompt,
   getRowAnchorMessageId,
   isOptimisticMessageId,
+  resolveEntryJump,
   resolveJumpTarget,
   resolveRestoreTarget,
   shouldPinForNewPrompt,
@@ -74,6 +76,9 @@ const AT_END_THRESHOLD_PX = 48
  * correction is driven by layout changes and bounded by the clock instead.
  */
 const PIN_SETTLE_MS = 2000
+
+/** How long a jump waits for an asynchronously hydrated nested entry. */
+const EXACT_REVEAL_TIMEOUT_MS = 10_000
 
 /** Close enough to the intended offset to stop correcting. */
 const PIN_TOLERANCE_PX = 2
@@ -132,7 +137,7 @@ function rowLightsItself(row: ResolvedTranscriptRow): boolean {
 
 type TranscriptRowItemProps = Pick<
   ComponentProps<typeof KannaTranscriptRow>,
-  "row" | "toolGroupExpanded" | "onToolGroupExpandedChange" | "onAskUserQuestionSubmit" | "onExitPlanModeConfirm"
+  "row" | "toolGroupExpanded" | "onToolGroupExpandedChange" | "onAskUserQuestionSubmit" | "onExitPlanModeConfirm" | "revealEntryId" | "flashEntryId"
 > & { flashBox: boolean; flashRow: boolean }
 
 /**
@@ -153,6 +158,8 @@ const TranscriptRowItem = memo(function TranscriptRowItem({
   flashBox,
   flashRow,
   toolGroupExpanded,
+  revealEntryId,
+  flashEntryId,
   onToolGroupExpandedChange,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
@@ -184,6 +191,8 @@ const TranscriptRowItem = memo(function TranscriptRowItem({
           row={row}
           flash={flashRow}
           toolGroupExpanded={toolGroupExpanded}
+          revealEntryId={revealEntryId}
+          flashEntryId={flashEntryId}
           onToolGroupExpandedChange={onToolGroupExpandedChange}
           onAskUserQuestionSubmit={onAskUserQuestionSubmit}
           onExitPlanModeConfirm={onExitPlanModeConfirm}
@@ -301,7 +310,7 @@ interface ChatTranscriptViewportProps {
    */
   hasOlderMessages?: boolean
   transcriptOutline?: TranscriptOutlineEntry[]
-  onLoadOlderMessages?: (options?: { untilMessageId?: string; all?: boolean }) => Promise<void>
+  onLoadOlderMessages?: (options?: { untilMessageId?: string; all?: boolean }) => Promise<unknown>
   isLoadingOlderMessages?: boolean
   /**
    * Where to publish `--transcript-scrollbar-w`. The chrome that overlays the
@@ -506,6 +515,11 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
   useScrollbarGutterVar(viewportRef, scrollbarGutterHostRef, "--transcript-scrollbar-w")
   const localLinkMenuTriggerRef = useRef<HTMLSpanElement | null>(null)
   const [toolGroupExpanded, setToolGroupExpanded] = useState<Record<string, boolean>>({})
+  const [revealTarget, setRevealTarget] = useState<{
+    rowId: string
+    entryId: string
+    requestId: string
+  } | null>(null)
   const [localLinkMenuTarget, setLocalLinkMenuTarget] = useState<OpenLocalLinkTarget | null>(null)
   const isMac = platform === "darwin"
   // Whether the empty state plays its entrance, fixed when it first shows in
@@ -526,6 +540,7 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
 
   useEffect(() => {
     setToolGroupExpanded({})
+    setRevealTarget(null)
   }, [activeChatId])
 
   useEffect(() => {
@@ -680,23 +695,27 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
    * fires (the row scrolled out of the DOM mid-flash) would strand it.
    */
   const [flashRowId, setFlashRowId] = useState<string | null>(null)
+  const [flashEntryTarget, setFlashEntryTarget] = useState<{ rowId: string; entryId: string } | null>(null)
   const flashTimerRef = useRef<number | null>(null)
   const flashFrameRef = useRef<number | null>(null)
 
-  const flashRow = useCallback((rowId: string) => {
+  const flashRow = useCallback((rowId: string, entryId?: string) => {
     if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current)
     if (flashFrameRef.current !== null) window.cancelAnimationFrame(flashFrameRef.current)
     // Dropped for a frame before being set, so jumping to the row you are
     // already lit on replays the flash. Re-applying a class that is already
     // there restarts nothing, and the second click would look ignored.
     setFlashRowId(null)
+    setFlashEntryTarget(null)
     flashFrameRef.current = window.requestAnimationFrame(() => {
       flashFrameRef.current = null
       setFlashRowId(rowId)
+      setFlashEntryTarget(entryId ? { rowId, entryId } : null)
     })
     flashTimerRef.current = window.setTimeout(() => {
       flashTimerRef.current = null
       setFlashRowId(null)
+      setFlashEntryTarget(null)
     }, JUMP_FLASH_DURATION_MS + JUMP_FLASH_CLEANUP_SLACK_MS)
   }, [])
 
@@ -704,6 +723,45 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
     if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current)
     if (flashFrameRef.current !== null) window.cancelAnimationFrame(flashFrameRef.current)
   }, [])
+
+  // A nested entry may not mount on the first expansion frame: trimmed tool
+  // payloads are fetched only after their row opens. Keep the owner chain
+  // forced open until the exact anchor appears, then finish the scroll there.
+  // The deadline prevents a malformed target from leaving a row forced open
+  // forever. Once mounted, ExpandableRow has copied the expanded state locally.
+  useLayoutEffect(() => {
+    if (!revealTarget) return
+    const deadline = Date.now() + EXACT_REVEAL_TIMEOUT_MS
+    let frame: number | null = null
+
+    const revealExactEntry = () => {
+      const viewport = viewportRef.current
+      const entry = document.getElementById(`msg-${revealTarget.entryId}`)
+      if (viewport && entry && viewport.contains(entry)) {
+        // The first pin gets the containing virtual row into view. Stop that
+        // settle loop before moving to the record inside it, or it would pull
+        // the viewport back to the start of a large group.
+        pendingPinRef.current = null
+        const intendedTop = headerOffsetPx + measureJumpLeadIn(viewport, viewportInsetsRef.current)
+        const offset = entry.getBoundingClientRect().top - viewport.getBoundingClientRect().top - intendedTop
+        viewport.scrollTop += offset
+        flashRow(revealTarget.rowId, revealTarget.entryId)
+        setRevealTarget((current) => current?.requestId === revealTarget.requestId ? null : current)
+        return
+      }
+
+      if (Date.now() >= deadline) {
+        setRevealTarget((current) => current?.requestId === revealTarget.requestId ? null : current)
+        return
+      }
+      frame = window.requestAnimationFrame(revealExactEntry)
+    }
+
+    frame = window.requestAnimationFrame(revealExactEntry)
+    return () => {
+      if (frame !== null) window.cancelAnimationFrame(frame)
+    }
+  }, [flashRow, headerOffsetPx, revealTarget])
 
   /**
    * Everything a jump does to a row: where it lands, and lighting it up.
@@ -717,8 +775,8 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
    * not somewhere you asked to go, and a flash on every chat open would be
    * noise rather than a cue.
    */
-  const prepareJumpToRow = useCallback((rowId: string): TranscriptScrollTarget => {
-    flashRow(rowId)
+  const prepareJumpToRow = useCallback((rowId: string, entryId?: string): TranscriptScrollTarget => {
+    flashRow(rowId, entryId)
     return {
       kind: "pin",
       rowId,
@@ -731,6 +789,8 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
 
   /** Jump requests already spent, so each one lands exactly once. */
   const handledJumpRequestIdRef = useRef<string | null>(null)
+  const attemptedEntryJumpLoadRequestIdRef = useRef<string | null>(null)
+  const pendingEntryJumpLoadRequestIdRef = useRef<string | null>(null)
 
   /**
    * Take the pending jump, if there is one and its message is loaded.
@@ -742,11 +802,69 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
    */
   const consumeJumpTarget = useCallback((): TranscriptScrollTarget | null => {
     if (!jumpRequest || handledJumpRequestIdRef.current === jumpRequest.requestId) return null
+    let revealEntryId: string | undefined
+    if (typeof jumpRequest.target !== "string" && "entryId" in jumpRequest.target) {
+      const entryId = jumpRequest.target.entryId
+      revealEntryId = jumpRequest.target.revealEntryId ?? entryId
+      const resolution = resolveEntryJump(resolvedRows, jumpRequest.target, {
+        hasOlderMessages,
+        loadAttempted: attemptedEntryJumpLoadRequestIdRef.current === jumpRequest.requestId,
+        loadPending: pendingEntryJumpLoadRequestIdRef.current === jumpRequest.requestId || isLoadingOlderMessages,
+      })
+      if (resolution.kind === "load") {
+        if (!onLoadOlderMessages) {
+          handledJumpRequestIdRef.current = jumpRequest.requestId
+          onJumpRequestHandled?.(jumpRequest.requestId)
+          return null
+        }
+        attemptedEntryJumpLoadRequestIdRef.current = jumpRequest.requestId
+        pendingEntryJumpLoadRequestIdRef.current = jumpRequest.requestId
+        void onLoadOlderMessages({ untilMessageId: resolution.entryId }).finally(() => {
+          if (pendingEntryJumpLoadRequestIdRef.current === jumpRequest.requestId) {
+            pendingEntryJumpLoadRequestIdRef.current = null
+          }
+        })
+        return null
+      }
+      if (resolution.kind === "wait") return null
+      if (resolution.kind === "missing") {
+        handledJumpRequestIdRef.current = jumpRequest.requestId
+        onJumpRequestHandled?.(jumpRequest.requestId)
+        return null
+      }
+      const rowIndex = findEntryRowIndex(resolvedRows, entryId)
+      const row = rowIndex === null ? undefined : resolvedRows[rowIndex]
+      if (row?.kind === "tool-group") {
+        setToolGroupExpanded((current) => current[row.id]
+          ? current
+          : { ...current, [row.id]: true })
+      }
+      if (row) {
+        setRevealTarget({
+          rowId: row.id,
+          entryId: revealEntryId,
+          requestId: jumpRequest.requestId,
+        })
+      }
+      handledJumpRequestIdRef.current = jumpRequest.requestId
+      onJumpRequestHandled?.(jumpRequest.requestId)
+      return resolution.target.kind === "pin"
+        ? prepareJumpToRow(resolution.target.rowId, revealEntryId)
+        : resolution.target
+    }
     handledJumpRequestIdRef.current = jumpRequest.requestId
     onJumpRequestHandled?.(jumpRequest.requestId)
     const target = resolveJumpTarget(resolvedRows, jumpRequest.target)
-    return target?.kind === "pin" ? prepareJumpToRow(target.rowId) : target
-  }, [jumpRequest, onJumpRequestHandled, prepareJumpToRow, resolvedRows])
+    return target?.kind === "pin" ? prepareJumpToRow(target.rowId, revealEntryId) : target
+  }, [
+    hasOlderMessages,
+    isLoadingOlderMessages,
+    jumpRequest,
+    onJumpRequestHandled,
+    onLoadOlderMessages,
+    prepareJumpToRow,
+    resolvedRows,
+  ])
 
   // Restore once per chat open: wait until rows exist *and* the stored anchor
   // has resolved, otherwise we'd land on the fallback and visibly jump when the
@@ -1130,6 +1248,8 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
                   flashBox={flashRowId === row.id && !rowLightsItself(row)}
                   flashRow={flashRowId === row.id && rowLightsItself(row)}
                   toolGroupExpanded={row.kind === "tool-group" ? (toolGroupExpanded[row.id] ?? false) : undefined}
+                  revealEntryId={revealTarget?.rowId === row.id ? revealTarget.entryId : null}
+                  flashEntryId={flashEntryTarget?.rowId === row.id ? flashEntryTarget.entryId : null}
                   onToolGroupExpandedChange={handleToolGroupExpandedChange}
                   onAskUserQuestionSubmit={onAskUserQuestionSubmit}
                   onExitPlanModeConfirm={onExitPlanModeConfirm}
