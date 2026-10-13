@@ -4107,10 +4107,14 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
     const ready = new Promise<any>((resolve) => { releaseStart = resolve })
     let prompts = 0
     let interrupts = 0
+    let closes = 0
+    let emitLateActivity!: () => void
+    const store = createFakeStore()
     const coordinator = new AgentCoordinator({
-      store: createFakeStore() as never,
+      store: store as never,
       onStateChange: () => {},
-      startClaudeSession: async () => {
+      startClaudeSession: async (args) => {
+        emitLateActivity = () => args.onSubagentActivity?.({ kind: "started", id: "cancelled-agent", type: "subagent", label: "late cancelled agent" })
         markStarting()
         return await ready
       },
@@ -4120,17 +4124,26 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
     })
     await starting
     await coordinator.cancel("chat-1")
+    emitLateActivity()
+    events.push({ type: "session_token", sessionToken: "cancelled-startup-session" })
+    events.push({ type: "transcript", entry: timestamped({ kind: "assistant_text", text: "late cancelled activity" }) })
     releaseStart({
       provider: "claude", stream: events,
-      interrupt: async () => { interrupts += 1 }, close: () => {},
+      interrupt: async () => { interrupts += 1 }, close: () => { closes += 1; events.close() },
       setModel: async () => {}, setPermissionMode: async () => {},
       sendPrompt: async () => { prompts += 1 },
     })
     await send
+    emitLateActivity()
     events.close()
     expect(prompts).toBe(0)
     expect(interrupts).toBe(1)
+    expect(closes).toBe(1)
+    expect(coordinator.claudeSessions.has("chat-1")).toBe(false)
+    expect(store.chat.sessionToken).toBeNull()
+    expect(store.messages.some((entry) => entry.kind === "assistant_text")).toBe(false)
     expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+    expect(coordinator.getSubagents("chat-1")).toEqual([])
   })
 
 
@@ -6250,6 +6263,118 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
       events.close()
     }
   })
+
+
+  test("closes an unsent Claude handle when cancellation lands during its handoff to the active turn", async () => {
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    events.push({ type: "session_token", sessionToken: "cancelled-in-refresh" })
+    let cancelled: Promise<void> | undefined
+    let prompts = 0
+    let closes = 0
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => ({
+        provider: "claude", stream: events,
+        interrupt: async () => {},
+        close: () => { closes += 1; events.close() },
+        setModel: async () => {}, setPermissionMode: async () => {},
+        sendPrompt: async () => { prompts += 1 },
+        // Refresh happens after startup returns but before its turn wrapper
+        // reaches startTurnForChat, leaving cancellation another async window.
+        supportedModels: async () => { cancelled = coordinator.cancel("chat-1"); return [] },
+      }),
+    })
+    try {
+      await coordinator.send({
+        type: "chat.send", chatId: "chat-1", provider: "claude", content: "cancel in handoff", model: "claude-opus-4-1",
+      })
+      await cancelled
+      expect(prompts).toBe(0)
+      expect(closes).toBeGreaterThan(0)
+      expect(coordinator.claudeSessions.has("chat-1")).toBe(false)
+      expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+      expect(store.chat.sessionToken).toBeNull()
+    } finally {
+      events.close()
+    }
+  })
+
+
+  for (const retiredStreamEnd of ["buffered events", "iterator failure"] as const) {
+    test(`retires a cancelled unsent Claude session with ${retiredStreamEnd} before its interrupt settles so replacement starts fresh`, async () => {
+      const oldEvents = new AsyncEventQueue<any>()
+      const replacementEvents = new AsyncEventQueue<any>()
+      let failOldStream!: () => void
+      const oldStreamFailed = new Promise<void>((resolve) => { failOldStream = resolve })
+      const oldStream = {
+        async *[Symbol.asyncIterator]() {
+          if (retiredStreamEnd === "iterator failure") {
+            await oldStreamFailed
+            throw new Error("retired native stream failed")
+          }
+          yield* oldEvents
+        },
+      }
+      const store = createFakeStore()
+      let starts = 0
+      let interrupted!: () => void
+      const interruptStarted = new Promise<void>((resolve) => { interrupted = resolve })
+      let releaseInterrupt!: () => void
+      const interruptFinished = new Promise<void>((resolve) => { releaseInterrupt = resolve })
+      let cancellation: Promise<void> | undefined
+      const prompts: string[] = []
+      const coordinator = new AgentCoordinator({
+        store: store as never, onStateChange: () => {},
+        startClaudeSession: async () => {
+          const original = ++starts === 1
+          return {
+          provider: "claude", stream: original ? {
+            [Symbol.asyncIterator]() {
+              cancellation = coordinator.cancel("chat-1")
+              return oldStream[Symbol.asyncIterator]()
+            },
+          } : replacementEvents,
+            interrupt: async () => { if (original) { interrupted(); await interruptFinished } },
+            close: () => { if (!original) replacementEvents.close() },
+            setModel: async () => {}, setPermissionMode: async () => {},
+            sendPrompt: async (content) => { prompts.push(content.split("\n\n")[0]!) },
+          }
+        },
+      })
+      const send = (content: string) => coordinator.send({
+        type: "chat.send", chatId: "chat-1", provider: "claude", content, model: "claude-opus-4-1",
+      })
+      const originalSend = send("cancelled")
+      try {
+        await interruptStarted
+        await waitFor(() => !coordinator.getActiveStatuses().has("chat-1"))
+        await send("replacement")
+        expect(starts).toBe(2)
+        expect(prompts).toEqual(["replacement"])
+        // A provider may yield buffered events even after close was requested.
+        oldEvents.push({ type: "session_token", sessionToken: "retired-session" })
+        oldEvents.push({ type: "transcript", entry: timestamped({ kind: "assistant_text", text: "retired activity" }) })
+        failOldStream()
+        releaseInterrupt()
+        await Promise.all([originalSend, cancellation])
+        oldEvents.close()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(store.chat.sessionToken).toBeNull()
+        expect(store.messages.some((entry) => entry.kind === "assistant_text")).toBe(false)
+        expect(store.messages.some((entry) => entry.kind === "result" && entry.isError)).toBe(false)
+        expect(coordinator.getActiveStatuses().get("chat-1")).toBe("running")
+      } finally {
+        releaseInterrupt()
+        failOldStream()
+        await originalSend.catch(() => {})
+        await cancellation?.catch(() => {})
+        oldEvents.close()
+        replacementEvents.close()
+      }
+    })
+  }
 
 })
 
