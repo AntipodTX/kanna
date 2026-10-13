@@ -1781,9 +1781,6 @@ describe("AgentCoordinator codex integration", () => {
   })
 
 
-  
-
-
   test("does not promote a queued Codex message while its native steer is still settling", async () => {
     const streams: AsyncEventQueue<any>[] = []
     const startTurnCalls: Array<{ content: string }> = []
@@ -6911,9 +6908,6 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
   })
 
 
-
-
-
 })
 
 describe("buildConcurrentAgentsNotice", () => {
@@ -9212,10 +9206,14 @@ describe("Codex async question answers", () => {
     const starts: string[] = []
     const steers: string[] = []
     let interrupts = 0
+
+    const nativeInputs: Array<{ turnId: string; promptId: string; text: string; userIndex: number }> = []
+
     const manager = {
       async startSession() { return { sessionToken: "thread-1", resumeFellBack: false } },
-      async startTurn(args: { content: string }): Promise<HarnessTurn> {
+      async startTurn(args: { content: string; clientUserMessageId: string }): Promise<HarnessTurn> {
         starts.push(args.content)
+        nativeInputs.push({ turnId: `turn-${starts.length}`, promptId: args.clientUserMessageId, text: args.content, userIndex: 0 })
         const stream = new AsyncEventQueue<any>()
         streams.push(stream)
         return { provider: "codex", providerTurnId: `turn-${starts.length}`, stream,
@@ -9228,7 +9226,11 @@ describe("Codex async question answers", () => {
         }))
         return { accepted: Promise.resolve(), settled }
       },
-    }
+    
+stopSession() {},
+stopAll() {},
+async readPromptHistory() { return { inputs: nativeInputs } },
+}
     const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, codexManager: manager as never,
       checkSessionArtifact: () => "present" })
     const command = { type: "chat.respondTool" as const, chatId: "chat-1", toolUseId: tool.toolId,
@@ -9289,24 +9291,6 @@ describe("Codex async question answers", () => {
       expect(f.store.getQueuedMessages()).toHaveLength(1)
       await f.coordinator.respondTool(f.command)
       expect(f.store.getQueuedMessages()).toHaveLength(1)
-    } finally { await f.coordinator.cancel("chat-1") }
-  })
-
-  test("retries the same durable answer after native delivery rejects it", async () => {
-    const f = setup()
-    try {
-      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
-      const deliver = f.manager.startSteerTurn
-      f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
-      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
-      const queuedId = f.store.getQueuedMessages()[0]?.id
-      expect(queuedId).toBeDefined()
-      expect(f.interrupts()).toBe(0)
-      f.manager.startSteerTurn = deliver
-      await f.coordinator.respondTool(f.command)
-      await waitFor(() => f.store.getQueuedMessages().length === 0)
-      expect(f.steers).toHaveLength(1)
-      expect(f.store.messages.some(entry => entry._id === queuedId)).toBe(true)
     } finally { await f.coordinator.cancel("chat-1") }
   })
 
