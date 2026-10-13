@@ -45,6 +45,7 @@ function createDeps(overrides: Partial<Parameters<typeof runCli>[1]> = {}) {
       share: false | "quick" | { kind: "token"; token: string }
       password: string | null
       strictPort: boolean
+      syncSessions: boolean
       trustProxy?: boolean
       update: {
         version: string
@@ -157,6 +158,7 @@ describe("parseArgs", () => {
         share: false,
         password: null,
         strictPort: false,
+        syncSessions: false,
         noCloud: false,
         directCloud: false,
       },
@@ -173,6 +175,24 @@ describe("parseArgs", () => {
         share: false,
         password: null,
         strictPort: true,
+        syncSessions: false,
+        noCloud: false,
+        directCloud: false,
+      },
+    })
+  })
+
+  test("parses startup session sync opt-in", () => {
+    expect(parseArgs(["--sync-sessions"])).toEqual({
+      kind: "run",
+      options: {
+        port: 3210,
+        host: "127.0.0.1",
+        openBrowser: true,
+        share: false,
+        password: null,
+        strictPort: false,
+        syncSessions: true,
         noCloud: false,
         directCloud: false,
       },
@@ -189,6 +209,7 @@ describe("parseArgs", () => {
         share: false,
         password: null,
         strictPort: false,
+        syncSessions: false,
         noCloud: false,
         directCloud: false,
       },
@@ -205,6 +226,7 @@ describe("parseArgs", () => {
         share: "quick",
         password: null,
         strictPort: false,
+        syncSessions: false,
         noCloud: false,
         directCloud: false,
       },
@@ -221,6 +243,7 @@ describe("parseArgs", () => {
         share: { kind: "token", token: "secret-token" },
         password: null,
         strictPort: false,
+        syncSessions: false,
         noCloud: false,
         directCloud: false,
       },
@@ -237,6 +260,7 @@ describe("parseArgs", () => {
         share: false,
         password: "secret",
         strictPort: false,
+        syncSessions: false,
         noCloud: false,
         directCloud: false,
       },
@@ -263,6 +287,7 @@ describe("parseArgs", () => {
         share: false,
         password: null,
         strictPort: false,
+        syncSessions: false,
         noCloud: false,
         directCloud: false,
       },
@@ -279,6 +304,7 @@ describe("parseArgs", () => {
         share: false,
         password: null,
         strictPort: false,
+        syncSessions: false,
         noCloud: false,
         directCloud: false,
       },
@@ -358,6 +384,7 @@ describe("runCli", () => {
       share: false,
       password: null,
       strictPort: false,
+      syncSessions: false,
       trustProxy: false,
       update: {
         version: "0.3.0",
@@ -367,6 +394,15 @@ describe("runCli", () => {
     })
     expect(calls.openUrl).toEqual([])
     expect(calls.log).toContain("[kanna] data dir: ~/.kanna/data")
+  })
+
+  test("passes startup session sync opt-in to the server", async () => {
+    const { calls, deps } = createDeps()
+
+    await runCli(["--sync-sessions", "--no-open"], deps)
+
+    expect(calls.startServer).toHaveLength(1)
+    expect(calls.startServer[0]?.syncSessions).toBe(true)
   })
 
   test("logs the dev data dir when the dev runtime profile is active", async () => {

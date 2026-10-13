@@ -337,6 +337,8 @@ interface ClaudeSessionState {
   cancelledPromptSeqs: Set<number>
 }
 
+type TitleGenerationProvider = Extract<AgentProvider, "claude" | "codex">
+
 interface AgentCoordinatorArgs {
   store: EventStore
   onStateChange: (chatId?: string, options?: { immediate?: boolean }) => void
@@ -346,7 +348,11 @@ interface AgentCoordinatorArgs {
   grokManager?: GrokCliManager
   piManager?: PiAgentManager
   resolvePiConnection?: () => Promise<import("./pi-agent").PiConnection | null>
-  generateTitle?: (messageContent: string, cwd: string) => Promise<GenerateChatTitleResult>
+  generateTitle?: (
+    messageContent: string,
+    cwd: string,
+    preferredProvider?: TitleGenerationProvider
+  ) => Promise<GenerateChatTitleResult>
   startClaudeSession?: (args: {
     localPath: string
     model: string
@@ -1178,7 +1184,11 @@ export class AgentCoordinator {
   private readonly grokManager: GrokCliManager
   private readonly piManager: PiAgentManager
   private readonly resolvePiConnection: () => Promise<import("./pi-agent").PiConnection | null>
-  private readonly generateTitle: (messageContent: string, cwd: string) => Promise<GenerateChatTitleResult>
+  private readonly generateTitle: (
+    messageContent: string,
+    cwd: string,
+    preferredProvider?: TitleGenerationProvider
+  ) => Promise<GenerateChatTitleResult>
   private readonly startClaudeSessionFn: NonNullable<AgentCoordinatorArgs["startClaudeSession"]>
   private readonly checkSessionArtifactFn: NonNullable<AgentCoordinatorArgs["checkSessionArtifact"]>
   private reportBackgroundError: ((message: string) => void) | null = null
@@ -1223,7 +1233,11 @@ export class AgentCoordinator {
     this.grokManager = args.grokManager ?? new GrokCliManager()
     this.piManager = args.piManager ?? new PiAgentManager()
     this.resolvePiConnection = args.resolvePiConnection ?? resolvePiConnection
-    this.generateTitle = args.generateTitle ?? generateTitleForChatDetailed
+    this.generateTitle = args.generateTitle ?? ((messageContent, cwd, preferredProvider) =>
+      generateTitleForChatDetailed(messageContent, cwd, undefined, {
+        preferredProvider,
+        useConfiguredProvider: false,
+      }))
     this.startClaudeSessionFn = args.startClaudeSession ?? startClaudeSession
     this.checkSessionArtifactFn = args.checkSessionArtifact ?? checkSessionArtifact
   }
@@ -1993,7 +2007,7 @@ export class AgentCoordinator {
     const optimisticTitle = shouldGenerateTitle ? fallbackTitleFromMessage(args.content) : null
 
     if (optimisticTitle) {
-      await this.store.renameChat(args.chatId, optimisticTitle)
+      await this.store.renameChat(args.chatId, optimisticTitle, { markTitleOverride: false })
     }
 
     const project = this.store.getProject(chat.projectId)
@@ -2040,7 +2054,13 @@ export class AgentCoordinator {
     await this.store.recordTurnStarted(args.chatId, args.model)
 
     if (shouldGenerateTitle) {
-      void this.generateTitleInBackground(args.chatId, args.content, project.localPath, optimisticTitle ?? "New Chat")
+      void this.generateTitleInBackground(
+        args.chatId,
+        args.content,
+        project.localPath,
+        optimisticTitle ?? "New Chat",
+        args.provider
+      )
     }
 
     const onToolRequest = (request: HarnessToolRequest) => this.requestToolInput(args.chatId, request)
@@ -2947,9 +2967,18 @@ export class AgentCoordinator {
     }
   }
 
-  private async generateTitleInBackground(chatId: string, messageContent: string, cwd: string, expectedCurrentTitle: string) {
+  private async generateTitleInBackground(
+    chatId: string,
+    messageContent: string,
+    cwd: string,
+    expectedCurrentTitle: string,
+    preferredProvider: AgentProvider
+  ) {
     try {
-      const result = await this.generateTitle(messageContent, cwd)
+      const titleProvider = preferredProvider === "claude" || preferredProvider === "codex"
+        ? preferredProvider
+        : undefined
+      const result = await this.generateTitle(messageContent, cwd, titleProvider)
       if (result.failureMessage) {
         this.reportBackgroundError?.(
           `[title-generation] chat ${chatId} failed provider title generation: ${result.failureMessage}`
@@ -2960,7 +2989,7 @@ export class AgentCoordinator {
       const chat = this.store.requireChat(chatId)
       if (chat.title !== expectedCurrentTitle) return
 
-      await this.store.renameChat(chatId, result.title)
+      await this.store.renameChat(chatId, result.title, { markTitleOverride: false })
       this.emitStateChange(chatId)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)

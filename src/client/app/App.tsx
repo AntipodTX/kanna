@@ -26,6 +26,7 @@ import { OpenRouterCallbackPage } from "./OpenRouterCallbackPage"
 const SettingsPage = lazy(() => import("./SettingsPage").then((m) => ({ default: m.SettingsPage })))
 const WorkflowsGalleryPage = lazy(() => import("./WorkflowsGalleryPage").then((m) => ({ default: m.WorkflowsGalleryPage })))
 import { TerminalPage } from "./TerminalPage"
+import { StartupSyncProgressDialog } from "./StartupSyncProgressDialog"
 import { useKannaState } from "./useKannaState"
 import { useSidebarStore } from "../stores/sidebarStore"
 import type { AppSettingsSnapshot } from "../../shared/types"
@@ -271,6 +272,11 @@ function KannaLayout() {
     activeProjectId: state.activeProjectId,
     activeChatId: state.activeChatId,
   }))
+  const [dismissedStartupSyncStartedAt, setDismissedStartupSyncStartedAt] = useState<number | null>(null)
+  const visibleStartupSync =
+    state.startupSync?.enabled && state.startupSync.startedAt !== dismissedStartupSyncStartedAt
+      ? state.startupSync
+      : null
   const handleSidebarCreateChat = useCallback((projectId: string) => {
     void state.handleCreateChat(projectId)
   }, [state.handleCreateChat])
@@ -454,8 +460,16 @@ function KannaLayout() {
     <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden">
       {sidebarElement}
       <Outlet context={state} />
-      <SetupWizard />
-      <CommandPalette state={state} />
+      <StartupSyncProgressDialog
+        snapshot={visibleStartupSync}
+        onDismiss={() => setDismissedStartupSyncStartedAt(state.startupSync?.startedAt ?? null)}
+      />
+      {visibleStartupSync ? null : (
+        <>
+          <SetupWizard />
+          <CommandPalette state={state} />
+        </>
+      )}
       <StandaloneShareDialog
         open={Boolean(state.standaloneShareUrl)}
         shareUrl={state.standaloneShareUrl ?? ""}
