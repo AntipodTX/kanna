@@ -77,14 +77,14 @@ import {
   normalizeServerModel,
   serviceTierFromModelOptions,
 } from "./provider-catalog"
-import { CODEX_SLASH_COMMANDS, resolveClaudeApiModelId, CLAUDE_REASONING_OPTIONS } from "../shared/types"
+import { CLAUDE_REASONING_OPTIONS, CODEX_SLASH_COMMANDS, resolveClaudeApiModelId } from "../shared/types"
 import { fallbackTitleFromMessage } from "./generate-title"
 import { asNumber, asRecord } from "../shared/json"
 import { buildHandoffContext, buildHandoffMessageContent } from "./handoff"
 import { checkSessionArtifact, type SessionArtifactStatus } from "./session-artifacts"
 import { timestamped } from "./transcript"
-import { prepareClaudeTranscriptFork, type PreparedClaudeTranscriptFork } from "./claude-fork"
 import { encodeCodexQuestionReplies, parseCodexQuestionReplies, type CodexQuestionReply } from "../shared/codex-questions"
+import { prepareClaudeTranscriptFork, type PreparedClaudeTranscriptFork } from "./claude-fork"
 import {
   findWorkflowOf,
   finishActivity,
@@ -257,10 +257,7 @@ interface ActiveTurn {
   chatId: string
   provider: AgentProvider
   turn: HarnessTurn | null
-  startupPending?: boolean
   redeliveringPromptId?: string
-  startupAbort?: AbortController
-  toolsReady?: Promise<void>
   claudePromptSeq?: number
   /** Only background wakeups can finish without a submitted prompt sequence. */
   claudeBackgroundTurn?: boolean
@@ -273,8 +270,11 @@ interface ActiveTurn {
   pendingTool: PendingToolRequest | null
   postToolFollowUp: { content: string; planMode: boolean } | null
   hasFinalResult: boolean
-  contextRestorationId?: string
   claudeSourceSessionToken?: string | null
+  startupPending?: boolean
+  startupAbort?: AbortController
+  toolsReady?: Promise<void>
+  contextRestorationId?: string
   cancelRequested: boolean
   cancelRecorded: boolean
 }
@@ -282,9 +282,9 @@ interface ActiveTurn {
 interface ClaudeSessionHandle {
   startupOutcome?: HarnessStartupOutcome
   waitForStartupOutcome?: () => Promise<HarnessStartupOutcome>
-  waitUntilReady?: () => Promise<void>
   provider: "claude"
   stream: AsyncIterable<HarnessEvent>
+  waitUntilReady?: () => Promise<void>
   getAccountInfo?: () => Promise<any>
   getUsage?: () => Promise<ClaudeUsageRaw | null>
   interrupt: () => Promise<void>
@@ -315,13 +315,13 @@ interface ClaudeSessionState {
   autoPlan: boolean
   /** Finish an earlier setter before a replacement turn configures this session. */
   configurationTail: Promise<void>
-  sessionToken: string | null
-  accountInfoLoaded: boolean
-  forceClosed: boolean
-  /** Native events become durable only after the replacement history commits. */
+  /** Consume startup events immediately, but publish only after edit/fork history is ready. */
   publicationReady: Promise<void>
   releasePublication: () => void
   streamFailure?: Error
+  sessionToken: string | null
+  accountInfoLoaded: boolean
+  forceClosed: boolean
   nextPromptSeq: number
   /** Prompts sent and not yet answered, oldest first. */
   pendingPrompts: Array<{ seq: number; id: string }>
@@ -361,6 +361,13 @@ interface AgentCoordinatorArgs {
     cwd: string,
     preferredProvider?: TitleGenerationProvider
   ) => Promise<GenerateChatTitleResult>
+  prepareClaudeSession?: (args: {
+    localPath: string
+    sessionToken: string
+    resumeSessionAt?: string
+    boundarySessionToken?: string | null
+    transcriptPrefix: TranscriptEntry[]
+  }) => Promise<string | PreparedClaudeTranscriptFork>
   startClaudeSession?: (args: {
     localPath: string
     model: string
@@ -387,14 +394,6 @@ interface AgentCoordinatorArgs {
     provider: AgentProvider,
     query: { cwd: string; sessionToken: string | null | undefined }
   ) => SessionArtifactStatus
-
-  prepareClaudeSession?: (args: {
-    localPath: string
-    sessionToken: string
-    resumeSessionAt?: string
-    boundarySessionToken?: string | null
-    transcriptPrefix: TranscriptEntry[]
-  }) => Promise<string | PreparedClaudeTranscriptFork>
 }
 
 async function prepareClaudeSession(args: {
@@ -1070,6 +1069,20 @@ function subagentHooks(
   }
 }
 
+function claudeSessionHooks(args: {
+  onSubagentActivity?: (update: SubagentActivityUpdate) => void
+  onBackgroundWorkStateChange?: (state: ClaudeBackgroundWorkState) => void
+}): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+  const hooks = args.onSubagentActivity ? subagentHooks(args.onSubagentActivity) : {}
+  if (args.onBackgroundWorkStateChange) {
+    hooks.Stop = [
+      ...(hooks.Stop ?? []),
+      { hooks: [createClaudeStopHook(args.onBackgroundWorkStateChange)] },
+    ]
+  }
+  return hooks
+}
+
 export async function startClaudeSession(args: {
   localPath: string
   model: string
@@ -1090,9 +1103,7 @@ export async function startClaudeSession(args: {
    * (background-tasks.ts) and SDK hooks (`subagentHooks`).
   */
   onSubagentActivity?: (update: SubagentActivityUpdate) => void
-
   onBackgroundWorkStateChange?: (state: ClaudeBackgroundWorkState) => void
-
 }, deps = { query, resolveExecutable: resolveClaudeExecutable }): Promise<ClaudeSessionHandle> {
   const canUseTool: CanUseTool = async (toolName, input, options) => {
     if (toolName !== "AskUserQuestion" && toolName !== "ExitPlanMode") {
@@ -1200,7 +1211,7 @@ export async function startClaudeSession(args: {
   // first push. supportedCommands() below prefers this over a q re-fetch.
   const commandsRef: { current: SlashCommand[] | null } = { current: null }
   // The first initialize response follows native resume/fork loading and
-  // native session validation in the supported headless CLI (2.1.284 source
+  // resumeSessionAt validation in the supported headless CLI (2.1.284 source
   // audited). Missing explicit resume exits before this response. Its payload
   // alone is not lineage proof, and a later reinitialize is not this barrier.
   const nativeStartup = q.initializationResult().then((): HarnessStartupOutcome => ({
@@ -1293,6 +1304,7 @@ export class AgentCoordinator {
     cwd: string,
     preferredProvider?: TitleGenerationProvider
   ) => Promise<GenerateChatTitleResult>
+  private readonly prepareClaudeSessionFn: NonNullable<AgentCoordinatorArgs["prepareClaudeSession"]>
   private readonly startClaudeSessionFn: NonNullable<AgentCoordinatorArgs["startClaudeSession"]>
   private readonly checkSessionArtifactFn: NonNullable<AgentCoordinatorArgs["checkSessionArtifact"]>
   private reportBackgroundError: ((message: string) => void) | null = null
@@ -1300,11 +1312,12 @@ export class AgentCoordinator {
   private cursorModelCatalogApplied = false
   private grokModelCatalogApplied = false
   private codexModelCatalogRefresh: Promise<void> | null = null
+  readonly activeTurns = new Map<string, ActiveTurn>()
   private readonly codexHistoryChecks = new Map<string, symbol>()
   private readonly cancelledCodexHistoryChecks = new Set<symbol>()
   private readonly startingClaudeTurns = new Map<string, symbol>()
+  /** A cancelled edit's in-flight durable write must settle before another startup reads history. */
   private readonly claudeReadinessCommits = new Map<string, Promise<void>>()
-  readonly activeTurns = new Map<string, ActiveTurn>()
   private readonly historyOperations = new Map<string, {
     cancelled: boolean; snapshot: string; sessionToken: string | null
     turnCount: number | undefined
@@ -1336,18 +1349,18 @@ export class AgentCoordinator {
    */
   private readonly foregroundTasks = new Map<string, Map<string, { task: TaskStart; startedAt: number }>>()
   readonly claudeSessions = new Map<string, ClaudeSessionState>()
-  private readonly idleSessionTimers = new Map<string, ReturnType<typeof setTimeout>>()
-  private readonly pendingCodexSteers = new Map<string, Set<string>>()
-  private readonly activeCodexCommands = new Map<string, symbol>()
-  private idleSessionTimeoutMs: number | null = null
-  private readonly codexSteerCompletions = new Map<string, Promise<string | undefined>>()
-  private readonly cancelingChats = new Set<string>()
   private readonly preparedClaudeEditSessions = new Map<string, {
     sourceSessionToken: string
     resumeSessionAt: string
     sessionToken: string
     transcriptPrefix: TranscriptEntry[]
   }>()
+  private readonly idleSessionTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private readonly activeCodexCommands = new Map<string, symbol>()
+  private idleSessionTimeoutMs: number | null = null
+  private readonly pendingCodexSteers = new Map<string, Set<string>>()
+  private readonly codexSteerCompletions = new Map<string, Promise<string | undefined>>()
+  private readonly cancelingChats = new Set<string>()
   private readonly asyncQuestionResponses = new Map<string, Promise<void>>()
 
   constructor(args: AgentCoordinatorArgs) {
@@ -1384,7 +1397,6 @@ export class AgentCoordinator {
       }))
     this.prepareClaudeSessionFn = args.prepareClaudeSession
       ?? (args.startClaudeSession ? async ({ sessionToken }) => sessionToken : prepareClaudeSession)
-
     this.startClaudeSessionFn = args.startClaudeSession ?? startClaudeSession
     this.checkSessionArtifactFn = args.checkSessionArtifact ?? checkSessionArtifact
   }
@@ -2036,9 +2048,7 @@ export class AgentCoordinator {
   }
 
   private async dequeueAndStartQueuedMessage(chatId: string, queuedMessage: QueuedChatMessage, options?: { steered?: boolean; retryPersisted?: boolean }) {
-
     if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
-
     const chat = this.store.requireChat(chatId)
     const provider = this.resolveProvider(queuedMessage, chat.provider)
     const start = async (startupReservation?: symbol) => {
@@ -2192,9 +2202,6 @@ export class AgentCoordinator {
     }
   }
 
-  
-  
-
   private async interruptAndCloseTurn(turn: HarnessTurn | null) {
     if (!turn) return
     try {
@@ -2207,7 +2214,6 @@ export class AgentCoordinator {
     }
     turn.close()
   }
-
 
   private async withClaudeStartupReservation<TResult>(chatId: string, start: (reservation: symbol) => Promise<TResult>): Promise<TResult> {
     if (this.startingClaudeTurns.has(chatId)) throw new Error("Chat is already starting")
@@ -2225,8 +2231,6 @@ export class AgentCoordinator {
       }
     }
   }
-
-  
 
   private async startTurnForChat(args: {
     chatId: string
@@ -2256,9 +2260,7 @@ export class AgentCoordinator {
     startupReservation?: symbol
     expectedCodexSessionToken?: string
   }) {
-
     if (this.activeCodexCommands.has(args.chatId)) throw new Error("A Codex command is already running")
-
     if (args.startupReservation) {
       if (this.startingClaudeTurns.get(args.chatId) !== args.startupReservation) throw new Error("Chat startup reservation was replaced")
       return await this.startReservedTurnForChat(args)
@@ -2271,7 +2273,6 @@ export class AgentCoordinator {
     const pendingCommit = this.claudeReadinessCommits.get(args.chatId)
     if (pendingCommit) await pendingCommit
     if (args.startupReservation && this.startingClaudeTurns.get(args.chatId) !== args.startupReservation) return
-
     if (this.activeCodexCommands.has(args.chatId)) throw new Error("A Codex command is already running")
     const chat = this.store.requireChat(args.chatId)
     if (this.activeTurns.has(args.chatId)) throw new Error("Chat is already running")
@@ -2503,17 +2504,12 @@ export class AgentCoordinator {
       assertCurrent()
       if (shouldGenerateTitle) void this.generateTitleInBackground(args.chatId, args.content, project.localPath, optimisticTitle ?? "New Chat", args.provider)
 
-
       const isQuestionReply = args.provider === "codex" && parseCodexQuestionReplies(args.content).length > 0
-
-
       const skills = isQuestionReply ? [] : await awaitOwned(() => this.resolvePromptSkills(args.provider, args.chatId, args.content))
       let wireContent = args.steered && !isQuestionReply ? buildSteeredMessageContent(args.content) : args.content
       if (args.provider !== "codex" && skills.length > 0) wireContent = appendSystemMessageBlock(wireContent, buildSkillSystemMessage(skills))
       const concurrentAgentsNotice = buildConcurrentAgentsNotice(this.collectConcurrentProjectChats(args.chatId, project.localPath))
-
       if (concurrentAgentsNotice && !isQuestionReply) wireContent = appendSystemMessageBlock(wireContent, concurrentAgentsNotice)
-
       let existingMessagesCache: ReturnType<typeof this.store.getMessages> | null = null
       const prepareWireContent = async (outcome: HarnessStartupOutcome) => {
         assertCurrent()
@@ -2579,8 +2575,8 @@ export class AgentCoordinator {
         if (forceFreshContext || !chat.sessionToken) await ensureRestoration("session_restore", args.provider)
         await prepareWireContent({ kind: "unknown", reason: "Cursor print CLI has no pre-input load acknowledgement" })
         void this.refreshCursorModelCatalog()
-        turn = await this.cursorManager.startTurn({ cwd: project.localPath, customTools, content: buildPromptText(wireContent, args.attachments),
-          model: args.model, sessionToken: forceFreshContext ? null : chat.sessionToken })
+        turn = await this.cursorManager.startTurn({ cwd: project.localPath, customTools,
+          content: buildPromptText(wireContent, args.attachments), model: args.model, sessionToken: forceFreshContext ? null : chat.sessionToken })
         active.turn = turn
         assertCurrent()
       } else if (args.provider === "grok") {
@@ -2741,10 +2737,7 @@ export class AgentCoordinator {
         active.claudePromptSeq = promptSeq
         active.status = "running"
         this.emitStateChange(args.chatId)
-      await session.session.sendPrompt(
-        buildPromptText(wireContent, args.attachments),
-        promptId,
-      )
+        await session.session.sendPrompt(buildPromptText(wireContent, args.attachments), promptId)
         return
       }
       void this.runTurn(active as ActiveTurn & { turn: HarnessTurn })
@@ -3028,7 +3021,9 @@ export class AgentCoordinator {
     const slashCommand = provider === "codex" ? parseCodexSlashCommand(command.content) : null
     if (slashCommand) {
       if (command.attachments?.length) throw new Error(`${slashCommand} cannot be used with attachments`)
-      if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId) || this.hasPendingCodexSteer(chatId)) throw new Error(`${slashCommand} cannot run while a turn is active`)
+      if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId) || this.hasPendingCodexSteer(chatId)) {
+        throw new Error(`${slashCommand} cannot run while a turn is active`)
+      }
       if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
       if (!chat.sessionToken) throw new Error(`${slashCommand} requires an existing Codex thread`)
       const project = this.store.getProject(chat.projectId)
@@ -3580,9 +3575,7 @@ export class AgentCoordinator {
   }
 
   private async performEditUserPrompt(command: Extract<ClientCommand, { type: "chat.editUserPrompt" }>) {
-
     if (this.activeCodexCommands.has(command.chatId)) throw new Error("A Codex command is already running")
-
     let content = command.content.trim()
     if (!content) {
       throw new Error("Message cannot be empty")
@@ -3644,10 +3637,10 @@ export class AgentCoordinator {
         attachments = plan.attachments
         sessionToken = await this.prepareCodexHistoryPlan(command.chatId, command.messageId, plan, project.localPath, settings)
         this.assertHistoryOperation(command.chatId)
-        pendingForkSessionToken=null
-        stopCodexSessionOnStartFailure=true
+        pendingForkSessionToken = null
+        stopCodexSessionOnStartFailure = true
         const prepared = sessionToken
-        onProviderReady=async(isCurrentTurn,outcome)=> {
+        onProviderReady = async (isCurrentTurn, outcome) => {
           if (!isCurrentTurn() || outcome.kind === "fresh") return
           this.assertHistoryOperation(command.chatId)
           if (!isCurrentTurn()) return
@@ -3655,9 +3648,10 @@ export class AgentCoordinator {
           this.assertHistoryOperation(command.chatId)
           if (!isCurrentTurn()) return
           const retained: Record<string, CodexPromptBinding> = {}
-          for(const entry of prefix) if(bindings[entry._id]) {
+          for (const entry of prefix) if (bindings[entry._id]) {
             const binding = bindings[entry._id]!
-            retained[entry._id]={...binding,sessionToken:binding.sessionToken===plan.sessionToken?prepared!:binding.sessionToken}
+            retained[entry._id] = { ...binding,
+              sessionToken: binding.sessionToken === plan.sessionToken ? prepared! : binding.sessionToken }
           }
           await this.codexPromptHistory.remember(command.chatId, retained)
           await this.retainCodexClassification(command.chatId, chat.codexHistoryIntegrity,
@@ -3744,13 +3738,13 @@ export class AgentCoordinator {
             modelOptions: settings.chatModelOptions,
           },
           appendUserPrompt: true,
-          startupReservation,
           sessionToken,
           pendingForkSessionToken,
           forkSession,
           resumeSessionAt,
           resetSession,
           replaceTranscriptPrefix: prefix,
+          startupReservation,
           expectedCodexSessionToken: stopCodexSessionOnStartFailure ? sessionToken ?? undefined : undefined,
           onProviderReady,
         })
@@ -3791,6 +3785,30 @@ export class AgentCoordinator {
       }
     }
     return { queuedMessageId: queuedMessage.id }
+  }
+
+  private async failCodexHistoryTurn(chatId: string, active: ActiveTurn, error: unknown) {
+    if (active.cancelRequested) return
+    if (this.activeTurns.has(chatId) && this.activeTurns.get(chatId) !== active) return
+    active.cancelRequested = true
+    active.cancelRecorded = true
+    active.customTools?.abort()
+    void active.turn?.interrupt().catch(() => {})
+    active.turn?.close()
+    this.codexManager.stopSession(chatId)
+    if (this.activeTurns.get(chatId) === active) this.activeTurns.delete(chatId)
+    if (this.drainingStreams.get(chatId)?.turn === active.turn) this.drainingStreams.delete(chatId)
+    const message = `Codex history could not be saved or recovered: ${error instanceof Error ? error.message : String(error)}`
+    await this.store.appendMessage(chatId, timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: message }))
+    await this.store.recordTurnFailed(chatId, message)
+    this.emitStateChange(chatId)
+  }
+
+  private async recordCodexHistoryFailure(chatId: string, error: unknown) {
+    const message = `Codex history could not be saved or recovered: ${error instanceof Error ? error.message : String(error)}`
+    await this.store.appendMessage(chatId, timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: message }))
+    await this.store.recordTurnFailed(chatId, message)
+    this.emitStateChange(chatId)
   }
 
   async steer(command: Extract<ClientCommand, { type: "message.steer" }>): Promise<void> {
@@ -4455,7 +4473,6 @@ export class AgentCoordinator {
         if (event.type === "session_token" && event.sessionToken) session.sessionToken = event.sessionToken
         await session.publicationReady
         if (!isCurrentClaudeSession()) break
-
         if (event.type === "session_token" && event.sessionToken) {
           if (this.store.getChat(session.chatId)?.sessionToken !== event.sessionToken) {
             await this.store.setSessionToken(session.chatId, event.sessionToken)
@@ -4877,7 +4894,6 @@ export class AgentCoordinator {
       const active = this.activeTurns.get(chatId)
       if (!active) return
 
-
       logClaudeSteer("cancel_requested", {
         chatId,
         provider: active.provider,
@@ -4889,10 +4905,10 @@ export class AgentCoordinator {
       active.cancelRequested = true
       active.startupAbort?.abort()
 
-    // Keep in-flight stream entries (emitted before the interrupt lands)
-    // from re-registering an active turn via resumeBackgroundTurn, and mark
-    // the cancelled prompt so its interrupt error result gets dropped.
-    if (active.provider === "claude") {
+      // Keep in-flight stream entries (emitted before the interrupt lands)
+      // from re-registering an active turn via resumeBackgroundTurn, and mark
+      // the cancelled prompt so its interrupt error result gets dropped.
+      if (active.provider === "claude") {
         const session = this.claudeSessions.get(chatId)
         if (session) {
           session.suppressResume = true
@@ -4906,7 +4922,7 @@ export class AgentCoordinator {
       active.pendingTool = null
       active.customTools?.abort()
 
-    if (pendingTool && pendingTool.resultOwner !== "tool") {
+      if (pendingTool && pendingTool.resultOwner !== "tool") {
         const result = discardedToolResult(pendingTool.tool)
         await this.store.appendMessage(
           chatId,
@@ -4925,12 +4941,14 @@ export class AgentCoordinator {
         }
       }
 
-    if (!historyOperation || historyOperation.publicationStarted) {
+      // An edit owns startup before its replacement transcript is published.
+      // Cancelling that preparation must leave the source history untouched.
+      if (!historyOperation || historyOperation.publicationStarted) {
         await this.store.appendMessage(chatId, timestamped({ kind: "interrupted", hidden: options?.hideInterrupted }))
         await this.store.recordTurnCancelled(chatId)
       }
-    active.cancelRecorded = true
-    active.hasFinalResult = true
+      active.cancelRecorded = true
+      active.hasFinalResult = true
 
       // Remove from activeTurns immediately so the UI reflects the cancellation
       // right away, rather than waiting for interrupt() which may hang.
@@ -4943,6 +4961,7 @@ export class AgentCoordinator {
         activePromptSeq: active.claudePromptSeq ?? null,
       })
 
+      // The turn may still be waiting for Claude startup readiness.
       await this.interruptAndCloseTurn(active.turn)
     } finally {
       if (!this.hasPendingCodexSteer(chatId)) {
@@ -5158,44 +5177,4 @@ export class AgentCoordinator {
       }
     }
   }
-
-  private readonly prepareClaudeSessionFn: NonNullable<AgentCoordinatorArgs["prepareClaudeSession"]>
-
-  private async recordCodexHistoryFailure(chatId: string, error: unknown) {
-    const message = `Codex history could not be saved or recovered: ${error instanceof Error ? error.message : String(error)}`
-    await this.store.appendMessage(chatId, timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: message }))
-    await this.store.recordTurnFailed(chatId, message)
-    this.emitStateChange(chatId)
-  }
-
-  private async failCodexHistoryTurn(chatId: string, active: ActiveTurn, error: unknown) {
-    if (active.cancelRequested) return
-    if (this.activeTurns.has(chatId) && this.activeTurns.get(chatId) !== active) return
-    active.cancelRequested = true
-    active.cancelRecorded = true
-    active.customTools?.abort()
-    void active.turn?.interrupt().catch(() => {})
-    active.turn?.close()
-    this.codexManager.stopSession(chatId)
-    if (this.activeTurns.get(chatId) === active) this.activeTurns.delete(chatId)
-    if (this.drainingStreams.get(chatId)?.turn === active.turn) this.drainingStreams.delete(chatId)
-    const message = `Codex history could not be saved or recovered: ${error instanceof Error ? error.message : String(error)}`
-    await this.store.appendMessage(chatId, timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: message }))
-    await this.store.recordTurnFailed(chatId, message)
-    this.emitStateChange(chatId)
-  }
-}
-
-function claudeSessionHooks(args: {
-  onSubagentActivity?: (update: SubagentActivityUpdate) => void
-  onBackgroundWorkStateChange?: (state: ClaudeBackgroundWorkState) => void
-}): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
-  const hooks = args.onSubagentActivity ? subagentHooks(args.onSubagentActivity) : {}
-  if (args.onBackgroundWorkStateChange) {
-    hooks.Stop = [
-      ...(hooks.Stop ?? []),
-      { hooks: [createClaudeStopHook(args.onBackgroundWorkStateChange)] },
-    ]
-  }
-  return hooks
 }

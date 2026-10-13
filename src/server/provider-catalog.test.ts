@@ -1,20 +1,24 @@
-import { CLAUDE_REASONING_OPTIONS, DEFAULT_PI_FAVE_MODELS, DEFAULT_PI_MODEL, resolveClaudeApiModelId } from "../shared/types"
-import { getServerClaudeRuntimeEffort, SERVER_PROVIDERS, applyClaudeSdkModels, applyCodexModels, applyCursorModels, applyGrokModels, applyPiFaveModels, cursorModelIdForOptions, normalizeClaudeModelOptions, normalizeCodexModelOptions, normalizeCursorModelOptions, normalizeServerModel, resetServerProvidersForTests, serviceTierFromModelOptions, normalizePiModelOptions } from "./provider-catalog"
 import { afterEach, describe, expect, test } from "bun:test"
+import {
+  SERVER_PROVIDERS,
+  applyClaudeSdkModels,
+  applyCodexModels,
+  applyCursorModels,
+  applyGrokModels,
+  applyPiFaveModels,
+  cursorModelIdForOptions,
+  normalizeClaudeModelOptions,
+  normalizeCodexModelOptions,
+  normalizeCursorModelOptions,
+  normalizePiModelOptions,
+  normalizeServerModel,
+  getServerClaudeRuntimeEffort,
+  resetServerProvidersForTests,
+  serviceTierFromModelOptions,
+} from "./provider-catalog"
+import { CLAUDE_REASONING_OPTIONS, DEFAULT_PI_FAVE_MODELS, DEFAULT_PI_MODEL, resolveClaudeApiModelId } from "../shared/types"
 
 describe("provider catalog normalization", () => {
-  test("Claude SDK effort stays native while recognized preferences are preserved", () => {
-    applyClaudeSdkModels([{
-      value: "opus",
-      supportsEffort: true,
-      supportedEffortLevels: CLAUDE_REASONING_OPTIONS.map((option) => option.id),
-    }])
-    for (const { id: effort } of CLAUDE_REASONING_OPTIONS) {
-      expect(normalizeClaudeModelOptions("opus", { claude: { reasoningEffort: effort } }).reasoningEffort).toBe(effort)
-      expect(String(getServerClaudeRuntimeEffort("opus", effort))).toBe(String(effort) === "ultracode" ? "xhigh" : String(effort))
-    }
-  })
-
   afterEach(() => {
     resetServerProvidersForTests()
   })
@@ -88,6 +92,43 @@ describe("provider catalog normalization", () => {
     }).reasoningEffort).toBe("high")
   })
 
+
+
+  test("Claude SDK effort stays native while recognized preferences are preserved", () => {
+    applyClaudeSdkModels([{
+      value: "opus",
+      supportsEffort: true,
+      supportedEffortLevels: CLAUDE_REASONING_OPTIONS.map((option) => option.id),
+    }])
+    for (const { id: effort } of CLAUDE_REASONING_OPTIONS) {
+      expect(normalizeClaudeModelOptions("opus", { claude: { reasoningEffort: effort } }).reasoningEffort).toBe(effort)
+      expect(String(getServerClaudeRuntimeEffort("opus", effort))).toBe(String(effort) === "ultracode" ? "xhigh" : String(effort))
+    }
+  })
+
+  test("Claude fallback belongs to the SDK's supported effort set", () => {
+    applyClaudeSdkModels([{ value: "opus", supportsEffort: true, supportedEffortLevels: ["low", "medium"] }])
+    expect(normalizeClaudeModelOptions("opus").reasoningEffort).toBe("medium")
+    expect(normalizeClaudeModelOptions("opus", { claude: { reasoningEffort: "max" } }).reasoningEffort).toBe("medium")
+    expect(normalizeClaudeModelOptions("opus", undefined, "low").reasoningEffort).toBe("low")
+  })
+
+  test("Claude fallback supports a max-only SDK model and normalized aliases", () => {
+    applyClaudeSdkModels([{ value: "opus", resolvedModel: "claude-opus-4-8", supportsEffort: true, supportedEffortLevels: ["max"] }])
+    expect(normalizeClaudeModelOptions("claude-opus-4-8").reasoningEffort).toBe("max")
+    expect(normalizeClaudeModelOptions("opus", undefined, "low").reasoningEffort).toBe("max")
+  })
+
+  test("Claude wire options omit effort when the SDK disables or cannot support it", () => {
+    applyClaudeSdkModels([{ value: "haiku", supportsEffort: false, supportedEffortLevels: ["low"] }])
+    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
+    applyClaudeSdkModels([{ value: "haiku", supportsEffort: true, supportedEffortLevels: [] }])
+    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
+    applyClaudeSdkModels([{ value: "haiku", supportsEffort: true, supportedEffortLevels: ["future-effort"] }])
+    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
+  })
+
+
   test("normalizes Claude fast mode only for supported models", () => {
     const opus = normalizeClaudeModelOptions("claude-opus-4-8", {
       claude: { reasoningEffort: "high", fastMode: true },
@@ -101,6 +142,51 @@ describe("provider catalog normalization", () => {
     }).fastMode).toBe(false)
 
     expect(serviceTierFromModelOptions(normalizeClaudeModelOptions("claude-opus-4-8", undefined))).toBeUndefined()
+  })
+
+  test("prefers explicit options, then legacy effort, then persisted options", () => {
+    const persistedClaudeOptions = {
+      claude: { reasoningEffort: "max" as const, contextWindow: "1m" as const, fastMode: true },
+    }
+    expect(normalizeClaudeModelOptions(
+      "claude-opus-4-8",
+      undefined,
+      "low",
+      persistedClaudeOptions,
+    )).toEqual({
+      reasoningEffort: "low",
+      contextWindow: "1m",
+      fastMode: true,
+    })
+    expect(normalizeClaudeModelOptions(
+      "claude-opus-4-8",
+      { claude: { reasoningEffort: "medium" } },
+      "low",
+      persistedClaudeOptions,
+    )).toEqual({
+      reasoningEffort: "medium",
+      contextWindow: "1m",
+      fastMode: true,
+    })
+
+    const persistedCodexOptions = {
+      codex: { reasoningEffort: "ultra" as const, fastMode: true },
+    }
+    expect(normalizeCodexModelOptions(
+      "gpt-5.6-sol",
+      { codex: { fastMode: false } },
+      "low",
+      persistedCodexOptions,
+    )).toEqual({
+      reasoningEffort: "low",
+      fastMode: false,
+    })
+    expect(normalizeCursorModelOptions(undefined, {
+      cursor: { fastMode: true },
+    })).toEqual({ fastMode: true })
+    expect(normalizePiModelOptions(undefined, undefined, {
+      pi: { reasoningEffort: "high" },
+    })).toEqual({ reasoningEffort: "high" })
   })
 
   test("normalizes Claude context window only for supported models", () => {
@@ -460,76 +546,5 @@ describe("provider catalog normalization", () => {
       { value: "sonnet[1m]", resolvedModel: "claude-sonnet-5[1m]", displayName: "Sonnet (1M context)", supportsEffort: true },
       { value: "nova", resolvedModel: "claude-nova-2", displayName: "Nova" },
     ])).toBe(false)
-  })
-
-
-  test("Claude fallback belongs to the SDK's supported effort set", () => {
-    applyClaudeSdkModels([{ value: "opus", supportsEffort: true, supportedEffortLevels: ["low", "medium"] }])
-    expect(normalizeClaudeModelOptions("opus").reasoningEffort).toBe("medium")
-    expect(normalizeClaudeModelOptions("opus", { claude: { reasoningEffort: "max" } }).reasoningEffort).toBe("medium")
-    expect(normalizeClaudeModelOptions("opus", undefined, "low").reasoningEffort).toBe("low")
-  })
-
-
-  test("Claude fallback supports a max-only SDK model and normalized aliases", () => {
-    applyClaudeSdkModels([{ value: "opus", resolvedModel: "claude-opus-4-8", supportsEffort: true, supportedEffortLevels: ["max"] }])
-    expect(normalizeClaudeModelOptions("claude-opus-4-8").reasoningEffort).toBe("max")
-    expect(normalizeClaudeModelOptions("opus", undefined, "low").reasoningEffort).toBe("max")
-  })
-
-
-  test("Claude wire options omit effort when the SDK disables or cannot support it", () => {
-    applyClaudeSdkModels([{ value: "haiku", supportsEffort: false, supportedEffortLevels: ["low"] }])
-    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
-    applyClaudeSdkModels([{ value: "haiku", supportsEffort: true, supportedEffortLevels: [] }])
-    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
-    applyClaudeSdkModels([{ value: "haiku", supportsEffort: true, supportedEffortLevels: ["future-effort"] }])
-    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
-  })
-
-
-  test("prefers explicit options, then legacy effort, then persisted options", () => {
-    const persistedClaudeOptions = {
-      claude: { reasoningEffort: "max" as const, contextWindow: "1m" as const, fastMode: true },
-    }
-    expect(normalizeClaudeModelOptions(
-      "claude-opus-4-8",
-      undefined,
-      "low",
-      persistedClaudeOptions,
-    )).toEqual({
-      reasoningEffort: "low",
-      contextWindow: "1m",
-      fastMode: true,
-    })
-    expect(normalizeClaudeModelOptions(
-      "claude-opus-4-8",
-      { claude: { reasoningEffort: "medium" } },
-      "low",
-      persistedClaudeOptions,
-    )).toEqual({
-      reasoningEffort: "medium",
-      contextWindow: "1m",
-      fastMode: true,
-    })
-
-    const persistedCodexOptions = {
-      codex: { reasoningEffort: "ultra" as const, fastMode: true },
-    }
-    expect(normalizeCodexModelOptions(
-      "gpt-5.6-sol",
-      { codex: { fastMode: false } },
-      "low",
-      persistedCodexOptions,
-    )).toEqual({
-      reasoningEffort: "low",
-      fastMode: false,
-    })
-    expect(normalizeCursorModelOptions(undefined, {
-      cursor: { fastMode: true },
-    })).toEqual({ fastMode: true })
-    expect(normalizePiModelOptions(undefined, undefined, {
-      pi: { reasoningEffort: "high" },
-    })).toEqual({ reasoningEffort: "high" })
   })
 })

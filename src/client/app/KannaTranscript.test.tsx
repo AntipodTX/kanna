@@ -4,7 +4,12 @@ import { CollapsedToolGroup } from "../components/messages/CollapsedToolGroup"
 import { OpenLocalLinkProvider } from "../components/messages/shared"
 import { formatPromptTimestamp } from "../components/messages/ResultMessage"
 import type { HydratedTranscriptMessage } from "../../shared/types"
-import { buildResolvedTranscriptRows, computeStableResolvedTranscriptRows, KannaTranscriptRow, type StableResolvedTranscriptRowsState } from "./KannaTranscript"
+import {
+  buildResolvedTranscriptRows,
+  computeStableResolvedTranscriptRows,
+  KannaTranscriptRow,
+  type StableResolvedTranscriptRowsState,
+} from "./KannaTranscript"
 
 const ROW_WRAPPER_CLASS = "mx-auto max-w-[800px] pb-5"
 
@@ -40,11 +45,11 @@ function TestTranscript({
             onToolGroupExpandedChange={() => undefined}
             onAskUserQuestionSubmit={() => undefined}
             onExitPlanModeConfirm={() => undefined}
-            {...{ onCodexApprovalDecision: () => undefined }}
             onEditUserPrompt={onEditUserPrompt}
             isEditUserPromptDisabled={isEditUserPromptDisabled}
             onForkUserPrompt={onForkUserPrompt}
             isForkUserPromptDisabled={isForkUserPromptDisabled}
+            {...{ onCodexApprovalDecision: () => undefined }}
           />
         </div>
       ))}
@@ -92,6 +97,48 @@ function createToolMessage(id: string, toolId = id): HydratedTranscriptMessage {
 }
 
 describe("KannaTranscript", () => {
+  test("keeps older async question cards interactive after the turn ends", () => {
+    const html = renderTranscript([
+      { id: "q1", kind: "tool", toolKind: "ask_user_question", toolName: "AskUserQuestion", toolId: "q1",
+        input: { codexAsync: { threadId: "thread" }, questions: [{ id: "q", question: "Cleanup?", options: [{ label: "All" }, { label: "Empty" }] }] },
+        timestamp: new Date().toISOString() },
+      { id: "r", kind: "result", success: true, result: "Done", durationMs: 1, timestamp: new Date().toISOString() },
+    ])
+    expect(html).toContain("Cleanup?")
+    expect(html).toContain("Submit")
+    expect(html).not.toContain("newer question active")
+  })
+
+  test("renders native async replies as readable answers, not their transport envelope", () => {
+    const html = renderTranscript([{ id: "a", kind: "user_prompt", content: '<send_user_message_question_reply>{"questionItemId":"q","question":"Cleanup?","answer":"All"}</send_user_message_question_reply>', timestamp: new Date().toISOString() }])
+    expect(html).toContain("Cleanup?")
+    expect(html).toContain("All")
+    expect(html).not.toContain("questionItemId")
+  })
+
+  test("native async replies exclude history actions while ordinary prompts keep them", () => {
+    const options = { onEditUserPrompt: () => undefined, onForkUserPrompt: () => undefined }
+    const timestamp = new Date().toISOString()
+    const reply = renderTranscript([{ id: "answer", kind: "user_prompt", timestamp,
+      content: '<send_user_message_question_reply>[{"questionItemId":"q","question":"Cleanup?","answer":"All"}]</send_user_message_question_reply>',
+    }], options)
+    expect(reply).toContain("Cleanup?")
+    expect(reply).toContain("All")
+    expect(reply).not.toContain("Edit message")
+    expect(reply).not.toContain("Fork message")
+    const ordinary = renderTranscript([{ id: "prompt", kind: "user_prompt", timestamp, content: "Continue" }], options)
+    expect(ordinary).toContain("Edit message")
+    expect(ordinary).toContain("Fork message")
+  })
+
+  test("a partially answered async group opens its remaining question", () => {
+    const html = renderTranscript([{ id: "q1", kind: "tool", toolKind: "ask_user_question", toolName: "AskUserQuestion", toolId: "q1",
+      input: { codexAsync: { threadId: "thread" }, questions: [{ id: "a", question: "Already answered?" }, { id: "b", question: "Still open?" }] },
+      result: { answers: { a: ["Yes"] } }, timestamp: new Date().toISOString() }])
+    expect(html).toContain('aria-label="Still open?"')
+    expect(html).not.toContain('aria-label="Already answered?"')
+  })
+
   test("renders user attachment cards outside the user bubble", () => {
     const html = renderTranscript([
       {
@@ -115,6 +162,91 @@ describe("KannaTranscript", () => {
     expect(html).toContain("spec.pdf")
     expect(html).toContain("application/pdf")
     expect(html).toContain("What are these files about?")
+  })
+
+  test("renders an edit control for editable user prompts", () => {
+    const html = renderTranscript([
+      {
+        id: "user-edit-1",
+        kind: "user_prompt",
+        content: "Adjust this",
+        attachments: [],
+        timestamp: new Date().toISOString(),
+      },
+    ], {
+      onEditUserPrompt: () => undefined,
+    })
+
+    expect(html).toContain("Edit message")
+  })
+
+  test("renders a fork control for forkable user prompts", () => {
+    const html = renderTranscript([
+      {
+        id: "user-fork-1",
+        kind: "user_prompt",
+        content: "Branch from here",
+        attachments: [],
+        timestamp: new Date().toISOString(),
+      },
+    ], {
+      onForkUserPrompt: () => undefined,
+    })
+
+    expect(html).toContain("Fork message")
+  })
+
+  test("keeps the edit control visible while temporarily disabled", () => {
+    const html = renderTranscript([
+      {
+        id: "user-edit-disabled-1",
+        kind: "user_prompt",
+        content: "Keep the edit affordance in place",
+        attachments: [],
+        timestamp: new Date().toISOString(),
+      },
+    ], {
+      onEditUserPrompt: () => undefined,
+      isEditUserPromptDisabled: true,
+    })
+
+    expect(html).toContain("Edit message")
+    expect(html).toContain("disabled")
+  })
+
+  test("renders the edit control visibly without requiring hover", () => {
+    const html = renderTranscript([
+      {
+        id: "user-edit-visible-1",
+        kind: "user_prompt",
+        content: "Make the control discoverable",
+        attachments: [],
+        timestamp: new Date().toISOString(),
+      },
+    ], {
+      onEditUserPrompt: () => undefined,
+    })
+
+    expect(html).toContain("Edit message")
+    expect(html).not.toContain("opacity-0")
+  })
+
+  test("keeps the fork control visible while temporarily disabled", () => {
+    const html = renderTranscript([
+      {
+        id: "user-fork-disabled-1",
+        kind: "user_prompt",
+        content: "Keep the fork affordance in place",
+        attachments: [],
+        timestamp: new Date().toISOString(),
+      },
+    ], {
+      onForkUserPrompt: () => undefined,
+      isForkUserPromptDisabled: true,
+    })
+
+    expect(html).toContain("Fork message")
+    expect(html).toContain("disabled")
   })
 
   test("renders uploaded image attachments using the server content URL", () => {
@@ -830,6 +962,122 @@ Please check the latest error first.`,
     expect(updatedHtml).toContain("Run tool-3")
   })
 
+  test("reveals the selected tool inside an expanded group", () => {
+    const messages = Array.from({ length: 8 }, (_, index) => createToolMessage(`tool-${index + 1}`))
+    const html = renderToStaticMarkup(
+      <CollapsedToolGroup
+        messages={messages}
+        isLoading={false}
+        expanded
+        revealEntryId="tool-8"
+        onExpandedChange={() => undefined}
+      />
+    )
+
+    expect(html).not.toContain("echo tool-1")
+    expect(html).toContain("echo tool-8")
+    expect(html).toContain('id="msg-tool-8"')
+    expect(html).toContain("w-full kanna-jump-flash")
+  })
+
+  test("reveals and marks an exact entry inside an Agent transcript", () => {
+    const rows = buildResolvedTranscriptRows([{
+      id: "agent-1",
+      kind: "tool",
+      toolKind: "subagent_task",
+      toolName: "Agent",
+      toolId: "agent-tool-id",
+      input: { prompt: "Investigate", subagentType: "Explore" },
+      children: [
+        {
+          id: "child-text",
+          kind: "assistant_text",
+          text: "Nested explanation",
+          timestamp: new Date().toISOString(),
+        },
+        createToolMessage("child-tool"),
+      ],
+      timestamp: new Date().toISOString(),
+    }], {
+      isLoading: false,
+      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null },
+    })
+    const row = rows[0]!
+
+    const textHtml = renderToStaticMarkup(
+      <KannaTranscriptRow
+        row={row}
+        revealEntryId="child-text"
+        onToolGroupExpandedChange={() => undefined}
+        onAskUserQuestionSubmit={() => undefined}
+        onExitPlanModeConfirm={() => undefined}
+        {...{ onCodexApprovalDecision: () => undefined }}
+      />
+    )
+    const toolHtml = renderToStaticMarkup(
+      <KannaTranscriptRow
+        row={row}
+        revealEntryId="child-tool"
+        onToolGroupExpandedChange={() => undefined}
+        onAskUserQuestionSubmit={() => undefined}
+        onExitPlanModeConfirm={() => undefined}
+        {...{ onCodexApprovalDecision: () => undefined }}
+      />
+    )
+
+    expect(textHtml).toContain('id="msg-child-text"')
+    expect(textHtml).toContain("w-full kanna-jump-flash")
+    expect(toolHtml).toContain('id="msg-child-tool"')
+    expect(toolHtml).toContain("w-full kanna-jump-flash")
+    expect(toolHtml).toContain("echo child-tool")
+  })
+
+  test("reveals an exact Agent child when the Agent belongs to a tool group", () => {
+    const agent: HydratedTranscriptMessage = {
+      id: "agent-in-group",
+      kind: "tool",
+      toolKind: "subagent_task",
+      toolName: "Agent",
+      toolId: "agent-in-group-tool-id",
+      input: { prompt: "Investigate", subagentType: "Explore" },
+      children: [
+        {
+          id: "grouped-child-text",
+          kind: "assistant_text",
+          text: "Nested explanation",
+          timestamp: new Date().toISOString(),
+        },
+        createToolMessage("grouped-child-tool"),
+      ],
+      timestamp: new Date().toISOString(),
+    }
+
+    const textHtml = renderToStaticMarkup(
+      <CollapsedToolGroup
+        messages={[agent, createToolMessage("sibling-tool")]}
+        isLoading={false}
+        expanded
+        revealEntryId="grouped-child-text"
+        onExpandedChange={() => undefined}
+      />
+    )
+    const toolHtml = renderToStaticMarkup(
+      <CollapsedToolGroup
+        messages={[agent, createToolMessage("sibling-tool")]}
+        isLoading={false}
+        expanded
+        revealEntryId="grouped-child-tool"
+        onExpandedChange={() => undefined}
+      />
+    )
+
+    expect(textHtml).toContain('id="msg-grouped-child-text"')
+    expect(textHtml).toContain("w-full kanna-jump-flash")
+    expect(toolHtml).toContain('id="msg-grouped-child-tool"')
+    expect(toolHtml).toContain("w-full kanna-jump-flash")
+    expect(toolHtml).toContain("echo grouped-child-tool")
+  })
+
   test("reuses unchanged single row objects across streaming updates", () => {
     const latestToolIds = { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null }
     const previousRows = buildResolvedTranscriptRows([
@@ -968,260 +1216,5 @@ Please check the latest error first.`,
     const stableState = computeStableResolvedTranscriptRows(nextRows, previousState)
 
     expect(stableState.result[0]).toBe(previousRows[0])
-  })
-
-
-  test("reveals the selected tool inside an expanded group", () => {
-    const messages = Array.from({ length: 8 }, (_, index) => createToolMessage(`tool-${index + 1}`))
-    const html = renderToStaticMarkup(
-      <CollapsedToolGroup
-        messages={messages}
-        isLoading={false}
-        expanded
-        revealEntryId="tool-8"
-        onExpandedChange={() => undefined}
-      />
-    )
-
-    expect(html).not.toContain("echo tool-1")
-    expect(html).toContain("echo tool-8")
-    expect(html).toContain('id="msg-tool-8"')
-    expect(html).toContain("w-full kanna-jump-flash")
-  })
-
-
-  test("reveals and marks an exact entry inside an Agent transcript", () => {
-    const rows = buildResolvedTranscriptRows([{
-      id: "agent-1",
-      kind: "tool",
-      toolKind: "subagent_task",
-      toolName: "Agent",
-      toolId: "agent-tool-id",
-      input: { prompt: "Investigate", subagentType: "Explore" },
-      children: [
-        {
-          id: "child-text",
-          kind: "assistant_text",
-          text: "Nested explanation",
-          timestamp: new Date().toISOString(),
-        },
-        createToolMessage("child-tool"),
-      ],
-      timestamp: new Date().toISOString(),
-    }], {
-      isLoading: false,
-      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null },
-    })
-    const row = rows[0]!
-
-    const textHtml = renderToStaticMarkup(
-      <KannaTranscriptRow
-        row={row}
-        revealEntryId="child-text"
-        onToolGroupExpandedChange={() => undefined}
-        onAskUserQuestionSubmit={() => undefined}
-        onExitPlanModeConfirm={() => undefined}
-        {...{ onCodexApprovalDecision: () => undefined }}
-      />
-    )
-    const toolHtml = renderToStaticMarkup(
-      <KannaTranscriptRow
-        row={row}
-        revealEntryId="child-tool"
-        onToolGroupExpandedChange={() => undefined}
-        onAskUserQuestionSubmit={() => undefined}
-        onExitPlanModeConfirm={() => undefined}
-        {...{ onCodexApprovalDecision: () => undefined }}
-      />
-    )
-
-    expect(textHtml).toContain('id="msg-child-text"')
-    expect(textHtml).toContain("w-full kanna-jump-flash")
-    expect(toolHtml).toContain('id="msg-child-tool"')
-    expect(toolHtml).toContain("w-full kanna-jump-flash")
-    expect(toolHtml).toContain("echo child-tool")
-  })
-
-
-  test("reveals an exact Agent child when the Agent belongs to a tool group", () => {
-    const agent: HydratedTranscriptMessage = {
-      id: "agent-in-group",
-      kind: "tool",
-      toolKind: "subagent_task",
-      toolName: "Agent",
-      toolId: "agent-in-group-tool-id",
-      input: { prompt: "Investigate", subagentType: "Explore" },
-      children: [
-        {
-          id: "grouped-child-text",
-          kind: "assistant_text",
-          text: "Nested explanation",
-          timestamp: new Date().toISOString(),
-        },
-        createToolMessage("grouped-child-tool"),
-      ],
-      timestamp: new Date().toISOString(),
-    }
-
-    const textHtml = renderToStaticMarkup(
-      <CollapsedToolGroup
-        messages={[agent, createToolMessage("sibling-tool")]}
-        isLoading={false}
-        expanded
-        revealEntryId="grouped-child-text"
-        onExpandedChange={() => undefined}
-      />
-    )
-    const toolHtml = renderToStaticMarkup(
-      <CollapsedToolGroup
-        messages={[agent, createToolMessage("sibling-tool")]}
-        isLoading={false}
-        expanded
-        revealEntryId="grouped-child-tool"
-        onExpandedChange={() => undefined}
-      />
-    )
-
-    expect(textHtml).toContain('id="msg-grouped-child-text"')
-    expect(textHtml).toContain("w-full kanna-jump-flash")
-    expect(toolHtml).toContain('id="msg-grouped-child-tool"')
-    expect(toolHtml).toContain("w-full kanna-jump-flash")
-    expect(toolHtml).toContain("echo grouped-child-tool")
-  })
-
-
-  test("renders an edit control for editable user prompts", () => {
-    const html = renderTranscript([
-      {
-        id: "user-edit-1",
-        kind: "user_prompt",
-        content: "Adjust this",
-        attachments: [],
-        timestamp: new Date().toISOString(),
-      },
-    ], {
-      onEditUserPrompt: () => undefined,
-    })
-
-    expect(html).toContain("Edit message")
-  })
-
-
-  test("renders a fork control for forkable user prompts", () => {
-    const html = renderTranscript([
-      {
-        id: "user-fork-1",
-        kind: "user_prompt",
-        content: "Branch from here",
-        attachments: [],
-        timestamp: new Date().toISOString(),
-      },
-    ], {
-      onForkUserPrompt: () => undefined,
-    })
-
-    expect(html).toContain("Fork message")
-  })
-
-
-  test("keeps the edit control visible while temporarily disabled", () => {
-    const html = renderTranscript([
-      {
-        id: "user-edit-disabled-1",
-        kind: "user_prompt",
-        content: "Keep the edit affordance in place",
-        attachments: [],
-        timestamp: new Date().toISOString(),
-      },
-    ], {
-      onEditUserPrompt: () => undefined,
-      isEditUserPromptDisabled: true,
-    })
-
-    expect(html).toContain("Edit message")
-    expect(html).toContain("disabled")
-  })
-
-
-  test("renders the edit control visibly without requiring hover", () => {
-    const html = renderTranscript([
-      {
-        id: "user-edit-visible-1",
-        kind: "user_prompt",
-        content: "Make the control discoverable",
-        attachments: [],
-        timestamp: new Date().toISOString(),
-      },
-    ], {
-      onEditUserPrompt: () => undefined,
-    })
-
-    expect(html).toContain("Edit message")
-    expect(html).not.toContain("opacity-0")
-  })
-
-
-  test("keeps the fork control visible while temporarily disabled", () => {
-    const html = renderTranscript([
-      {
-        id: "user-fork-disabled-1",
-        kind: "user_prompt",
-        content: "Keep the fork affordance in place",
-        attachments: [],
-        timestamp: new Date().toISOString(),
-      },
-    ], {
-      onForkUserPrompt: () => undefined,
-      isForkUserPromptDisabled: true,
-    })
-
-    expect(html).toContain("Fork message")
-    expect(html).toContain("disabled")
-  })
-
-
-  test("keeps older async question cards interactive after the turn ends", () => {
-    const html = renderTranscript([
-      { id: "q1", kind: "tool", toolKind: "ask_user_question", toolName: "AskUserQuestion", toolId: "q1",
-        input: { codexAsync: { threadId: "thread" }, questions: [{ id: "q", question: "Cleanup?", options: [{ label: "All" }, { label: "Empty" }] }] },
-        timestamp: new Date().toISOString() },
-      { id: "r", kind: "result", success: true, result: "Done", durationMs: 1, timestamp: new Date().toISOString() },
-    ])
-    expect(html).toContain("Cleanup?")
-    expect(html).toContain("Submit")
-    expect(html).not.toContain("newer question active")
-  })
-
-
-  test("renders native async replies as readable answers, not their transport envelope", () => {
-    const html = renderTranscript([{ id: "a", kind: "user_prompt", content: '<send_user_message_question_reply>{"questionItemId":"q","question":"Cleanup?","answer":"All"}</send_user_message_question_reply>', timestamp: new Date().toISOString() }])
-    expect(html).toContain("Cleanup?")
-    expect(html).toContain("All")
-    expect(html).not.toContain("questionItemId")
-  })
-
-
-  test("a partially answered async group opens its remaining question", () => {
-    const html = renderTranscript([{ id: "q1", kind: "tool", toolKind: "ask_user_question", toolName: "AskUserQuestion", toolId: "q1",
-      input: { codexAsync: { threadId: "thread" }, questions: [{ id: "a", question: "Already answered?" }, { id: "b", question: "Still open?" }] },
-      result: { answers: { a: ["Yes"] } }, timestamp: new Date().toISOString() }])
-    expect(html).toContain('aria-label="Still open?"')
-    expect(html).not.toContain('aria-label="Already answered?"')
-  })
-
-
-  test("native async replies exclude history actions while ordinary prompts keep them", () => {
-    const options = { onEditUserPrompt: () => undefined, onForkUserPrompt: () => undefined }
-    const timestamp = new Date().toISOString()
-    const reply = renderTranscript([{ id: "answer", kind: "user_prompt", timestamp,
-      content: '<send_user_message_question_reply>[{"questionItemId":"q","question":"Cleanup?","answer":"All"}]</send_user_message_question_reply>',
-    }], options)
-    expect(reply).toContain("Cleanup?")
-    expect(reply).toContain("All")
-    expect(reply).not.toContain("Edit message")
-    expect(reply).not.toContain("Fork message")
-    const ordinary = renderTranscript([{ id: "prompt", kind: "user_prompt", timestamp, content: "Continue" }], options)
-    expect(ordinary).toContain("Edit message")
-    expect(ordinary).toContain("Fork message")
   })
 })

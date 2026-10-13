@@ -2,7 +2,7 @@ import { homedir } from "node:os"
 import { PerformanceLog } from "./performance-log"
 import path from "node:path"
 import { stat } from "node:fs/promises"
-import { APP_NAME, getDataDir, getRuntimeProfile, LOG_PREFIX, getKeybindingsFilePath } from "../shared/branding"
+import { APP_NAME, getDataDir, getKeybindingsFilePath, getRuntimeProfile, LOG_PREFIX } from "../shared/branding"
 import type { ChatAttachment, IdleSessionTimeoutPreference } from "../shared/types"
 import type { ShareMode } from "../shared/share"
 import {

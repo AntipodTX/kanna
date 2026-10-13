@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test"
 import type { TranscriptEntry } from "../shared/types"
 import { normalizeToolCall } from "../shared/tools"
 import { timestamped } from "./transcript"
-import { buildHandoffContext, buildHandoffMessageContent, HANDOFF_CHAR_BUDGET, HANDOFF_TOKEN_BUDGET, renderToolResultContent } from "./handoff"
+import {
+  buildHandoffContext,
+  buildHandoffMessageContent,
+  HANDOFF_CHAR_BUDGET,
+  HANDOFF_TOKEN_BUDGET,
+  renderToolResultContent,
+} from "./handoff"
 
 const TRANSCRIPT_PATH = "/tmp/transcripts/chat-1.jsonl"
 

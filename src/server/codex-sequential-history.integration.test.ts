@@ -1,5 +1,3 @@
-import { AsyncQueue } from "./async-queue"
-import type { HarnessEvent } from "./harness-types"
 import { expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -8,6 +6,8 @@ import { AgentCoordinator } from "./agent"
 import { EventStore } from "./event-store"
 import { timestamped } from "./transcript"
 import { CodexPromptHistory } from "./codex-prompt-history"
+import { AsyncQueue } from "./async-queue"
+import type { HarnessEvent } from "./harness-types"
 
 async function fixture(run: (f: {
   store: EventStore; coordinator: AgentCoordinator; chatId: string; dir: string;
@@ -276,7 +276,35 @@ test("cancellation during ordinary Codex startup preserves history and rejects l
   expect(coordinator.getResourceCounts().activeTurns).toBe(0)
 }, ["A"]))
 
-
+test("failed steering provenance stops the turn and keeps the waiting successor queued", () => fixture(async ({ coordinator, store, chatId, manager, state }) => {
+  const events = new AsyncQueue<HarnessEvent>()
+  let nativeInputs = 0
+  manager.startTurn = async () => ({ provider: "codex", providerTurnId: "a", stream: events,
+    interrupt: async () => {}, close: () => events.finish() })
+  manager.startSteerTurn = (args: any) => {
+    nativeInputs++
+    return { accepted: Promise.resolve(), settled: Promise.resolve() }
+  }
+  await coordinator.send({ type: "chat.send", chatId, content: "A", provider: "codex" })
+  const b = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "B", provider: "codex" })
+  const c = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "C", provider: "codex" })
+  let enter!: () => void, release!: () => void
+  const entered = new Promise<void>((resolve) => { enter = resolve }), waiting = new Promise<void>((resolve) => { release = resolve })
+  ;(coordinator as any).codexPromptHistory.recordPrompt = async () => { enter(); await waiting; throw new Error("binding EIO") }
+  await coordinator.steer({ type: "message.steer", chatId, queuedMessageId: b.queuedMessageId })
+  const successor = coordinator.steer({ type: "message.steer", chatId, queuedMessageId: c.queuedMessageId }).catch((error) => error.message)
+  await entered
+  expect(nativeInputs).toBe(1)
+  release()
+  expect(await successor).toContain("recovery")
+  expect(nativeInputs).toBe(1)
+  expect(store.getQueuedMessage(chatId, b.queuedMessageId)).toBeNull()
+  expect(store.getQueuedMessage(chatId, c.queuedMessageId)).not.toBeNull()
+  expect(coordinator.getResourceCounts().activeTurns).toBe(0)
+  expect(state.stops).toBeGreaterThan(0)
+  expect(store.getMessages(chatId).filter((e) => e.kind === "user_prompt").map((e) => e.content)).toEqual(["A", expect.stringContaining("B")])
+  expect(store.getMessages(chatId).some((e) => e.kind === "result" && e.isError && e.result.includes("binding EIO"))).toBe(true)
+}, []))
 
 test("a failed accepted edit token publication cannot remap edited text onto the source session", () => fixture(async ({ coordinator, store, chatId, state }) => {
   const original = store.getMessages(chatId)
@@ -291,37 +319,6 @@ test("a failed accepted edit token publication cannot remap edited text onto the
   expect(store.requireChat(chatId).sessionToken).toBe("source")
   expect(state.interrupts).toBeGreaterThan(0)
 }))
-
-for (const action of ["edit", "fork"] as const)
-  test(`the first confirmed Codex prompt after handoff retains prior context on ${action}`, () => fixture(async ({ coordinator, store, chatId, state, manager, cuts }) => {
-    await store.setChatProvider(chatId, "claude")
-    await store.setSessionToken(chatId, "claude-old")
-    manager.startSession = async (args: any) => ({ sessionToken: args.sessionToken ?? args.pendingForkSessionToken ?? "prepared", resumeFellBack: false,
-      startupOutcome: { kind: args.sessionToken || args.pendingForkSessionToken ? "resumed" : "fresh" } })
-    const inputs: string[] = [], start = manager.startTurn
-    manager.startTurn = async (args: any) => { inputs.push(args.content); return start(args) }
-    await coordinator.send({ type: "chat.send", chatId, content: "B", provider: "codex" })
-    for (let i = 0; i < 100 && coordinator.getResourceCounts().activeTurns; i++) await new Promise(resolve => setTimeout(resolve, 10))
-    expect(store.requireChat(chatId).contextRestoration).toBeNull()
-    const original = store.getMessages(chatId), b = original.find(e => e.kind === "user_prompt" && e.content === "B")!
-    const marker = original.find(e => e.kind === "handoff_boundary")!
-    const record = await (coordinator as any).codexPromptHistory.read(chatId)
-    expect(record.prompts[b._id].boundaryEntryId).toBe(marker._id)
-    state.native = [{ turnId: "new", promptId: b._id, text: "B", userIndex: 0 }]
-    const destination = action === "edit"
-      ? await coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId, messageId: b._id, content: "Edited B" })
-      : await coordinator.forkChat({ type: "chat.fork", chatId, messageId: b._id })
-    if (action === "fork") {
-      expect(store.getMessages(chatId)).toEqual(original)
-      await coordinator.send({ type: "chat.send", chatId: destination.chatId, content: "", provider: "codex" })
-    }
-    expect(cuts).toMatchObject([{ beforeTurnId: "new" }])
-    expect(inputs).toHaveLength(2)
-    expect(inputs[1]).toContain("Answer A")
-    expect(inputs[1]).not.toContain(store.getTranscriptPath(chatId))
-    expect(inputs[1]).toContain(action === "edit" ? "Edited B" : "B")
-    expect(store.getMessages(destination.chatId).some(e => e._id === marker._id)).toBe(true)
-  }, ["A"]))
 
 for (const originalCount of [undefined, 0, 7])
   test(`failed Codex edit publication restores turnCount ${originalCount ?? "absent"} through restart`, () => fixture(async ({ coordinator, store, chatId, dir }) => {
@@ -418,6 +415,61 @@ test("stopping a fully published Codex edit keeps its replacement turn count", (
   } finally { events.finish() }
 }))
 
+for (const stop of ["cancel", "close", "dispose"] as const)
+  test(`${stop} during a pending native steer cannot submit its waiting successor`, () => fixture(async ({ coordinator, store, chatId, manager }) => {
+    const events = new AsyncQueue<HarnessEvent>()
+    manager.startTurn = async () => ({ provider: "codex", providerTurnId: "a", stream: events,
+      interrupt: async () => {}, close: () => events.finish() })
+    let release!: () => void, nativeInputs = 0
+    const settled = new Promise<void>(resolve => { release = resolve })
+    manager.startSteerTurn = () => { nativeInputs++; return { accepted: Promise.resolve(), settled } }
+    await coordinator.send({ type: "chat.send", chatId, content: "A", provider: "codex" })
+    const b = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "B", provider: "codex" })
+    const c = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "C", provider: "codex" })
+    await coordinator.steer({ type: "message.steer", chatId, queuedMessageId: b.queuedMessageId })
+    const successor = coordinator.steer({ type: "message.steer", chatId, queuedMessageId: c.queuedMessageId }).catch(error => error.message)
+    if (stop === "cancel") await coordinator.cancel(chatId)
+    else if (stop === "close") await coordinator.closeChat(chatId)
+    else coordinator.dispose()
+    release()
+    expect(await successor).toContain("cancelled")
+    expect(nativeInputs).toBe(1)
+    expect(store.getQueuedMessage(chatId, c.queuedMessageId)).not.toBeNull()
+    events.finish()
+  }, []))
+
+for (const failure of ["before input", "acceptance", "confirmation"] as const)
+  test(`native steer failure at ${failure} stops the turn and preserves both user requests`, () => fixture(async ({ coordinator, store, chatId, manager, state }) => {
+    const events = new AsyncQueue<HarnessEvent>()
+    manager.startTurn = async () => ({ provider: "codex", providerTurnId: "a", stream: events,
+      interrupt: async () => {}, close: () => events.finish() })
+    await coordinator.send({ type: "chat.send", chatId, content: "A", provider: "codex" })
+    const b = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "B", provider: "codex" })
+    const c = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "C", provider: "codex" })
+    let release!: () => void, nativeInputs = 0
+    const waiting = new Promise<void>(resolve => { release = resolve })
+    if (failure === "before input") {
+      const append = store.appendMessage.bind(store)
+      store.appendMessage = async (id, entry) => { if (entry._id === b.queuedMessageId) { await waiting; throw new Error("transcript EIO") }; await append(id, entry) }
+    }
+    manager.startSteerTurn = () => {
+      nativeInputs++
+      const rejected = waiting.then(() => { throw new Error("native confirmation failed") })
+      void rejected.catch(() => {})
+      return { accepted: failure === "acceptance" ? rejected : Promise.resolve(), settled: rejected }
+    }
+    const first = coordinator.steer({ type: "message.steer", chatId, queuedMessageId: b.queuedMessageId }).catch(error => error)
+    const successor = coordinator.steer({ type: "message.steer", chatId, queuedMessageId: c.queuedMessageId }).catch(error => error.message)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    release(); await first
+    expect(await successor).toContain("recovery")
+    expect(nativeInputs).toBe(failure === "before input" ? 0 : 1)
+    expect(store.getQueuedMessage(chatId, b.queuedMessageId)).not.toBeNull()
+    expect(store.getQueuedMessage(chatId, c.queuedMessageId)).not.toBeNull()
+    expect(state.stops).toBeGreaterThan(0)
+    expect(coordinator.getResourceCounts().activeTurns).toBe(0)
+    events.finish()
+  }, []))
 
 for (const action of ["edit", "fork"] as const)
   test(`a first gap after provider handoff can ${action} with its known previous context`, () => fixture(async ({ coordinator, store, chatId, state, manager }) => {
@@ -450,91 +502,33 @@ for (const action of ["edit", "fork"] as const)
     expect(inputs[0]).toContain(action === "edit" ? "Edited B" : "B")
   }, ["A"]))
 
-
-  test("failed steering provenance stops the turn and keeps the waiting successor queued", () => fixture(async ({ coordinator, store, chatId, manager, state }) => {
-  const events = new AsyncQueue<HarnessEvent>()
-  let nativeInputs = 0
-  manager.startTurn = async () => ({ provider: "codex", providerTurnId: "a", stream: events,
-    interrupt: async () => {}, close: () => events.finish() })
-  manager.startSteerTurn = (args: any) => {
-    nativeInputs++
-    return { accepted: Promise.resolve(), settled: Promise.resolve() }
-  }
-  await coordinator.send({ type: "chat.send", chatId, content: "A", provider: "codex" })
-  const b = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "B", provider: "codex" })
-  const c = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "C", provider: "codex" })
-  let enter!: () => void, release!: () => void
-  const entered = new Promise<void>((resolve) => { enter = resolve }), waiting = new Promise<void>((resolve) => { release = resolve })
-  ;(coordinator as any).codexPromptHistory.recordPrompt = async () => { enter(); await waiting; throw new Error("binding EIO") }
-  await coordinator.steer({ type: "message.steer", chatId, queuedMessageId: b.queuedMessageId })
-  const successor = coordinator.steer({ type: "message.steer", chatId, queuedMessageId: c.queuedMessageId }).catch((error) => error.message)
-  await entered
-  expect(nativeInputs).toBe(1)
-  release()
-  expect(await successor).toContain("recovery")
-  expect(nativeInputs).toBe(1)
-  expect(store.getQueuedMessage(chatId, b.queuedMessageId)).toBeNull()
-  expect(store.getQueuedMessage(chatId, c.queuedMessageId)).not.toBeNull()
-  expect(coordinator.getResourceCounts().activeTurns).toBe(0)
-  expect(state.stops).toBeGreaterThan(0)
-  expect(store.getMessages(chatId).filter((e) => e.kind === "user_prompt").map((e) => e.content)).toEqual(["A", expect.stringContaining("B")])
-  expect(store.getMessages(chatId).some((e) => e.kind === "result" && e.isError && e.result.includes("binding EIO"))).toBe(true)
-}, []))
-
-
-  for (const stop of ["cancel", "close", "dispose"] as const)
-  test(`${stop} during a pending native steer cannot submit its waiting successor`, () => fixture(async ({ coordinator, store, chatId, manager }) => {
-    const events = new AsyncQueue<HarnessEvent>()
-    manager.startTurn = async () => ({ provider: "codex", providerTurnId: "a", stream: events,
-      interrupt: async () => {}, close: () => events.finish() })
-    let release!: () => void, nativeInputs = 0
-    const settled = new Promise<void>(resolve => { release = resolve })
-    manager.startSteerTurn = () => { nativeInputs++; return { accepted: Promise.resolve(), settled } }
-    await coordinator.send({ type: "chat.send", chatId, content: "A", provider: "codex" })
-    const b = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "B", provider: "codex" })
-    const c = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "C", provider: "codex" })
-    await coordinator.steer({ type: "message.steer", chatId, queuedMessageId: b.queuedMessageId })
-    const successor = coordinator.steer({ type: "message.steer", chatId, queuedMessageId: c.queuedMessageId }).catch(error => error.message)
-    if (stop === "cancel") await coordinator.cancel(chatId)
-    else if (stop === "close") await coordinator.closeChat(chatId)
-    else coordinator.dispose()
-    release()
-    expect(await successor).toContain("cancelled")
-    expect(nativeInputs).toBe(1)
-    expect(store.getQueuedMessage(chatId, c.queuedMessageId)).not.toBeNull()
-    events.finish()
-  }, []))
-
-
-  for (const failure of ["before input", "acceptance", "confirmation"] as const)
-  test(`native steer failure at ${failure} stops the turn and preserves both user requests`, () => fixture(async ({ coordinator, store, chatId, manager, state }) => {
-    const events = new AsyncQueue<HarnessEvent>()
-    manager.startTurn = async () => ({ provider: "codex", providerTurnId: "a", stream: events,
-      interrupt: async () => {}, close: () => events.finish() })
-    await coordinator.send({ type: "chat.send", chatId, content: "A", provider: "codex" })
-    const b = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "B", provider: "codex" })
-    const c = await coordinator.enqueue({ type: "message.enqueue", chatId, content: "C", provider: "codex" })
-    let release!: () => void, nativeInputs = 0
-    const waiting = new Promise<void>(resolve => { release = resolve })
-    if (failure === "before input") {
-      const append = store.appendMessage.bind(store)
-      store.appendMessage = async (id, entry) => { if (entry._id === b.queuedMessageId) { await waiting; throw new Error("transcript EIO") }; await append(id, entry) }
+for (const action of ["edit", "fork"] as const)
+  test(`the first confirmed Codex prompt after handoff retains prior context on ${action}`, () => fixture(async ({ coordinator, store, chatId, state, manager, cuts }) => {
+    await store.setChatProvider(chatId, "claude")
+    await store.setSessionToken(chatId, "claude-old")
+    manager.startSession = async (args: any) => ({ sessionToken: args.sessionToken ?? args.pendingForkSessionToken ?? "prepared", resumeFellBack: false,
+      startupOutcome: { kind: args.sessionToken || args.pendingForkSessionToken ? "resumed" : "fresh" } })
+    const inputs: string[] = [], start = manager.startTurn
+    manager.startTurn = async (args: any) => { inputs.push(args.content); return start(args) }
+    await coordinator.send({ type: "chat.send", chatId, content: "B", provider: "codex" })
+    for (let i = 0; i < 100 && coordinator.getResourceCounts().activeTurns; i++) await new Promise(resolve => setTimeout(resolve, 10))
+    expect(store.requireChat(chatId).contextRestoration).toBeNull()
+    const original = store.getMessages(chatId), b = original.find(e => e.kind === "user_prompt" && e.content === "B")!
+    const marker = original.find(e => e.kind === "handoff_boundary")!
+    const record = await (coordinator as any).codexPromptHistory.read(chatId)
+    expect(record.prompts[b._id].boundaryEntryId).toBe(marker._id)
+    state.native = [{ turnId: "new", promptId: b._id, text: "B", userIndex: 0 }]
+    const destination = action === "edit"
+      ? await coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId, messageId: b._id, content: "Edited B" })
+      : await coordinator.forkChat({ type: "chat.fork", chatId, messageId: b._id })
+    if (action === "fork") {
+      expect(store.getMessages(chatId)).toEqual(original)
+      await coordinator.send({ type: "chat.send", chatId: destination.chatId, content: "", provider: "codex" })
     }
-    manager.startSteerTurn = () => {
-      nativeInputs++
-      const rejected = waiting.then(() => { throw new Error("native confirmation failed") })
-      void rejected.catch(() => {})
-      return { accepted: failure === "acceptance" ? rejected : Promise.resolve(), settled: rejected }
-    }
-    const first = coordinator.steer({ type: "message.steer", chatId, queuedMessageId: b.queuedMessageId }).catch(error => error)
-    const successor = coordinator.steer({ type: "message.steer", chatId, queuedMessageId: c.queuedMessageId }).catch(error => error.message)
-    await new Promise(resolve => setTimeout(resolve, 0))
-    release(); await first
-    expect(await successor).toContain("recovery")
-    expect(nativeInputs).toBe(failure === "before input" ? 0 : 1)
-    expect(store.getQueuedMessage(chatId, b.queuedMessageId)).not.toBeNull()
-    expect(store.getQueuedMessage(chatId, c.queuedMessageId)).not.toBeNull()
-    expect(state.stops).toBeGreaterThan(0)
-    expect(coordinator.getResourceCounts().activeTurns).toBe(0)
-    events.finish()
-  }, []))
+    expect(cuts).toMatchObject([{ beforeTurnId: "new" }])
+    expect(inputs).toHaveLength(2)
+    expect(inputs[1]).toContain("Answer A")
+    expect(inputs[1]).not.toContain(store.getTranscriptPath(chatId))
+    expect(inputs[1]).toContain(action === "edit" ? "Edited B" : "B")
+    expect(store.getMessages(destination.chatId).some(e => e._id === marker._id)).toBe(true)
+  }, ["A"]))

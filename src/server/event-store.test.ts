@@ -1,10 +1,5 @@
-import { ExitPlanModeMessage } from "../client/components/messages/ExitPlanModeMessage"
-import { renderToStaticMarkup } from "react-dom/server"
-import { createElement } from "react"
-import { TranscriptPayloadIndex } from "./transcript-payloads"
-import { processTranscriptMessages } from "../client/lib/parseTranscript"
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile, readdir } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -12,6 +7,11 @@ import type { TranscriptEntry } from "../shared/types"
 import type { SnapshotFile } from "./events"
 import { EventStore } from "./event-store"
 import { deriveLocalProjectsSnapshot, SIDEBAR_ACTIVITY_RESOLUTION_MS } from "./read-models"
+import { processTranscriptMessages } from "../client/lib/parseTranscript"
+import { TranscriptPayloadIndex } from "./transcript-payloads"
+import { createElement } from "react"
+import { renderToStaticMarkup } from "react-dom/server"
+import { ExitPlanModeMessage } from "../client/components/messages/ExitPlanModeMessage"
 
 const originalRuntimeProfile = process.env.KANNA_RUNTIME_PROFILE
 const tempDirs: string[] = []
@@ -55,6 +55,28 @@ function entry(
 }
 
 describe("EventStore", () => {
+  test("moves a redelivered prompt without losing concurrent writes or its payload", async () => {
+    const store = new EventStore(await createTempDataDir())
+    await store.initialize()
+    const project = await store.openProject(store.dataDir, "Project")
+    const chat = await store.createChat(project.id)
+    const answer: TranscriptEntry = { _id: "answer-1", createdAt: 1, kind: "user_prompt", content: "Saved answer",
+      attachments: [{ id: "attachment-1", kind: "file", displayName: "details.txt",
+        absolutePath: "/tmp/details.txt", relativePath: "details.txt", contentUrl: "/file",
+        mimeType: "text/plain", size: 12 }] }
+    await store.appendMessage(chat.id, answer)
+    const next = entry("user_prompt", 2, { content: "Next" })
+    const output = entry("assistant_text", 3, { text: "Concurrent output" })
+    await store.appendMessage(chat.id, next)
+    const moving = store.moveUserPromptToEnd(chat.id, answer._id)
+    const writing = store.appendMessage(chat.id, output)
+    await Promise.all([moving, writing])
+    expect(store.getMessages(chat.id)).toEqual([next, answer, output])
+    const replayed = new EventStore(store.dataDir)
+    await replayed.initialize()
+    expect(replayed.getMessages(chat.id)).toEqual([next, answer, output])
+  })
+
   test("reconciles transcripts using payload sidecars and provider activity timestamps", async () => {
     const dataDir = await createTempDataDir()
     const store = new EventStore(dataDir)
@@ -86,8 +108,6 @@ describe("EventStore", () => {
     expect(replayed.getMessages(chat.id)).toEqual(entries)
     expect(replayed.getChat(chat.id)?.lastAgentMessageAt).toBe(200)
   })
-
-  
 
   test.each([false, true])("publishes a committed transcript replacement when metadata append fails (empty=%s)", async (empty) => {
     const dataDir = await createTempDataDir()
@@ -248,6 +268,144 @@ describe("EventStore", () => {
 
     expect(store.getTranscriptPath(chat.id)).toBe(join(dataDir, "transcripts", `${chat.id}.jsonl`))
     expect(existsSync(store.getTranscriptPath(chat.id))).toBe(true)
+  })
+
+  test("persists replaced transcript metadata across restart", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    const first = entry("user_prompt", chat.createdAt + 1, { content: "first" })
+    const firstAnswer = entry("assistant_text", chat.createdAt + 2, { text: "first answer" })
+    const second = entry("user_prompt", chat.createdAt + 3, { content: "second" })
+    const staleAnswer = entry("assistant_text", chat.createdAt + 4, { text: "stale answer" })
+    await store.appendMessage(chat.id, first)
+    await store.appendMessage(chat.id, firstAnswer)
+    await store.appendMessage(chat.id, second)
+    await store.appendMessage(chat.id, staleAnswer)
+    await store.compact()
+
+    await store.replaceTranscript(chat.id, [first, firstAnswer])
+
+    expect(store.requireChat(chat.id).lastMessageAt).toBe(first.createdAt)
+    expect(store.requireChat(chat.id).lastUserMessagePreview).toBe("first")
+    expect(store.requireChat(chat.id).lastAgentMessagePreview).toBe("first answer")
+    expect(store.requireChat(chat.id).lastAgentMessagePreviewAt).toBe(firstAnswer.createdAt)
+    expect(store.requireChat(chat.id).lastAgentMessageAt).toBe(firstAnswer.createdAt)
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+
+    expect(reloaded.requireChat(chat.id).hasMessages).toBe(true)
+    expect(reloaded.requireChat(chat.id).lastMessageAt).toBe(first.createdAt)
+    expect(reloaded.requireChat(chat.id).lastUserMessagePreview).toBe("first")
+    expect(reloaded.requireChat(chat.id).lastAgentMessagePreview).toBe("first answer")
+    expect(reloaded.requireChat(chat.id).lastAgentMessagePreviewAt).toBe(firstAnswer.createdAt)
+    expect(reloaded.requireChat(chat.id).lastAgentMessageAt).toBe(firstAnswer.createdAt)
+  })
+
+
+  test("replacement previews ignore child user prompts", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(dataDir, "Project")
+    const chat = await store.createChat(project.id)
+    const root = entry("user_prompt", 100, { content: "Main request" })
+    const child: TranscriptEntry = { _id: "child-prompt", createdAt: 200, kind: "user_prompt",
+      content: "Subagent request", parentToolUseId: "parent-tool" }
+    await store.replaceTranscript(chat.id, [root, child])
+    expect(store.getChat(chat.id)?.lastUserMessagePreview).toBe("Main request")
+    expect(store.getChat(chat.id)?.lastMessageAt).toBe(200)
+    await store.replaceTranscript(chat.id, [child])
+    expect(store.getChat(chat.id)?.lastUserMessagePreview).toBeUndefined()
+  })
+
+  test("clears replaced transcript metadata for an empty transcript across restart", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.appendMessage(chat.id, entry("user_prompt", chat.createdAt + 1, { content: "stale prompt" }))
+    await store.appendMessage(chat.id, entry("assistant_text", chat.createdAt + 2, { text: "stale answer" }))
+    await store.compact()
+
+    await store.replaceTranscript(chat.id, [])
+
+    expect(store.requireChat(chat.id)).toMatchObject({ hasMessages: false })
+    expect(store.requireChat(chat.id).lastMessageAt).toBeUndefined()
+    expect(store.requireChat(chat.id).lastUserMessagePreview).toBeUndefined()
+    expect(store.requireChat(chat.id).lastAgentMessagePreview).toBeUndefined()
+    expect(store.requireChat(chat.id).lastAgentMessagePreviewAt).toBeUndefined()
+    expect(store.requireChat(chat.id).lastAgentMessageAt).toBeUndefined()
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+
+    expect(reloaded.requireChat(chat.id)).toMatchObject({ hasMessages: false })
+    expect(reloaded.requireChat(chat.id).lastMessageAt).toBeUndefined()
+    expect(reloaded.requireChat(chat.id).lastUserMessagePreview).toBeUndefined()
+    expect(reloaded.requireChat(chat.id).lastAgentMessagePreview).toBeUndefined()
+    expect(reloaded.requireChat(chat.id).lastAgentMessagePreviewAt).toBeUndefined()
+    expect(reloaded.requireChat(chat.id).lastAgentMessageAt).toBeUndefined()
+  })
+
+  test("clears the stale agent preview when a replacement has no assistant messages", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.appendMessage(chat.id, entry("user_prompt", chat.createdAt + 1, { content: "stale prompt" }))
+    await store.appendMessage(chat.id, entry("assistant_text", chat.createdAt + 2, { text: "stale answer" }))
+    await store.compact()
+
+    const replacement = entry("user_prompt", chat.createdAt + 3, { content: "replacement prompt" })
+    await store.replaceTranscript(chat.id, [replacement])
+
+    expect(store.requireChat(chat.id).hasMessages).toBe(true)
+    expect(store.requireChat(chat.id).lastMessageAt).toBe(replacement.createdAt)
+    expect(store.requireChat(chat.id).lastUserMessagePreview).toBe("replacement prompt")
+    expect(store.requireChat(chat.id).lastAgentMessagePreview).toBeUndefined()
+    expect(store.requireChat(chat.id).lastAgentMessagePreviewAt).toBeUndefined()
+    expect(store.requireChat(chat.id).lastAgentMessageAt).toBeUndefined()
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+
+    expect(reloaded.requireChat(chat.id).hasMessages).toBe(true)
+    expect(reloaded.requireChat(chat.id).lastMessageAt).toBe(replacement.createdAt)
+    expect(reloaded.requireChat(chat.id).lastUserMessagePreview).toBe("replacement prompt")
+    expect(reloaded.requireChat(chat.id).lastAgentMessagePreview).toBeUndefined()
+    expect(reloaded.requireChat(chat.id).lastAgentMessagePreviewAt).toBeUndefined()
+    expect(reloaded.requireChat(chat.id).lastAgentMessageAt).toBeUndefined()
+  })
+
+  test("persists exact replacement metadata when the transcript tail exceeds 256 KiB", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    const prompt = entry("user_prompt", chat.createdAt + 1, { content: "large transcript prompt" })
+    const longAnswer = "A".repeat(300 * 1024)
+    const answer = entry("assistant_text", chat.createdAt + 2, { text: longAnswer })
+
+    await store.replaceTranscript(chat.id, [prompt, answer])
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+
+    expect(reloaded.requireChat(chat.id).hasMessages).toBe(true)
+    expect(reloaded.requireChat(chat.id).lastMessageAt).toBe(prompt.createdAt)
+    expect(reloaded.requireChat(chat.id).lastUserMessagePreview).toBe("large transcript prompt")
+    expect(reloaded.requireChat(chat.id).lastAgentMessagePreview).toBe(`${"A".repeat(160)}…`)
   })
 
   test("persists queued messages across restart and removes promoted entries", async () => {
@@ -529,6 +687,310 @@ describe("EventStore", () => {
     expect(store.getChat("chat-1")?.unread).toBe(false)
   })
 
+  test("recovers from replay logs when snapshot is corrupt", async () => {
+    const dataDir = await createTempDataDir()
+    const snapshotPath = join(dataDir, "snapshot.json")
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+    const chatsLogPath = join(dataDir, "chats.jsonl")
+
+    await writeFile(snapshotPath, "{not-json", "utf8")
+    await writeFile(projectsLogPath, `${JSON.stringify({
+      v: 2,
+      type: "project_opened",
+      timestamp: 1,
+      projectId: "project-1",
+      localPath: "/tmp/project",
+      title: "Project",
+    })}\n`, "utf8")
+    await writeFile(chatsLogPath, `${JSON.stringify({
+      v: 2,
+      type: "chat_created",
+      timestamp: 2,
+      chatId: "chat-1",
+      projectId: "project-1",
+      title: "Chat",
+    })}\n`, "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      expect(store.getProject("project-1")?.title).toBe("Project")
+      expect(store.getChat("chat-1")?.title).toBe("Chat")
+    } finally {
+      console.warn = originalWarn
+    }
+
+    const recoveredSnapshot = JSON.parse(await readFile(snapshotPath, "utf8")) as SnapshotFile
+    expect(recoveredSnapshot.projects.map((project) => project.id)).toEqual(["project-1"])
+    expect(recoveredSnapshot.chats.map((chat) => chat.id)).toEqual(["chat-1"])
+    expect(await readFile(projectsLogPath, "utf8")).toBe("")
+    expect(await readFile(chatsLogPath, "utf8")).toBe("")
+  })
+
+  test("backs up a corrupt snapshot before replaying logs", async () => {
+    const dataDir = await createTempDataDir()
+    const snapshotPath = join(dataDir, "snapshot.json")
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+
+    await writeFile(snapshotPath, "{not-json", "utf8")
+    await writeFile(projectsLogPath, `${JSON.stringify({
+      v: 2,
+      type: "project_opened",
+      timestamp: 1,
+      projectId: "project-1",
+      localPath: "/tmp/project",
+      title: "Project",
+    })}\n`, "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      const backupFiles = await readdir(join(dataDir, "recovery"))
+      const snapshotBackup = backupFiles.find((file) => file.includes("snapshot") && file.endsWith(".json"))
+      expect(snapshotBackup).toBeString()
+      expect(await readFile(join(dataDir, "recovery", snapshotBackup!), "utf8")).toBe("{not-json")
+      expect(store.getStartupRecoveryIncidents()).toContainEqual(expect.objectContaining({
+        kind: "snapshot",
+        sourcePath: snapshotPath,
+        backupPath: join(dataDir, "recovery", snapshotBackup!),
+      }))
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
+  test("replaces a corrupt snapshot after recovery even when logs are small", async () => {
+    const dataDir = await createTempDataDir()
+    const snapshotPath = join(dataDir, "snapshot.json")
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+
+    await writeFile(snapshotPath, "{not-json", "utf8")
+    await writeFile(projectsLogPath, `${JSON.stringify({
+      v: 2,
+      type: "project_opened",
+      timestamp: 1,
+      projectId: "project-1",
+      localPath: "/tmp/project",
+      title: "Project",
+    })}\n`, "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      const recoveredSnapshot = JSON.parse(await readFile(snapshotPath, "utf8")) as SnapshotFile
+      expect(recoveredSnapshot.projects.map((project) => project.id)).toEqual(["project-1"])
+      expect(await readFile(projectsLogPath, "utf8")).toBe("")
+
+      const reloaded = new EventStore(dataDir)
+      await reloaded.initialize()
+      expect(reloaded.getStartupRecoveryIncidents()).toEqual([])
+      expect(reloaded.getProject("project-1")?.title).toBe("Project")
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
+  test("backs up a log with a corrupt middle line and records a startup incident", async () => {
+    const dataDir = await createTempDataDir()
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+
+    await writeFile(projectsLogPath, [
+      JSON.stringify({
+        v: 2,
+        type: "project_opened",
+        timestamp: 1,
+        projectId: "project-1",
+        localPath: "/tmp/project",
+        title: "Project",
+      }),
+      "{not-json",
+      JSON.stringify({
+        v: 2,
+        type: "project_opened",
+        timestamp: 2,
+        projectId: "project-2",
+        localPath: "/tmp/project-2",
+        title: "Project 2",
+      }),
+      "",
+    ].join("\n"), "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      const backupFiles = await readdir(join(dataDir, "recovery"))
+      const logBackup = backupFiles.find((file) => file.includes("projects") && file.endsWith(".jsonl"))
+      expect(logBackup).toBeString()
+      expect(await readFile(join(dataDir, "recovery", logBackup!), "utf8")).toContain("{not-json")
+      expect(store.getProject("project-1")?.title).toBe("Project")
+      expect(store.getProject("project-2")?.title).toBe("Project 2")
+      expect(store.getStartupRecoveryIncidents()).toContainEqual(expect.objectContaining({
+        kind: "log",
+        sourcePath: projectsLogPath,
+        backupPath: join(dataDir, "recovery", logBackup!),
+        line: 2,
+      }))
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
+  test("stops startup and preserves a corrupt log when its recovery backup fails", async () => {
+    const dataDir = await createTempDataDir()
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+
+    await writeFile(projectsLogPath, [
+      JSON.stringify({
+        v: 2,
+        type: "project_opened",
+        timestamp: 1,
+        projectId: "project-1",
+        localPath: "/tmp/project",
+        title: "Project",
+      }),
+      "{not-json",
+      JSON.stringify({
+        v: 2,
+        type: "project_opened",
+        timestamp: 2,
+        projectId: "project-2",
+        localPath: "/tmp/project-2",
+        title: "Project 2",
+      }),
+      "",
+    ].join("\n"), "utf8")
+    await writeFile(join(dataDir, "recovery"), "not-a-directory", "utf8")
+    const originalLog = await readFile(projectsLogPath, "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await expect(store.initialize()).rejects.toThrow("Cannot back up recovery source")
+
+      const incidents = store.getStartupRecoveryIncidents()
+      expect(await readFile(projectsLogPath, "utf8")).toBe(originalLog)
+      expect(existsSync(join(dataDir, "snapshot.json"))).toBe(false)
+      expect(incidents).toHaveLength(1)
+      expect(incidents[0]).toMatchObject({
+        kind: "log",
+        sourcePath: projectsLogPath,
+        backupPath: null,
+        line: 2,
+      })
+      expect(incidents[0]!.reason).toContain("backup failed:")
+      // Once backup storage is repaired, ordinary recovery can safely proceed.
+      await rm(join(dataDir, "recovery"))
+      const restarted = new EventStore(dataDir)
+      await restarted.initialize()
+      expect(restarted.getProject("project-1")?.title).toBe("Project")
+      expect(restarted.getProject("project-2")?.title).toBe("Project 2")
+      const recoveredIncident = restarted.getStartupRecoveryIncidents()[0]!
+      expect(await readFile(recoveredIncident.backupPath!, "utf8")).toBe(originalLog)
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
+  for (const corruption of ["invalid JSON", "incompatible version"] as const) {
+    test(`stops startup without overwriting a snapshot with ${corruption} when backup fails`, async () => {
+      const dataDir = await createTempDataDir()
+      const snapshotPath = join(dataDir, "snapshot.json")
+      const originalSnapshot = corruption === "invalid JSON"
+        ? "{not-json"
+        : JSON.stringify({ v: 1, projects: [], chats: [] })
+      await writeFile(snapshotPath, originalSnapshot, "utf8")
+      const journals = ["projects.jsonl", "chats.jsonl", "messages.jsonl", "queued-messages.jsonl", "turns.jsonl"]
+      for (const journal of journals) await writeFile(join(dataDir, journal), "\n", "utf8")
+      await writeFile(join(dataDir, "recovery"), "not-a-directory", "utf8")
+      const warn = spyOn(console, "warn").mockImplementation(() => {})
+      try {
+        const store = new EventStore(dataDir)
+        await expect(store.initialize()).rejects.toThrow(snapshotPath)
+        expect(await readFile(snapshotPath, "utf8")).toBe(originalSnapshot)
+        for (const journal of journals) expect(await readFile(join(dataDir, journal), "utf8")).toBe("\n")
+        expect(store.getStartupRecoveryIncidents()).toHaveLength(1)
+      } finally {
+        warn.mockRestore()
+      }
+    })
+  }
+
+  test("does not swallow failed backup of an incompatible final log event as a truncated trailing line", async () => {
+    const dataDir = await createTempDataDir()
+    const logPath = join(dataDir, "projects.jsonl")
+    const originalLog = `${JSON.stringify({ v: 1, type: "project_opened", timestamp: 1 })}\n`
+    await writeFile(logPath, originalLog, "utf8")
+    await writeFile(join(dataDir, "recovery"), "not-a-directory", "utf8")
+    const warn = spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      const store = new EventStore(dataDir)
+      await expect(store.initialize()).rejects.toThrow(logPath)
+      expect(await readFile(logPath, "utf8")).toBe(originalLog)
+      expect(existsSync(join(dataDir, "snapshot.json"))).toBe(false)
+      expect(store.getStartupRecoveryIncidents()).toHaveLength(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  test("records only one startup incident for an incompatible event log", async () => {
+    const dataDir = await createTempDataDir()
+    const projectsLogPath = join(dataDir, "projects.jsonl")
+
+    await writeFile(projectsLogPath, [
+      JSON.stringify({
+        v: 1,
+        type: "project_opened",
+        timestamp: 1,
+        projectId: "project-1",
+        localPath: "/tmp/project",
+        title: "Project",
+      }),
+      JSON.stringify({
+        v: 1,
+        type: "project_opened",
+        timestamp: 2,
+        projectId: "project-2",
+        localPath: "/tmp/project-2",
+        title: "Project 2",
+      }),
+      "",
+    ].join("\n"), "utf8")
+
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+      const store = new EventStore(dataDir)
+      await store.initialize()
+
+      const incidents = store.getStartupRecoveryIncidents()
+      expect(incidents).toHaveLength(1)
+      expect(incidents[0]).toMatchObject({
+        kind: "log",
+        sourcePath: projectsLogPath,
+        line: 1,
+        reason: "incompatible event version 1",
+      })
+      expect(incidents[0]!.backupPath).toBeString()
+      expect(await readFile(incidents[0]!.backupPath!, "utf8")).toContain("project-2")
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
   test("persists sidebar project order across restart and compaction", async () => {
     const dataDir = await createTempDataDir()
     const store = new EventStore(dataDir)
@@ -646,35 +1108,6 @@ describe("EventStore", () => {
     }
   })
 
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
-  
 
   test("auto plan defaults to false and survives a replay", async () => {
     const dataDir = await createTempDataDir()
@@ -783,6 +1216,120 @@ describe("EventStore", () => {
     await expect(store.forkChat(source.id, { atLastCompletedTurn: true })).rejects.toThrow(/no completed turn/)
     // The refusal happens before anything is written — no half-built fork.
     expect(store.listChatsByProject(project.id).length).toBe(chatsBefore)
+  })
+
+  test("forks a chat with a selected transcript prefix", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const source = await store.createChat(project.id, { title: "Debug Session" })
+    await store.setChatProvider(source.id, "codex")
+    await store.setSessionToken(source.id, "thread-1")
+    const first = entry("user_prompt", source.createdAt + 1, { content: "first" })
+    const second = entry("assistant_text", source.createdAt + 2, { text: "done" })
+    const third = entry("user_prompt", source.createdAt + 3, { content: "second" })
+    await store.appendMessage(source.id, first)
+    await store.appendMessage(source.id, second)
+    await store.appendMessage(source.id, third)
+
+    const forked = await store.forkChat(source.id, {
+      transcriptEntries: [first, second],
+      pendingForkSessionToken: null,
+      pendingForkResumeAt: "assistant-msg-1",
+    })
+
+    expect(forked.id).not.toBe(source.id)
+    expect(forked.title).toBe("Fork: Debug Session")
+    expect(forked.provider).toBe("codex")
+    expect(forked.sessionToken).toBeNull()
+    expect(forked.pendingForkSessionToken).toBeNull()
+    expect(forked.pendingForkResumeAt).toBe("assistant-msg-1")
+    expect(store.getMessages(forked.id)).toEqual([first, second])
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    expect(reloaded.requireChat(forked.id).pendingForkResumeAt).toBe("assistant-msg-1")
+  })
+
+  test("persists a pending fork user prompt marker across reloads", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const source = await store.createChat(project.id, { title: "Claude Debug" })
+    await store.setChatProvider(source.id, "claude")
+    await store.setSessionToken(source.id, "session-1")
+    const prompt = entry("user_prompt", source.createdAt + 1, { content: "first" })
+    await store.appendMessage(source.id, prompt)
+
+    const forked = await store.forkChat(source.id, {
+      transcriptEntries: [prompt],
+      pendingForkSessionToken: null,
+      pendingForkUserPrompt: true,
+    })
+
+    expect(forked.pendingForkUserPrompt).toBe(true)
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    expect(reloaded.requireChat(forked.id).pendingForkUserPrompt).toBe(true)
+  })
+
+  test("persists chat model settings across reloads and copies them to forks", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project", "Project")
+    const chat = await store.createChat(project.id, { title: "Chat" })
+    await store.setChatProvider(chat.id, "claude")
+    await store.setPlanMode(chat.id, true)
+    await store.setSessionToken(chat.id, "claude-session-1")
+    await store.setChatModelSettings(chat.id, {
+      model: "claude-opus-4-7",
+      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "1m" } },
+    })
+    await store.compact()
+
+    const cursorChat = await store.createChat(project.id, { title: "Cursor chat" })
+    await store.setChatProvider(cursorChat.id, "cursor")
+    await store.setSessionToken(cursorChat.id, "cursor-session-1")
+    await store.setChatModelSettings(cursorChat.id, {
+      model: "composer-2.5",
+      modelOptions: { cursor: { fastMode: true } },
+    })
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    expect(reloaded.requireChat(chat.id)).toMatchObject({
+      model: "claude-opus-4-7",
+      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "1m" } },
+      planMode: true,
+    })
+    expect(reloaded.requireChat(cursorChat.id)).toMatchObject({
+      provider: "cursor",
+      model: "composer-2.5",
+      modelOptions: { cursor: { fastMode: true } },
+      planMode: false,
+    })
+
+    const forked = await reloaded.forkChat(chat.id)
+    expect(forked).toMatchObject({
+      provider: "claude",
+      model: "claude-opus-4-7",
+      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "1m" } },
+      planMode: true,
+    })
+
+    await reloaded.compact()
+    const compactedReload = new EventStore(dataDir)
+    await compactedReload.initialize()
+    expect(compactedReload.requireChat(cursorChat.id).modelOptions).toEqual({
+      cursor: { fastMode: true },
+    })
   })
 
   test("the resume marker survives a restart and a compaction", async () => {
@@ -1225,6 +1772,63 @@ describe("EventStore", () => {
     expect(reloaded.getChat(chat.id)?.turnCount).toBe(2)
   })
 
+  test("resets the turn count when a rewritten transcript starts an edited turn", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.recordTurnStarted(chat.id)
+    await store.recordTurnStarted(chat.id)
+    await store.recordTurnStarted(chat.id)
+
+    await store.recordTurnStarted(chat.id, "claude-opus-4-6", { turnCount: 2 })
+
+    expect(store.getChat(chat.id)?.turnCount).toBe(2)
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    expect(reloaded.getChat(chat.id)?.turnCount).toBe(2)
+  })
+
+  for (const originalCount of [undefined, 0, 7]) {
+    test(`turn count restoration preserves lifecycle metadata and same-millisecond journal order (${originalCount ?? "absent"})`, async () => {
+      const dataDir = await createTempDataDir()
+      const clock = spyOn(Date, "now").mockReturnValue(Date.now())
+      try {
+        const store = new EventStore(dataDir)
+        await store.initialize()
+        const project = await store.openProject("/tmp/project")
+        const chat = await store.createChat(project.id)
+        await store.recordTurnStarted(chat.id, "edited-model", { turnCount: 1 })
+        const beforeRestore = { ...store.requireChat(chat.id) }
+
+        await store.restoreTurnCount(chat.id, originalCount)
+        const expected = { ...beforeRestore, turnCount: originalCount }
+        if (originalCount === undefined) delete expected.turnCount
+        expect(store.requireChat(chat.id)).toEqual(expected)
+
+        const reloaded = new EventStore(dataDir)
+        await reloaded.initialize()
+        expect(reloaded.requireChat(chat.id)).toEqual(expected)
+
+        await store.recordTurnStarted(chat.id)
+        const successorCount = (originalCount ?? 0) + 1
+        expect(store.requireChat(chat.id).turnCount).toBe(successorCount)
+        const successorReload = new EventStore(dataDir)
+        await successorReload.initialize()
+        expect(successorReload.requireChat(chat.id).turnCount).toBe(successorCount)
+
+        await store.restoreTurnCount(chat.id, originalCount)
+        await store.compact()
+        const compacted = new EventStore(dataDir)
+        await compacted.initialize()
+        expect(compacted.requireChat(chat.id).turnCount).toBe(originalCount)
+      } finally { clock.mockRestore() }
+    })
+  }
+
   test("a fork inherits the turns behind the conversation it copied", async () => {
     const dataDir = await createTempDataDir()
     const store = new EventStore(dataDir)
@@ -1262,6 +1866,63 @@ describe("EventStore", () => {
 
     expect(store.getChat(chat.id)?.lastUserMessagePreview)
       .toBe("Plan rewrite the router drop parseTranscript and ship it")
+  })
+
+  test.each([
+    [`<system-message>${"hidden instructions ".repeat(30)}</system-message>\n**Visible** request`, "Visible request"],
+    ['<send_user_message_question_reply>[{"questionItemId":"q1","question":"Version?","answer":"B"},{"questionItemId":"q2","question":"Import?","answer":"Yes"}]</send_user_message_question_reply>', "Version? B Import? Yes"],
+  ])("forms a visible user preview before shortening it: %s", async (content, expected) => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.appendMessage(chat.id, entry("user_prompt", 1_000, { content }))
+    const assistantText = "<system-message>Literal example</system-message>"
+    await store.appendMessage(chat.id, entry("assistant_text", 2_000, { text: assistantText }))
+
+    expect(store.getChat(chat.id)?.lastUserMessagePreview).toBe(expected)
+    expect(store.getChat(chat.id)?.lastAgentMessagePreview).toBe(assistantText)
+    expect(store.getMessages(chat.id)[0]).toMatchObject({ content })
+  })
+
+  test("forms a visible user preview when replacing a transcript", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    const content = '<system-message>Hidden instructions</system-message>\n<send_user_message_question_reply>{"questionItemId":"q","question":"Version?","answer":"B"}</send_user_message_question_reply>'
+    const messages = [entry("user_prompt", 1_000, { content })]
+    await store.replaceTranscript(chat.id, messages)
+
+    expect(store.getChat(chat.id)?.lastUserMessagePreview).toBe("Version? B")
+    expect(store.getMessages(chat.id)).toEqual(messages)
+  })
+
+  test("forms a visible fork preview without changing the source signature", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const source = await store.createChat(project.id)
+    await store.setChatProvider(source.id, "claude")
+    await store.setSessionToken(source.id, "session-1")
+    await store.recordTurnStarted(source.id)
+    const content = "<system-message>Hidden instructions</system-message>\nVisible request"
+    await store.appendMessage(source.id, entry("user_prompt", 1_000, { content }))
+    await store.appendMessage(source.id, entry("assistant_text", 2_000, { text: "Done" }))
+    await store.appendMessage(source.id, entry("result", 3_000, { result: "ok" }))
+    await store.recordTurnFinished(source.id)
+    await store.recordTurnStarted(source.id)
+    await store.appendMessage(source.id, entry("user_prompt", 4_000, { content: "Next request" }))
+    const before = store.getMessages(source.id)
+    const fork = await store.forkChat(source.id, { atLastCompletedTurn: true })
+
+    expect(fork.lastUserMessagePreview).toBe("Visible request")
+    expect(store.getChat(source.id)?.lastUserMessagePreview).toBe("Next request")
+    expect(store.getMessages(source.id)).toEqual(before)
+    expect(store.getMessages(fork.id)[0]).toMatchObject({ content })
   })
 
   test("advances each preview independently, so a new prompt keeps the old reply", async () => {
@@ -1369,705 +2030,6 @@ describe("EventStore", () => {
     const compacted = new EventStore(dataDir)
     await compacted.initialize()
     expect(compacted.isProviderSessionHidden("claude", "session-1")).toBe(true)
-  })
-
-
-  test("recovers from replay logs when snapshot is corrupt", async () => {
-    const dataDir = await createTempDataDir()
-    const snapshotPath = join(dataDir, "snapshot.json")
-    const projectsLogPath = join(dataDir, "projects.jsonl")
-    const chatsLogPath = join(dataDir, "chats.jsonl")
-
-    await writeFile(snapshotPath, "{not-json", "utf8")
-    await writeFile(projectsLogPath, `${JSON.stringify({
-      v: 2,
-      type: "project_opened",
-      timestamp: 1,
-      projectId: "project-1",
-      localPath: "/tmp/project",
-      title: "Project",
-    })}\n`, "utf8")
-    await writeFile(chatsLogPath, `${JSON.stringify({
-      v: 2,
-      type: "chat_created",
-      timestamp: 2,
-      chatId: "chat-1",
-      projectId: "project-1",
-      title: "Chat",
-    })}\n`, "utf8")
-
-    const originalWarn = console.warn
-    console.warn = () => {}
-    try {
-      const store = new EventStore(dataDir)
-      await store.initialize()
-
-      expect(store.getProject("project-1")?.title).toBe("Project")
-      expect(store.getChat("chat-1")?.title).toBe("Chat")
-    } finally {
-      console.warn = originalWarn
-    }
-
-    const recoveredSnapshot = JSON.parse(await readFile(snapshotPath, "utf8")) as SnapshotFile
-    expect(recoveredSnapshot.projects.map((project) => project.id)).toEqual(["project-1"])
-    expect(recoveredSnapshot.chats.map((chat) => chat.id)).toEqual(["chat-1"])
-    expect(await readFile(projectsLogPath, "utf8")).toBe("")
-    expect(await readFile(chatsLogPath, "utf8")).toBe("")
-  })
-
-
-  test("backs up a corrupt snapshot before replaying logs", async () => {
-    const dataDir = await createTempDataDir()
-    const snapshotPath = join(dataDir, "snapshot.json")
-    const projectsLogPath = join(dataDir, "projects.jsonl")
-
-    await writeFile(snapshotPath, "{not-json", "utf8")
-    await writeFile(projectsLogPath, `${JSON.stringify({
-      v: 2,
-      type: "project_opened",
-      timestamp: 1,
-      projectId: "project-1",
-      localPath: "/tmp/project",
-      title: "Project",
-    })}\n`, "utf8")
-
-    const originalWarn = console.warn
-    console.warn = () => {}
-    try {
-      const store = new EventStore(dataDir)
-      await store.initialize()
-
-      const backupFiles = await readdir(join(dataDir, "recovery"))
-      const snapshotBackup = backupFiles.find((file) => file.includes("snapshot") && file.endsWith(".json"))
-      expect(snapshotBackup).toBeString()
-      expect(await readFile(join(dataDir, "recovery", snapshotBackup!), "utf8")).toBe("{not-json")
-      expect(store.getStartupRecoveryIncidents()).toContainEqual(expect.objectContaining({
-        kind: "snapshot",
-        sourcePath: snapshotPath,
-        backupPath: join(dataDir, "recovery", snapshotBackup!),
-      }))
-    } finally {
-      console.warn = originalWarn
-    }
-  })
-
-
-  test("replaces a corrupt snapshot after recovery even when logs are small", async () => {
-    const dataDir = await createTempDataDir()
-    const snapshotPath = join(dataDir, "snapshot.json")
-    const projectsLogPath = join(dataDir, "projects.jsonl")
-
-    await writeFile(snapshotPath, "{not-json", "utf8")
-    await writeFile(projectsLogPath, `${JSON.stringify({
-      v: 2,
-      type: "project_opened",
-      timestamp: 1,
-      projectId: "project-1",
-      localPath: "/tmp/project",
-      title: "Project",
-    })}\n`, "utf8")
-
-    const originalWarn = console.warn
-    console.warn = () => {}
-    try {
-      const store = new EventStore(dataDir)
-      await store.initialize()
-
-      const recoveredSnapshot = JSON.parse(await readFile(snapshotPath, "utf8")) as SnapshotFile
-      expect(recoveredSnapshot.projects.map((project) => project.id)).toEqual(["project-1"])
-      expect(await readFile(projectsLogPath, "utf8")).toBe("")
-
-      const reloaded = new EventStore(dataDir)
-      await reloaded.initialize()
-      expect(reloaded.getStartupRecoveryIncidents()).toEqual([])
-      expect(reloaded.getProject("project-1")?.title).toBe("Project")
-    } finally {
-      console.warn = originalWarn
-    }
-  })
-
-
-  test("backs up a log with a corrupt middle line and records a startup incident", async () => {
-    const dataDir = await createTempDataDir()
-    const projectsLogPath = join(dataDir, "projects.jsonl")
-
-    await writeFile(projectsLogPath, [
-      JSON.stringify({
-        v: 2,
-        type: "project_opened",
-        timestamp: 1,
-        projectId: "project-1",
-        localPath: "/tmp/project",
-        title: "Project",
-      }),
-      "{not-json",
-      JSON.stringify({
-        v: 2,
-        type: "project_opened",
-        timestamp: 2,
-        projectId: "project-2",
-        localPath: "/tmp/project-2",
-        title: "Project 2",
-      }),
-      "",
-    ].join("\n"), "utf8")
-
-    const originalWarn = console.warn
-    console.warn = () => {}
-    try {
-      const store = new EventStore(dataDir)
-      await store.initialize()
-
-      const backupFiles = await readdir(join(dataDir, "recovery"))
-      const logBackup = backupFiles.find((file) => file.includes("projects") && file.endsWith(".jsonl"))
-      expect(logBackup).toBeString()
-      expect(await readFile(join(dataDir, "recovery", logBackup!), "utf8")).toContain("{not-json")
-      expect(store.getProject("project-1")?.title).toBe("Project")
-      expect(store.getProject("project-2")?.title).toBe("Project 2")
-      expect(store.getStartupRecoveryIncidents()).toContainEqual(expect.objectContaining({
-        kind: "log",
-        sourcePath: projectsLogPath,
-        backupPath: join(dataDir, "recovery", logBackup!),
-        line: 2,
-      }))
-    } finally {
-      console.warn = originalWarn
-    }
-  })
-
-
-  
-
-
-  test("records only one startup incident for an incompatible event log", async () => {
-    const dataDir = await createTempDataDir()
-    const projectsLogPath = join(dataDir, "projects.jsonl")
-
-    await writeFile(projectsLogPath, [
-      JSON.stringify({
-        v: 1,
-        type: "project_opened",
-        timestamp: 1,
-        projectId: "project-1",
-        localPath: "/tmp/project",
-        title: "Project",
-      }),
-      JSON.stringify({
-        v: 1,
-        type: "project_opened",
-        timestamp: 2,
-        projectId: "project-2",
-        localPath: "/tmp/project-2",
-        title: "Project 2",
-      }),
-      "",
-    ].join("\n"), "utf8")
-
-    const originalWarn = console.warn
-    console.warn = () => {}
-    try {
-      const store = new EventStore(dataDir)
-      await store.initialize()
-
-      const incidents = store.getStartupRecoveryIncidents()
-      expect(incidents).toHaveLength(1)
-      expect(incidents[0]).toMatchObject({
-        kind: "log",
-        sourcePath: projectsLogPath,
-        line: 1,
-        reason: "incompatible event version 1",
-      })
-      expect(incidents[0]!.backupPath).toBeString()
-      expect(await readFile(incidents[0]!.backupPath!, "utf8")).toContain("project-2")
-    } finally {
-      console.warn = originalWarn
-    }
-  })
-
-
-  test("persists replaced transcript metadata across restart", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    const first = entry("user_prompt", chat.createdAt + 1, { content: "first" })
-    const firstAnswer = entry("assistant_text", chat.createdAt + 2, { text: "first answer" })
-    const second = entry("user_prompt", chat.createdAt + 3, { content: "second" })
-    const staleAnswer = entry("assistant_text", chat.createdAt + 4, { text: "stale answer" })
-    await store.appendMessage(chat.id, first)
-    await store.appendMessage(chat.id, firstAnswer)
-    await store.appendMessage(chat.id, second)
-    await store.appendMessage(chat.id, staleAnswer)
-    await store.compact()
-
-    await store.replaceTranscript(chat.id, [first, firstAnswer])
-
-    expect(store.requireChat(chat.id).lastMessageAt).toBe(first.createdAt)
-    expect(store.requireChat(chat.id).lastUserMessagePreview).toBe("first")
-    expect(store.requireChat(chat.id).lastAgentMessagePreview).toBe("first answer")
-    expect(store.requireChat(chat.id).lastAgentMessagePreviewAt).toBe(firstAnswer.createdAt)
-    expect(store.requireChat(chat.id).lastAgentMessageAt).toBe(firstAnswer.createdAt)
-
-    const reloaded = new EventStore(dataDir)
-    await reloaded.initialize()
-
-    expect(reloaded.requireChat(chat.id).hasMessages).toBe(true)
-    expect(reloaded.requireChat(chat.id).lastMessageAt).toBe(first.createdAt)
-    expect(reloaded.requireChat(chat.id).lastUserMessagePreview).toBe("first")
-    expect(reloaded.requireChat(chat.id).lastAgentMessagePreview).toBe("first answer")
-    expect(reloaded.requireChat(chat.id).lastAgentMessagePreviewAt).toBe(firstAnswer.createdAt)
-    expect(reloaded.requireChat(chat.id).lastAgentMessageAt).toBe(firstAnswer.createdAt)
-  })
-
-
-  test("clears replaced transcript metadata for an empty transcript across restart", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    await store.appendMessage(chat.id, entry("user_prompt", chat.createdAt + 1, { content: "stale prompt" }))
-    await store.appendMessage(chat.id, entry("assistant_text", chat.createdAt + 2, { text: "stale answer" }))
-    await store.compact()
-
-    await store.replaceTranscript(chat.id, [])
-
-    expect(store.requireChat(chat.id)).toMatchObject({ hasMessages: false })
-    expect(store.requireChat(chat.id).lastMessageAt).toBeUndefined()
-    expect(store.requireChat(chat.id).lastUserMessagePreview).toBeUndefined()
-    expect(store.requireChat(chat.id).lastAgentMessagePreview).toBeUndefined()
-    expect(store.requireChat(chat.id).lastAgentMessagePreviewAt).toBeUndefined()
-    expect(store.requireChat(chat.id).lastAgentMessageAt).toBeUndefined()
-
-    const reloaded = new EventStore(dataDir)
-    await reloaded.initialize()
-
-    expect(reloaded.requireChat(chat.id)).toMatchObject({ hasMessages: false })
-    expect(reloaded.requireChat(chat.id).lastMessageAt).toBeUndefined()
-    expect(reloaded.requireChat(chat.id).lastUserMessagePreview).toBeUndefined()
-    expect(reloaded.requireChat(chat.id).lastAgentMessagePreview).toBeUndefined()
-    expect(reloaded.requireChat(chat.id).lastAgentMessagePreviewAt).toBeUndefined()
-    expect(reloaded.requireChat(chat.id).lastAgentMessageAt).toBeUndefined()
-  })
-
-
-  test("clears the stale agent preview when a replacement has no assistant messages", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    await store.appendMessage(chat.id, entry("user_prompt", chat.createdAt + 1, { content: "stale prompt" }))
-    await store.appendMessage(chat.id, entry("assistant_text", chat.createdAt + 2, { text: "stale answer" }))
-    await store.compact()
-
-    const replacement = entry("user_prompt", chat.createdAt + 3, { content: "replacement prompt" })
-    await store.replaceTranscript(chat.id, [replacement])
-
-    expect(store.requireChat(chat.id).hasMessages).toBe(true)
-    expect(store.requireChat(chat.id).lastMessageAt).toBe(replacement.createdAt)
-    expect(store.requireChat(chat.id).lastUserMessagePreview).toBe("replacement prompt")
-    expect(store.requireChat(chat.id).lastAgentMessagePreview).toBeUndefined()
-    expect(store.requireChat(chat.id).lastAgentMessagePreviewAt).toBeUndefined()
-    expect(store.requireChat(chat.id).lastAgentMessageAt).toBeUndefined()
-
-    const reloaded = new EventStore(dataDir)
-    await reloaded.initialize()
-
-    expect(reloaded.requireChat(chat.id).hasMessages).toBe(true)
-    expect(reloaded.requireChat(chat.id).lastMessageAt).toBe(replacement.createdAt)
-    expect(reloaded.requireChat(chat.id).lastUserMessagePreview).toBe("replacement prompt")
-    expect(reloaded.requireChat(chat.id).lastAgentMessagePreview).toBeUndefined()
-    expect(reloaded.requireChat(chat.id).lastAgentMessagePreviewAt).toBeUndefined()
-    expect(reloaded.requireChat(chat.id).lastAgentMessageAt).toBeUndefined()
-  })
-
-
-  test("persists exact replacement metadata when the transcript tail exceeds 256 KiB", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    const prompt = entry("user_prompt", chat.createdAt + 1, { content: "large transcript prompt" })
-    const longAnswer = "A".repeat(300 * 1024)
-    const answer = entry("assistant_text", chat.createdAt + 2, { text: longAnswer })
-
-    await store.replaceTranscript(chat.id, [prompt, answer])
-
-    const reloaded = new EventStore(dataDir)
-    await reloaded.initialize()
-
-    expect(reloaded.requireChat(chat.id).hasMessages).toBe(true)
-    expect(reloaded.requireChat(chat.id).lastMessageAt).toBe(prompt.createdAt)
-    expect(reloaded.requireChat(chat.id).lastUserMessagePreview).toBe("large transcript prompt")
-    expect(reloaded.requireChat(chat.id).lastAgentMessagePreview).toBe(`${"A".repeat(160)}…`)
-  })
-
-
-  test("forks a chat with a selected transcript prefix", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const source = await store.createChat(project.id, { title: "Debug Session" })
-    await store.setChatProvider(source.id, "codex")
-    await store.setSessionToken(source.id, "thread-1")
-    const first = entry("user_prompt", source.createdAt + 1, { content: "first" })
-    const second = entry("assistant_text", source.createdAt + 2, { text: "done" })
-    const third = entry("user_prompt", source.createdAt + 3, { content: "second" })
-    await store.appendMessage(source.id, first)
-    await store.appendMessage(source.id, second)
-    await store.appendMessage(source.id, third)
-
-    const forked = await store.forkChat(source.id, {
-      transcriptEntries: [first, second],
-      pendingForkSessionToken: null,
-      pendingForkResumeAt: "assistant-msg-1",
-    })
-
-    expect(forked.id).not.toBe(source.id)
-    expect(forked.title).toBe("Fork: Debug Session")
-    expect(forked.provider).toBe("codex")
-    expect(forked.sessionToken).toBeNull()
-    expect(forked.pendingForkSessionToken).toBeNull()
-    expect(forked.pendingForkResumeAt).toBe("assistant-msg-1")
-    expect(store.getMessages(forked.id)).toEqual([first, second])
-
-    const reloaded = new EventStore(dataDir)
-    await reloaded.initialize()
-    expect(reloaded.requireChat(forked.id).pendingForkResumeAt).toBe("assistant-msg-1")
-  })
-
-
-  test("persists a pending fork user prompt marker across reloads", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const source = await store.createChat(project.id, { title: "Claude Debug" })
-    await store.setChatProvider(source.id, "claude")
-    await store.setSessionToken(source.id, "session-1")
-    const prompt = entry("user_prompt", source.createdAt + 1, { content: "first" })
-    await store.appendMessage(source.id, prompt)
-
-    const forked = await store.forkChat(source.id, {
-      transcriptEntries: [prompt],
-      pendingForkSessionToken: null,
-      pendingForkUserPrompt: true,
-    })
-
-    expect(forked.pendingForkUserPrompt).toBe(true)
-
-    const reloaded = new EventStore(dataDir)
-    await reloaded.initialize()
-    expect(reloaded.requireChat(forked.id).pendingForkUserPrompt).toBe(true)
-  })
-
-
-  test("persists chat model settings across reloads and copies them to forks", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project", "Project")
-    const chat = await store.createChat(project.id, { title: "Chat" })
-    await store.setChatProvider(chat.id, "claude")
-    await store.setPlanMode(chat.id, true)
-    await store.setSessionToken(chat.id, "claude-session-1")
-    await store.setChatModelSettings(chat.id, {
-      model: "claude-opus-4-7",
-      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "1m" } },
-    })
-    await store.compact()
-
-    const cursorChat = await store.createChat(project.id, { title: "Cursor chat" })
-    await store.setChatProvider(cursorChat.id, "cursor")
-    await store.setSessionToken(cursorChat.id, "cursor-session-1")
-    await store.setChatModelSettings(cursorChat.id, {
-      model: "composer-2.5",
-      modelOptions: { cursor: { fastMode: true } },
-    })
-
-    const reloaded = new EventStore(dataDir)
-    await reloaded.initialize()
-    expect(reloaded.requireChat(chat.id)).toMatchObject({
-      model: "claude-opus-4-7",
-      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "1m" } },
-      planMode: true,
-    })
-    expect(reloaded.requireChat(cursorChat.id)).toMatchObject({
-      provider: "cursor",
-      model: "composer-2.5",
-      modelOptions: { cursor: { fastMode: true } },
-      planMode: false,
-    })
-
-    const forked = await reloaded.forkChat(chat.id)
-    expect(forked).toMatchObject({
-      provider: "claude",
-      model: "claude-opus-4-7",
-      modelOptions: { claude: { reasoningEffort: "max", contextWindow: "1m" } },
-      planMode: true,
-    })
-
-    await reloaded.compact()
-    const compactedReload = new EventStore(dataDir)
-    await compactedReload.initialize()
-    expect(compactedReload.requireChat(cursorChat.id).modelOptions).toEqual({
-      cursor: { fastMode: true },
-    })
-  })
-
-
-  test("resets the turn count when a rewritten transcript starts an edited turn", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    await store.recordTurnStarted(chat.id)
-    await store.recordTurnStarted(chat.id)
-    await store.recordTurnStarted(chat.id)
-
-    await store.recordTurnStarted(chat.id, "claude-opus-4-6", { turnCount: 2 })
-
-    expect(store.getChat(chat.id)?.turnCount).toBe(2)
-
-    const reloaded = new EventStore(dataDir)
-    await reloaded.initialize()
-    expect(reloaded.getChat(chat.id)?.turnCount).toBe(2)
-  })
-
-
-  for (const originalCount of [undefined, 0, 7]) {
-    test(`turn count restoration preserves lifecycle metadata and same-millisecond journal order (${originalCount ?? "absent"})`, async () => {
-      const dataDir = await createTempDataDir()
-      const clock = spyOn(Date, "now").mockReturnValue(Date.now())
-      try {
-        const store = new EventStore(dataDir)
-        await store.initialize()
-        const project = await store.openProject("/tmp/project")
-        const chat = await store.createChat(project.id)
-        await store.recordTurnStarted(chat.id, "edited-model", { turnCount: 1 })
-        const beforeRestore = { ...store.requireChat(chat.id) }
-
-        await store.restoreTurnCount(chat.id, originalCount)
-        const expected = { ...beforeRestore, turnCount: originalCount }
-        if (originalCount === undefined) delete expected.turnCount
-        expect(store.requireChat(chat.id)).toEqual(expected)
-
-        const reloaded = new EventStore(dataDir)
-        await reloaded.initialize()
-        expect(reloaded.requireChat(chat.id)).toEqual(expected)
-
-        await store.recordTurnStarted(chat.id)
-        const successorCount = (originalCount ?? 0) + 1
-        expect(store.requireChat(chat.id).turnCount).toBe(successorCount)
-        const successorReload = new EventStore(dataDir)
-        await successorReload.initialize()
-        expect(successorReload.requireChat(chat.id).turnCount).toBe(successorCount)
-
-        await store.restoreTurnCount(chat.id, originalCount)
-        await store.compact()
-        const compacted = new EventStore(dataDir)
-        await compacted.initialize()
-        expect(compacted.requireChat(chat.id).turnCount).toBe(originalCount)
-      } finally { clock.mockRestore() }
-    })
-  }
-
-
-  test("stops startup and preserves a corrupt log when its recovery backup fails", async () => {
-    const dataDir = await createTempDataDir()
-    const projectsLogPath = join(dataDir, "projects.jsonl")
-
-    await writeFile(projectsLogPath, [
-      JSON.stringify({
-        v: 2,
-        type: "project_opened",
-        timestamp: 1,
-        projectId: "project-1",
-        localPath: "/tmp/project",
-        title: "Project",
-      }),
-      "{not-json",
-      JSON.stringify({
-        v: 2,
-        type: "project_opened",
-        timestamp: 2,
-        projectId: "project-2",
-        localPath: "/tmp/project-2",
-        title: "Project 2",
-      }),
-      "",
-    ].join("\n"), "utf8")
-    await writeFile(join(dataDir, "recovery"), "not-a-directory", "utf8")
-    const originalLog = await readFile(projectsLogPath, "utf8")
-
-    const originalWarn = console.warn
-    console.warn = () => {}
-    try {
-      const store = new EventStore(dataDir)
-      await expect(store.initialize()).rejects.toThrow("Cannot back up recovery source")
-
-      const incidents = store.getStartupRecoveryIncidents()
-      expect(await readFile(projectsLogPath, "utf8")).toBe(originalLog)
-      expect(existsSync(join(dataDir, "snapshot.json"))).toBe(false)
-      expect(incidents).toHaveLength(1)
-      expect(incidents[0]).toMatchObject({
-        kind: "log",
-        sourcePath: projectsLogPath,
-        backupPath: null,
-        line: 2,
-      })
-      expect(incidents[0]!.reason).toContain("backup failed:")
-      // Once backup storage is repaired, ordinary recovery can safely proceed.
-      await rm(join(dataDir, "recovery"))
-      const restarted = new EventStore(dataDir)
-      await restarted.initialize()
-      expect(restarted.getProject("project-1")?.title).toBe("Project")
-      expect(restarted.getProject("project-2")?.title).toBe("Project 2")
-      const recoveredIncident = restarted.getStartupRecoveryIncidents()[0]!
-      expect(await readFile(recoveredIncident.backupPath!, "utf8")).toBe(originalLog)
-    } finally {
-      console.warn = originalWarn
-    }
-  })
-
-
-  for (const corruption of ["invalid JSON", "incompatible version"] as const) {
-    test(`stops startup without overwriting a snapshot with ${corruption} when backup fails`, async () => {
-      const dataDir = await createTempDataDir()
-      const snapshotPath = join(dataDir, "snapshot.json")
-      const originalSnapshot = corruption === "invalid JSON"
-        ? "{not-json"
-        : JSON.stringify({ v: 1, projects: [], chats: [] })
-      await writeFile(snapshotPath, originalSnapshot, "utf8")
-      const journals = ["projects.jsonl", "chats.jsonl", "messages.jsonl", "queued-messages.jsonl", "turns.jsonl"]
-      for (const journal of journals) await writeFile(join(dataDir, journal), "\n", "utf8")
-      await writeFile(join(dataDir, "recovery"), "not-a-directory", "utf8")
-      const warn = spyOn(console, "warn").mockImplementation(() => {})
-      try {
-        const store = new EventStore(dataDir)
-        await expect(store.initialize()).rejects.toThrow(snapshotPath)
-        expect(await readFile(snapshotPath, "utf8")).toBe(originalSnapshot)
-        for (const journal of journals) expect(await readFile(join(dataDir, journal), "utf8")).toBe("\n")
-        expect(store.getStartupRecoveryIncidents()).toHaveLength(1)
-      } finally {
-        warn.mockRestore()
-      }
-    })
-  }
-
-
-  test("does not swallow failed backup of an incompatible final log event as a truncated trailing line", async () => {
-    const dataDir = await createTempDataDir()
-    const logPath = join(dataDir, "projects.jsonl")
-    const originalLog = `${JSON.stringify({ v: 1, type: "project_opened", timestamp: 1 })}\n`
-    await writeFile(logPath, originalLog, "utf8")
-    await writeFile(join(dataDir, "recovery"), "not-a-directory", "utf8")
-    const warn = spyOn(console, "warn").mockImplementation(() => {})
-    try {
-      const store = new EventStore(dataDir)
-      await expect(store.initialize()).rejects.toThrow(logPath)
-      expect(await readFile(logPath, "utf8")).toBe(originalLog)
-      expect(existsSync(join(dataDir, "snapshot.json"))).toBe(false)
-      expect(store.getStartupRecoveryIncidents()).toHaveLength(1)
-    } finally {
-      warn.mockRestore()
-    }
-  })
-
-
-  test.each([
-    [`<system-message>${"hidden instructions ".repeat(30)}</system-message>\n**Visible** request`, "Visible request"],
-    ['<send_user_message_question_reply>[{"questionItemId":"q1","question":"Version?","answer":"B"},{"questionItemId":"q2","question":"Import?","answer":"Yes"}]</send_user_message_question_reply>', "Version? B Import? Yes"],
-  ])("forms a visible user preview before shortening it: %s", async (content, expected) => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    await store.appendMessage(chat.id, entry("user_prompt", 1_000, { content }))
-    const assistantText = "<system-message>Literal example</system-message>"
-    await store.appendMessage(chat.id, entry("assistant_text", 2_000, { text: assistantText }))
-
-    expect(store.getChat(chat.id)?.lastUserMessagePreview).toBe(expected)
-    expect(store.getChat(chat.id)?.lastAgentMessagePreview).toBe(assistantText)
-    expect(store.getMessages(chat.id)[0]).toMatchObject({ content })
-  })
-
-
-  test("forms a visible fork preview without changing the source signature", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-    const project = await store.openProject("/tmp/project")
-    const source = await store.createChat(project.id)
-    await store.setChatProvider(source.id, "claude")
-    await store.setSessionToken(source.id, "session-1")
-    await store.recordTurnStarted(source.id)
-    const content = "<system-message>Hidden instructions</system-message>\nVisible request"
-    await store.appendMessage(source.id, entry("user_prompt", 1_000, { content }))
-    await store.appendMessage(source.id, entry("assistant_text", 2_000, { text: "Done" }))
-    await store.appendMessage(source.id, entry("result", 3_000, { result: "ok" }))
-    await store.recordTurnFinished(source.id)
-    await store.recordTurnStarted(source.id)
-    await store.appendMessage(source.id, entry("user_prompt", 4_000, { content: "Next request" }))
-    const before = store.getMessages(source.id)
-    const fork = await store.forkChat(source.id, { atLastCompletedTurn: true })
-
-    expect(fork.lastUserMessagePreview).toBe("Visible request")
-    expect(store.getChat(source.id)?.lastUserMessagePreview).toBe("Next request")
-    expect(store.getMessages(source.id)).toEqual(before)
-    expect(store.getMessages(fork.id)[0]).toMatchObject({ content })
-  })
-
-
-  test("forms a visible user preview when replacing a transcript", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    const content = '<system-message>Hidden instructions</system-message>\n<send_user_message_question_reply>{"questionItemId":"q","question":"Version?","answer":"B"}</send_user_message_question_reply>'
-    const messages = [entry("user_prompt", 1_000, { content })]
-    await store.replaceTranscript(chat.id, messages)
-
-    expect(store.getChat(chat.id)?.lastUserMessagePreview).toBe("Version? B")
-    expect(store.getMessages(chat.id)).toEqual(messages)
-  })
-
-
-  test("moves a redelivered prompt without losing concurrent writes or its payload", async () => {
-    const store = new EventStore(await createTempDataDir())
-    await store.initialize()
-    const project = await store.openProject(store.dataDir, "Project")
-    const chat = await store.createChat(project.id)
-    const answer: TranscriptEntry = { _id: "answer-1", createdAt: 1, kind: "user_prompt", content: "Saved answer",
-      attachments: [{ id: "attachment-1", kind: "file", displayName: "details.txt",
-        absolutePath: "/tmp/details.txt", relativePath: "details.txt", contentUrl: "/file",
-        mimeType: "text/plain", size: 12 }] }
-    await store.appendMessage(chat.id, answer)
-    const next = entry("user_prompt", 2, { content: "Next" })
-    const output = entry("assistant_text", 3, { text: "Concurrent output" })
-    await store.appendMessage(chat.id, next)
-    const moving = store.moveUserPromptToEnd(chat.id, answer._id)
-    const writing = store.appendMessage(chat.id, output)
-    await Promise.all([moving, writing])
-    expect(store.getMessages(chat.id)).toEqual([next, answer, output])
-    const replayed = new EventStore(store.dataDir)
-    await replayed.initialize()
-    expect(replayed.getMessages(chat.id)).toEqual([next, answer, output])
   })
 })
 
@@ -2320,151 +2282,6 @@ describe("slimTranscripts", () => {
   })
 })
 
-describe("getClientTranscript window and outline", () => {
-  test("clones from the requested index and keeps the outline whole", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-    const project = await store.openProject(join(dataDir, "project"))
-    const chat = await store.createChat(project.id)
-    const at = Date.now()
-    await store.appendMessage(chat.id, { _id: "p1", createdAt: at, kind: "user_prompt", content: "first" } as TranscriptEntry)
-    await store.appendMessage(chat.id, { _id: "a1", createdAt: at + 1, kind: "assistant_text", text: "x" } as TranscriptEntry)
-    await store.appendMessage(chat.id, { _id: "p2", createdAt: at + 2, kind: "user_prompt", content: "second" } as TranscriptEntry)
-    await store.appendMessage(chat.id, { _id: "a2", createdAt: at + 3, kind: "assistant_text", text: "y" } as TranscriptEntry)
-
-    const windowed = store.getClientTranscript(chat.id, 2)
-    expect(windowed.startIndex).toBe(2)
-    expect(windowed.messages.map((entry) => entry._id)).toEqual(["p2", "a2"])
-    expect(windowed.outline.map((entry) => entry.index)).toEqual([0, 2])
-
-    const outlineBefore = windowed.outline
-    await store.appendMessage(chat.id, { _id: "a3", createdAt: at + 4, kind: "assistant_text", text: "z" } as TranscriptEntry)
-    expect(store.getClientTranscript(chat.id).outline).toBe(outlineBefore)
-    await store.appendMessage(chat.id, { _id: "p3", createdAt: at + 5, kind: "user_prompt", content: "third" } as TranscriptEntry)
-    expect(store.getClientTranscript(chat.id).outline.map((entry) => entry.id)).toEqual(["p1", "p2", "p3"])
-    await rm(dataDir, { recursive: true, force: true })
-  })
-})
-
-
-describe("stateVersion", () => {
-  /**
-   * `stateVersion` is the sidebar memo key in ws-router. A transcript append
-   * must bump it only when it moved something the sidebar can actually show,
-   * otherwise a streaming turn re-derives and re-serializes the whole sidebar
-   * many times a second for bytes that come out identical.
-   */
-  test("agent entries inside one activity bucket do not bump it", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-    const project = await store.openProject(dataDir, "proj")
-    const chat = await store.createChat(project.id)
-
-    const at = Math.floor(Date.now() / SIDEBAR_ACTIVITY_RESOLUTION_MS) * SIDEBAR_ACTIVITY_RESOLUTION_MS
-    await store.appendMessage(chat.id, entry("user_prompt", at, { content: "go" }))
-
-    const before = store.stateVersion
-    for (let i = 0; i < 20; i++) {
-      // This fixture starts at the aligned activity bucket boundary.
-      await store.appendMessage(chat.id, entry("assistant_text", at + 100 + i * 20, { text: `step ${i}` }))
-    }
-    // The first one moves lastAgentMessageAt into a bucket; the rest are free.
-    expect(store.stateVersion - before).toBe(1)
-  })
-
-  test("still bumps when a sidebar-visible field moves", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-    const project = await store.openProject(dataDir, "proj")
-    const chat = await store.createChat(project.id)
-
-    const at = Date.now()
-    // hasMessages false -> true, and lastMessageAt is the sidebar sort key.
-    const afterFirstPrompt = store.stateVersion
-    await store.appendMessage(chat.id, entry("user_prompt", at, { content: "one" }))
-    expect(store.stateVersion).toBeGreaterThan(afterFirstPrompt)
-
-    // A later user prompt moves lastMessageAt, so it must bump again.
-    const beforeSecond = store.stateVersion
-    await store.appendMessage(chat.id, entry("user_prompt", at + 1_000, { content: "two" }))
-    expect(store.stateVersion).toBeGreaterThan(beforeSecond)
-
-    // Crossing into the next 15s activity bucket must bump.
-    const beforeBucketCross = store.stateVersion
-    await store.appendMessage(chat.id, entry("assistant_text", at + 40_000, { text: "much later" }))
-    expect(store.stateVersion).toBeGreaterThan(beforeBucketCross)
-  })
-})
-
-
-describe("chat pins", () => {
-  test("persists pin and unpin through replay and compaction", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    await store.setChatPinned(chat.id, true)
-    const pinnedAt = store.getChat(chat.id)!.pinnedAt
-    expect(pinnedAt).toBeNumber()
-    await store.setChatPinned(chat.id, true)
-    expect(store.getChat(chat.id)!.pinnedAt).toBe(pinnedAt)
-
-    const replayed = new EventStore(dataDir)
-    await replayed.initialize()
-    expect(replayed.getChat(chat.id)!.pinnedAt).toBe(pinnedAt)
-    await replayed.compact()
-    const compacted = new EventStore(dataDir)
-    await compacted.initialize()
-    expect(compacted.getChat(chat.id)!.pinnedAt).toBe(pinnedAt)
-    await compacted.setChatPinned(chat.id, false)
-    const unpinned = new EventStore(dataDir)
-    await unpinned.initialize()
-    expect(unpinned.getChat(chat.id)!.pinnedAt).toBeUndefined()
-  })
-
-  test("replay preserves repinning after archive within the same millisecond", async () => {
-    const dataDir = await createTempDataDir()
-    const store = new EventStore(dataDir)
-    await store.initialize()
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    const timestamp = Date.now()
-    const clock = spyOn(Date, "now").mockReturnValue(timestamp)
-    try {
-      await store.setChatPinned(chat.id, true)
-      await store.archiveChat(chat.id)
-      await store.unarchiveChat(chat.id)
-      await store.setChatPinned(chat.id, true)
-    } finally {
-      clock.mockRestore()
-    }
-    const replayed = new EventStore(dataDir)
-    await replayed.initialize()
-    expect(replayed.getChat(chat.id)!.pinnedAt).toBe(timestamp)
-    expect(replayed.getChat(chat.id)!.archivedAt).toBeUndefined()
-  })
-
-  
-
-  test("manual archive clears the pin and restore keeps it unpinned", async () => {
-    const store = new EventStore(await createTempDataDir())
-    await store.initialize()
-    const project = await store.openProject("/tmp/project")
-    const chat = await store.createChat(project.id)
-    await store.setChatPinned(chat.id, true)
-    await store.archiveChat(chat.id)
-    expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
-    await store.setChatPinned(chat.id, true)
-    expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
-    await store.unarchiveChat(chat.id)
-    expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
-  })
-})
-
 
 describe("stored Claude plan recovery", () => {
   const planPath = "/missing-project/.claude/plans/review.md"
@@ -2531,6 +2348,51 @@ describe("stored Claude plan recovery", () => {
     await reloaded.initialize()
     await reloaded.prepareTranscript(chat.id)
     assertSnapshot(reloaded.getClientTranscript(chat.id, 4))
+  })
+
+  test("replaceTranscript invalidates warmed stored plan recovery with reused operation and exit IDs", async () => {
+    const { dataDir, store, chat } = await setup()
+    const operations = (before: string, after: string) => [
+      call("write", "write_file", { filePath: planPath, content: `## Plan\n\n- ${before}` }), result("write"),
+      call("edit", "edit_file", { filePath: planPath, oldString: before, newString: after }), result("edit"),
+      call("exit", "exit_plan_mode", { plan: "" }),
+    ]
+    for (const entry of operations("Old step", "Old adjusted step")) await store.appendMessage(chat.id, entry)
+    const warmSnapshot = store.getClientTranscript(chat.id)
+    expect(plan(warmSnapshot.messages, "exit")).toBe("## Plan\n\n- Old adjusted step")
+
+    const replacement = operations("Current step", "Current adjusted step")
+    const sourceBefore = JSON.stringify(replacement)
+    await store.replaceTranscript(chat.id, replacement)
+    const diskBefore = await readFile(store.getTranscriptPath(chat.id), "utf8")
+    const sidecarBefore = await readFile(join(dataDir, "transcripts", `${chat.id}.payloads.jsonl`), "utf8")
+    const current = store.getClientTranscript(chat.id)
+    expect(plan(current.messages, "exit")).toBe("## Plan\n\n- Current adjusted step")
+    expect(plan(store.getClientTranscript(chat.id, 4).messages, "exit")).toBe("## Plan\n\n- Current adjusted step")
+    for (const entry of current.messages) {
+      if (entry.kind !== "tool_call" || entry.tool.toolKind === "exit_plan_mode") continue
+      expect(entry.tool.input).toEqual({ filePath: planPath })
+      expect(entry.tool.rawInput).toBeUndefined()
+      expect(entry.trimmed).toBe(true)
+    }
+    expect(plan(store.getEntriesById(chat.id, ["exit"]), "exit")).toBe("")
+    expect(JSON.stringify(replacement)).toBe(sourceBefore)
+    expect(await readFile(store.getTranscriptPath(chat.id), "utf8")).toBe(diskBefore)
+    expect(await readFile(join(dataDir, "transcripts", `${chat.id}.payloads.jsonl`), "utf8")).toBe(sidecarBefore)
+    expect(diskBefore).not.toContain("Current adjusted step")
+    expect(plan(warmSnapshot.messages, "exit")).toBe("## Plan\n\n- Old adjusted step")
+
+    const restarted = new EventStore(dataDir)
+    await restarted.initialize()
+    expect(plan(restarted.getClientTranscript(chat.id).messages, "exit")).toBe("## Plan\n\n- Current adjusted step")
+    // The replacement retains the old IDs but no successful operations. Neither
+    // warmed recovery nor the append-only sidecar may resurrect their old plan.
+    await store.replaceTranscript(chat.id, [call("exit", "exit_plan_mode", { plan: "" })])
+    expect(plan(store.getClientTranscript(chat.id).messages, "exit")).toBe("")
+    await store.replaceTranscript(chat.id, [])
+    expect(store.getClientTranscript(chat.id).messages).toEqual([])
+    await store.replaceTranscript(chat.id, operations("Fresh step", "Fresh adjusted step"))
+    expect(plan(store.getClientTranscript(chat.id, 4).messages, "exit")).toBe("## Plan\n\n- Fresh adjusted step")
   })
 
   test("replacing a warmed transcript through the slim import boundary discards old recovery", async () => {
@@ -2778,51 +2640,149 @@ describe("stored Claude plan recovery", () => {
       read.mockRestore()
     }
   })
+})
+
+describe("getClientTranscript window and outline", () => {
+  test("clones from the requested index and keeps the outline whole", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(join(dataDir, "project"))
+    const chat = await store.createChat(project.id)
+    const at = Date.now()
+    await store.appendMessage(chat.id, { _id: "p1", createdAt: at, kind: "user_prompt", content: "first" } as TranscriptEntry)
+    await store.appendMessage(chat.id, { _id: "a1", createdAt: at + 1, kind: "assistant_text", text: "x" } as TranscriptEntry)
+    await store.appendMessage(chat.id, { _id: "p2", createdAt: at + 2, kind: "user_prompt", content: "second" } as TranscriptEntry)
+    await store.appendMessage(chat.id, { _id: "a2", createdAt: at + 3, kind: "assistant_text", text: "y" } as TranscriptEntry)
+
+    const windowed = store.getClientTranscript(chat.id, 2)
+    expect(windowed.startIndex).toBe(2)
+    expect(windowed.messages.map((entry) => entry._id)).toEqual(["p2", "a2"])
+    expect(windowed.outline.map((entry) => entry.index)).toEqual([0, 2])
+
+    const outlineBefore = windowed.outline
+    await store.appendMessage(chat.id, { _id: "a3", createdAt: at + 4, kind: "assistant_text", text: "z" } as TranscriptEntry)
+    expect(store.getClientTranscript(chat.id).outline).toBe(outlineBefore)
+    await store.appendMessage(chat.id, { _id: "p3", createdAt: at + 5, kind: "user_prompt", content: "third" } as TranscriptEntry)
+    expect(store.getClientTranscript(chat.id).outline.map((entry) => entry.id)).toEqual(["p1", "p2", "p3"])
+    await rm(dataDir, { recursive: true, force: true })
+  })
+})
 
 
-  test("replaceTranscript invalidates warmed stored plan recovery with reused operation and exit IDs", async () => {
-    const { dataDir, store, chat } = await setup()
-    const operations = (before: string, after: string) => [
-      call("write", "write_file", { filePath: planPath, content: `## Plan\n\n- ${before}` }), result("write"),
-      call("edit", "edit_file", { filePath: planPath, oldString: before, newString: after }), result("edit"),
-      call("exit", "exit_plan_mode", { plan: "" }),
-    ]
-    for (const entry of operations("Old step", "Old adjusted step")) await store.appendMessage(chat.id, entry)
-    const warmSnapshot = store.getClientTranscript(chat.id)
-    expect(plan(warmSnapshot.messages, "exit")).toBe("## Plan\n\n- Old adjusted step")
+describe("stateVersion", () => {
+  /**
+   * `stateVersion` is the sidebar memo key in ws-router. A transcript append
+   * must bump it only when it moved something the sidebar can actually show,
+   * otherwise a streaming turn re-derives and re-serializes the whole sidebar
+   * many times a second for bytes that come out identical.
+   */
+  test("agent entries inside one activity bucket do not bump it", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(dataDir, "proj")
+    const chat = await store.createChat(project.id)
 
-    const replacement = operations("Current step", "Current adjusted step")
-    const sourceBefore = JSON.stringify(replacement)
-    await store.replaceTranscript(chat.id, replacement)
-    const diskBefore = await readFile(store.getTranscriptPath(chat.id), "utf8")
-    const sidecarBefore = await readFile(join(dataDir, "transcripts", `${chat.id}.payloads.jsonl`), "utf8")
-    const current = store.getClientTranscript(chat.id)
-    expect(plan(current.messages, "exit")).toBe("## Plan\n\n- Current adjusted step")
-    expect(plan(store.getClientTranscript(chat.id, 4).messages, "exit")).toBe("## Plan\n\n- Current adjusted step")
-    for (const entry of current.messages) {
-      if (entry.kind !== "tool_call" || entry.tool.toolKind === "exit_plan_mode") continue
-      expect(entry.tool.input).toEqual({ filePath: planPath })
-      expect(entry.tool.rawInput).toBeUndefined()
-      expect(entry.trimmed).toBe(true)
+    const at = Math.floor(Date.now() / SIDEBAR_ACTIVITY_RESOLUTION_MS) * SIDEBAR_ACTIVITY_RESOLUTION_MS
+    await store.appendMessage(chat.id, entry("user_prompt", at, { content: "go" }))
+
+    const before = store.stateVersion
+    for (let i = 0; i < 20; i++) {
+      // This fixture starts at the aligned activity bucket boundary.
+      await store.appendMessage(chat.id, entry("assistant_text", at + 100 + i * 20, { text: `step ${i}` }))
     }
-    expect(plan(store.getEntriesById(chat.id, ["exit"]), "exit")).toBe("")
-    expect(JSON.stringify(replacement)).toBe(sourceBefore)
-    expect(await readFile(store.getTranscriptPath(chat.id), "utf8")).toBe(diskBefore)
-    expect(await readFile(join(dataDir, "transcripts", `${chat.id}.payloads.jsonl`), "utf8")).toBe(sidecarBefore)
-    expect(diskBefore).not.toContain("Current adjusted step")
-    expect(plan(warmSnapshot.messages, "exit")).toBe("## Plan\n\n- Old adjusted step")
+    // The first one moves lastAgentMessageAt into a bucket; the rest are free.
+    expect(store.stateVersion - before).toBe(1)
+  })
 
-    const restarted = new EventStore(dataDir)
-    await restarted.initialize()
-    expect(plan(restarted.getClientTranscript(chat.id).messages, "exit")).toBe("## Plan\n\n- Current adjusted step")
-    // The replacement retains the old IDs but no successful operations. Neither
-    // warmed recovery nor the append-only sidecar may resurrect their old plan.
-    await store.replaceTranscript(chat.id, [call("exit", "exit_plan_mode", { plan: "" })])
-    expect(plan(store.getClientTranscript(chat.id).messages, "exit")).toBe("")
-    await store.replaceTranscript(chat.id, [])
-    expect(store.getClientTranscript(chat.id).messages).toEqual([])
-    await store.replaceTranscript(chat.id, operations("Fresh step", "Fresh adjusted step"))
-    expect(plan(store.getClientTranscript(chat.id, 4).messages, "exit")).toBe("## Plan\n\n- Fresh adjusted step")
+  test("still bumps when a sidebar-visible field moves", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(dataDir, "proj")
+    const chat = await store.createChat(project.id)
+
+    const at = Date.now()
+    // hasMessages false -> true, and lastMessageAt is the sidebar sort key.
+    const afterFirstPrompt = store.stateVersion
+    await store.appendMessage(chat.id, entry("user_prompt", at, { content: "one" }))
+    expect(store.stateVersion).toBeGreaterThan(afterFirstPrompt)
+
+    // A later user prompt moves lastMessageAt, so it must bump again.
+    const beforeSecond = store.stateVersion
+    await store.appendMessage(chat.id, entry("user_prompt", at + 1_000, { content: "two" }))
+    expect(store.stateVersion).toBeGreaterThan(beforeSecond)
+
+    // Crossing into the next 15s activity bucket must bump.
+    const beforeBucketCross = store.stateVersion
+    await store.appendMessage(chat.id, entry("assistant_text", at + 40_000, { text: "much later" }))
+    expect(store.stateVersion).toBeGreaterThan(beforeBucketCross)
+  })
+})
+
+
+describe("chat pins", () => {
+  test("persists pin and unpin through replay and compaction", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.setChatPinned(chat.id, true)
+    const pinnedAt = store.getChat(chat.id)!.pinnedAt
+    expect(pinnedAt).toBeNumber()
+    await store.setChatPinned(chat.id, true)
+    expect(store.getChat(chat.id)!.pinnedAt).toBe(pinnedAt)
+
+    const replayed = new EventStore(dataDir)
+    await replayed.initialize()
+    expect(replayed.getChat(chat.id)!.pinnedAt).toBe(pinnedAt)
+    await replayed.compact()
+    const compacted = new EventStore(dataDir)
+    await compacted.initialize()
+    expect(compacted.getChat(chat.id)!.pinnedAt).toBe(pinnedAt)
+    await compacted.setChatPinned(chat.id, false)
+    const unpinned = new EventStore(dataDir)
+    await unpinned.initialize()
+    expect(unpinned.getChat(chat.id)!.pinnedAt).toBeUndefined()
+  })
+
+  test("replay preserves repinning after archive within the same millisecond", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    const timestamp = Date.now()
+    const clock = spyOn(Date, "now").mockReturnValue(timestamp)
+    try {
+      await store.setChatPinned(chat.id, true)
+      await store.archiveChat(chat.id)
+      await store.unarchiveChat(chat.id)
+      await store.setChatPinned(chat.id, true)
+    } finally {
+      clock.mockRestore()
+    }
+    const replayed = new EventStore(dataDir)
+    await replayed.initialize()
+    expect(replayed.getChat(chat.id)!.pinnedAt).toBe(timestamp)
+    expect(replayed.getChat(chat.id)!.archivedAt).toBeUndefined()
+  })
+
+
+  test("manual archive clears the pin and restore keeps it unpinned", async () => {
+    const store = new EventStore(await createTempDataDir())
+    await store.initialize()
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.setChatPinned(chat.id, true)
+    await store.archiveChat(chat.id)
+    expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
+    await store.setChatPinned(chat.id, true)
+    expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
+    await store.unarchiveChat(chat.id)
+    expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
   })
 })
 
@@ -2866,7 +2826,7 @@ describe("durable context restoration", () => {
 })
 
 
-  test("a mid-turn fork inherits pending restoration restricted to its completed prefix", async () => {
+test("a selected fork inherits pending restoration restricted to its copied prefix", async () => {
   const dataDir = await createTempDataDir()
   const store = new EventStore(dataDir)
   await store.initialize()
@@ -2874,16 +2834,16 @@ describe("durable context restoration", () => {
   const source = await store.createChat(project.id)
   await store.setChatProvider(source.id, "codex")
   await store.setSessionToken(source.id, "partially-restored-native")
-  const prefix = [entry("user_prompt", 1, { content: "allowed" }), entry("assistant_text", 2, { text: "allowed answer" }), entry("result", 3, { subtype: "success", isError: false, durationMs: 0, result: "done" })]
-  for (const message of [...prefix, entry("user_prompt", 4, { content: "removed" })]) await store.appendMessage(source.id, message)
-  await store.setContextRestoration(source.id, { id: "source-obligation", provider: "codex", fromProvider: "claude", reason: "provider_switch", endExclusive: 4 })
-  const fork = await store.forkChat(source.id, { atLastCompletedTurn: true })
-  expect(fork.contextRestoration).toMatchObject({ provider: "codex", fromProvider: "claude", endExclusive: 3 })
+  const prefix = [entry("user_prompt", 1, { content: "allowed" }), entry("assistant_text", 2, { text: "allowed answer" })]
+  await store.replaceTranscript(source.id, [...prefix, entry("user_prompt", 3, { content: "removed" })])
+  await store.setContextRestoration(source.id, { id: "source-obligation", provider: "codex", fromProvider: "claude", reason: "provider_switch", endExclusive: 3 })
+  const fork = await store.forkChat(source.id, { transcriptEntries: prefix })
+  expect(fork.contextRestoration).toMatchObject({ provider: "codex", fromProvider: "claude", endExclusive: 2 })
   expect(fork.contextRestoration?.id).not.toBe("source-obligation")
 })
 
 
-  test("queued prompt identity is checked in headers without payload reads", async () => {
+test("queued prompt identity is checked in headers without payload reads", async () => {
   const dataDir = await createTempDataDir()
   const store = new EventStore(dataDir)
   await store.initialize()
@@ -2897,8 +2857,7 @@ describe("durable context restoration", () => {
   expect(store.hasUserPrompt(chat.id, "missing-id")).toBe(false)
 })
 
-
-  test("a selected fork inherits pending restoration restricted to its copied prefix", async () => {
+test("a mid-turn fork inherits pending restoration restricted to its completed prefix", async () => {
   const dataDir = await createTempDataDir()
   const store = new EventStore(dataDir)
   await store.initialize()
@@ -2906,10 +2865,10 @@ describe("durable context restoration", () => {
   const source = await store.createChat(project.id)
   await store.setChatProvider(source.id, "codex")
   await store.setSessionToken(source.id, "partially-restored-native")
-  const prefix = [entry("user_prompt", 1, { content: "allowed" }), entry("assistant_text", 2, { text: "allowed answer" })]
-  await store.replaceTranscript(source.id, [...prefix, entry("user_prompt", 3, { content: "removed" })])
-  await store.setContextRestoration(source.id, { id: "source-obligation", provider: "codex", fromProvider: "claude", reason: "provider_switch", endExclusive: 3 })
-  const fork = await store.forkChat(source.id, { transcriptEntries: prefix })
-  expect(fork.contextRestoration).toMatchObject({ provider: "codex", fromProvider: "claude", endExclusive: 2 })
+  const prefix = [entry("user_prompt", 1, { content: "allowed" }), entry("assistant_text", 2, { text: "allowed answer" }), entry("result", 3, { subtype: "success", isError: false, durationMs: 0, result: "done" })]
+  for (const message of [...prefix, entry("user_prompt", 4, { content: "removed" })]) await store.appendMessage(source.id, message)
+  await store.setContextRestoration(source.id, { id: "source-obligation", provider: "codex", fromProvider: "claude", reason: "provider_switch", endExclusive: 4 })
+  const fork = await store.forkChat(source.id, { atLastCompletedTurn: true })
+  expect(fork.contextRestoration).toMatchObject({ provider: "codex", fromProvider: "claude", endExclusive: 3 })
   expect(fork.contextRestoration?.id).not.toBe("source-obligation")
 })

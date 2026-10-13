@@ -506,11 +506,11 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
   onOpenLocalLink,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
-  onCodexApprovalDecision,
   onEditUserPrompt,
   isEditUserPromptDisabled = false,
   onForkUserPrompt,
   isForkUserPromptDisabled = false,
+  onCodexApprovalDecision,
   showScrollButton,
   onIsAtEndChange,
   scrollToBottom,
@@ -1290,11 +1290,11 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
                   onToolGroupExpandedChange={handleToolGroupExpandedChange}
                   onAskUserQuestionSubmit={onAskUserQuestionSubmit}
                   onExitPlanModeConfirm={onExitPlanModeConfirm}
-                  onCodexApprovalDecision={onCodexApprovalDecision}
                   onEditUserPrompt={onEditUserPrompt}
                   isEditUserPromptDisabled={isEditUserPromptDisabled}
                   onForkUserPrompt={onForkUserPrompt}
                   isForkUserPromptDisabled={isForkUserPromptDisabled}
+                  onCodexApprovalDecision={onCodexApprovalDecision}
                 />
               ))}
               {listFooter}

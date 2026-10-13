@@ -1454,7 +1454,6 @@ export function ChatPage() {
           platform={state.localProjects?.machine.platform}
           onAskUserQuestionSubmit={state.handleAskUserQuestion}
           onExitPlanModeConfirm={state.handleExitPlanMode}
-          onCodexApprovalDecision={state.handleCodexApproval}
           onEditUserPrompt={
             state.runtime?.provider !== "claude" && state.runtime?.provider !== "codex"
               ? undefined
@@ -1464,9 +1463,10 @@ export function ChatPage() {
           onForkUserPrompt={
             state.runtime?.provider !== "claude" && state.runtime?.provider !== "codex"
               ? undefined
-              : transcriptEditUserPromptControls.onForkUserPrompt
+            : transcriptEditUserPromptControls.onForkUserPrompt
           }
           isForkUserPromptDisabled={transcriptEditUserPromptControls.isForkUserPromptDisabled}
+          onCodexApprovalDecision={state.handleCodexApproval}
           showScrollButton={showScrollToBottom && state.messages.length > 0}
           onIsAtEndChange={onIsAtEndChange}
           readAnchorState={state.readAnchorState}

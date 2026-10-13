@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import type { TranscriptEntry } from "./types"
-import { buildTranscriptOutline, findTranscriptWindowStart, snapToRowStart, trimTranscriptWindow } from "./transcript-window"
+import {
+  buildTranscriptOutline,
+  findTranscriptWindowStart,
+  snapToRowStart,
+  trimTranscriptWindow,
+} from "./transcript-window"
 
 let counter = 0
 function entry(kind: string, extra: Record<string, unknown> = {}): TranscriptEntry {
@@ -173,6 +178,19 @@ describe("subagent entries in the window count", () => {
 })
 
 describe("buildTranscriptOutline", () => {
+  test("removes hidden instructions before shortening the unloaded prompt preview", () => {
+    const source = prompt(`<system-message>${"hidden ".repeat(100)}</system-message>\n**Visible** request`)
+    const outline = buildTranscriptOutline([source])
+    expect(outline).toEqual([{ id: source._id, index: 0, preview: "Visible request", createdAt: source.createdAt }])
+    expect(source.kind === "user_prompt" && source.content).toContain("<system-message>")
+  })
+
+  test("decodes all native answers before flattening an unloaded preview", () => {
+    const content = '<send_user_message_question_reply>[{"questionItemId":"q1","question":"Which version?","answer":"Version B"},{"questionItemId":"q2","question":"Import sessions?","answer":"Yes"}]</send_user_message_question_reply>'
+    const outline = buildTranscriptOutline([prompt(content)])
+    expect(outline[0]?.preview).toBe("Which version? Version B Import sessions? Yes")
+  })
+
   test("lists visible user prompts with their absolute index and a preview", () => {
     const hidden = prompt("secret")
     ;(hidden as { hidden?: boolean }).hidden = true
@@ -183,21 +201,6 @@ describe("buildTranscriptOutline", () => {
     expect(outline[1]!.index).toBe(3)
     expect(outline[1]!.preview.length).toBe(161)
     expect(outline[1]!.preview.endsWith("…")).toBe(true)
-  })
-
-
-  test("removes hidden instructions before shortening the unloaded prompt preview", () => {
-    const source = prompt(`<system-message>${"hidden ".repeat(100)}</system-message>\n**Visible** request`)
-    const outline = buildTranscriptOutline([source])
-    expect(outline).toEqual([{ id: source._id, index: 0, preview: "Visible request", createdAt: source.createdAt }])
-    expect(source.kind === "user_prompt" && source.content).toContain("<system-message>")
-  })
-
-
-  test("decodes all native answers before flattening an unloaded preview", () => {
-    const content = '<send_user_message_question_reply>[{"questionItemId":"q1","question":"Which version?","answer":"Version B"},{"questionItemId":"q2","question":"Import sessions?","answer":"Yes"}]</send_user_message_question_reply>'
-    const outline = buildTranscriptOutline([prompt(content)])
-    expect(outline[0]?.preview).toBe("Which version? Version B Import sessions? Yes")
   })
 })
 

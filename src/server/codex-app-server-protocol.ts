@@ -83,24 +83,6 @@ export interface ThreadRollbackParams {
   numTurns: number
 }
 
-export interface Thread {
-  id: string
-  preview: string
-  ephemeral: boolean
-  modelProvider: string
-  createdAt: number
-  updatedAt: number
-  status: string
-  path?: string | null
-  cwd: string
-  cliVersion: string
-  source: string
-  agentNickname?: string | null
-  agentRole?: string | null
-  name?: string | null
-  turns: ThreadTurn[]
-}
-
 export interface ThreadRollbackResponse {
   thread: Thread
 }
@@ -326,6 +308,24 @@ export interface ThreadTurn {
   error: {
     message?: string
   } | null
+}
+
+export interface Thread {
+  id: string
+  preview: string
+  ephemeral: boolean
+  modelProvider: string
+  createdAt: number
+  updatedAt: number
+  status: string
+  path?: string | null
+  cwd: string
+  cliVersion: string
+  source: string
+  agentNickname?: string | null
+  agentRole?: string | null
+  name?: string | null
+  turns: ThreadTurn[]
 }
 
 export interface ThreadListResponse {
@@ -722,6 +722,19 @@ export interface AgentMessageItem {
   questions?: import("../shared/codex-questions").CodexAsyncQuestion[] | null
 }
 
+export type RawResponseItem =
+  | {
+      type: "message"
+      role: string
+      content: Array<{
+        type: "input_text" | "input_image" | "output_text"
+        text?: string
+        image_url?: string
+      }>
+      phase?: string | null
+    }
+  | Record<string, unknown>
+
 export interface PlanItem {
   type: "plan"
   id: string
@@ -946,16 +959,3 @@ export function isServerNotification(value: unknown): value is ServerNotificatio
     || candidate.method === "account/rateLimits/updated"
     || candidate.method === "error"
 }
-
-export type RawResponseItem =
-  | {
-      type: "message"
-      role: string
-      content: Array<{
-        type: "input_text" | "input_image" | "output_text"
-        text?: string
-        image_url?: string
-      }>
-      phase?: string | null
-    }
-  | Record<string, unknown>

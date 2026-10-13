@@ -1,5 +1,18 @@
 import { describe, expect, test } from "bun:test"
-import { CLAUDE_REASONING_OPTIONS, PROVIDERS, deriveClaudeModelLabel, deriveModelLabel, getCodexReasoningOptions, resolveModelLabel, normalizeClaudeModelId, normalizeCodexModelId, normalizeCursorModelId, normalizeCodexReasoningEffort, isCodexReasoningEffort, supportsClaudeMaxReasoningEffort } from "./types"
+import {
+  CLAUDE_REASONING_OPTIONS,
+  PROVIDERS,
+  deriveClaudeModelLabel,
+  deriveModelLabel,
+  getCodexReasoningOptions,
+  resolveModelLabel,
+  normalizeClaudeModelId,
+  normalizeCodexModelId,
+  normalizeCursorModelId,
+  normalizeCodexReasoningEffort,
+  isCodexReasoningEffort,
+  supportsClaudeMaxReasoningEffort,
+} from "./types"
 
 describe("shared model normalization", () => {
   test("uses the full Claude Code harness label", () => {
