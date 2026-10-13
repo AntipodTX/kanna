@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -50,6 +50,90 @@ function entry(
 }
 
 describe("EventStore", () => {
+  test("reconciles transcripts using payload sidecars and provider activity timestamps", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(dataDir, "Project")
+    const chat = await store.createChat(project.id)
+    const original: TranscriptEntry = { _id: "result-1", createdAt: 300, kind: "tool_result", toolId: "call-1", content: "old output" }
+    await store.appendMessage(chat.id, original)
+    // Warm the old payload index: the replacement must invalidate it.
+    expect(store.getMessages(chat.id)[0]).toMatchObject({ content: "old output" })
+    const entries: TranscriptEntry[] = [
+      { _id: "call-1", createdAt: 100, kind: "tool_call", tool: { kind: "tool", toolKind: "write_file", toolId: "call-1", toolName: "Write", input: { filePath: "output.txt", content: "new body" } } },
+      { ...original, createdAt: 200, content: "new output" },
+      { _id: "assistant-1", createdAt: 150, kind: "assistant_text", text: "Provider reply" },
+      { _id: "status-1", createdAt: 500, kind: "status", status: "Imported status" },
+    ]
+    const replaced: string[] = []
+    store.onTranscriptReplaced = chatId => { replaced.push(chatId) }
+    await store.replaceTranscript(chat.id, entries)
+    expect(replaced).toEqual([chat.id])
+    const headers = (await readFile(store.getTranscriptPath(chat.id), "utf8")).trim().split("\n").map(line => JSON.parse(line))
+    expect(headers[0].tool.input.content).toBeUndefined()
+    expect(headers[1].content).toBeUndefined()
+    expect(store.getMessages(chat.id)).toEqual(entries)
+    expect(store.getChat(chat.id)?.lastAgentMessageAt).toBe(200)
+    expect(store.getChat(chat.id)?.lastAgentMessagePreviewAt).toBe(150)
+    const replayed = new EventStore(dataDir)
+    await replayed.initialize()
+    expect(replayed.getMessages(chat.id)).toEqual(entries)
+    expect(replayed.getChat(chat.id)?.lastAgentMessageAt).toBe(200)
+  })
+
+  
+
+  test.each([false, true])("publishes a committed transcript replacement when metadata append fails (empty=%s)", async (empty) => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(dataDir, "Project")
+    const chat = await store.createChat(project.id)
+    const original: TranscriptEntry[] = [
+      { _id: "result-1", createdAt: 300, kind: "tool_result", toolId: "call-1", content: "old output" },
+      { _id: "assistant-1", createdAt: 400, kind: "assistant_text", text: "old answer" },
+    ]
+    for (const message of original) await store.appendMessage(chat.id, message)
+    expect(store.getEntriesById(chat.id, ["result-1"])[0]).toMatchObject({ content: "old output" })
+    expect(store.getMessages(chat.id)).toEqual(original)
+    const replacement: TranscriptEntry[] = empty ? [] : [
+      { ...original[0]!, createdAt: 200, content: "new output" } as TranscriptEntry,
+      { _id: "assistant-2", createdAt: 150, kind: "assistant_text", text: "new answer" },
+    ]
+    const notifications: string[] = []
+    store.onTranscriptReplaced = id => { notifications.push(id) }
+    // Only the metadata journal write fails; transcript/payload writes remain writable.
+    const journal = join(dataDir, "chats.jsonl")
+    const heldJournal = join(dataDir, "chats-held.jsonl")
+    await rename(journal, heldJournal)
+    await mkdir(journal)
+    try {
+      await expect(store.replaceTranscript(chat.id, replacement)).rejects.toThrow()
+      const text = await readFile(store.getTranscriptPath(chat.id), "utf8")
+      const headers = text.trim() ? text.trim().split("\n").map(line => JSON.parse(line)) : []
+      expect(headers.map(header => header._id)).toEqual(replacement.map(message => message._id))
+      if (!empty) expect(headers[0].content).toBeUndefined()
+      expect(store.getMessages(chat.id)).toEqual(replacement)
+      expect(store.getEntriesById(chat.id, ["result-1"])).toEqual(empty ? [] : [replacement[0]!])
+      expect(store.getTranscriptLength(chat.id)).toBe(replacement.length)
+      expect(store.getChat(chat.id)?.hasMessages).toBe(!empty)
+      expect(store.getChat(chat.id)?.lastAgentMessagePreview).toBe(empty ? undefined : "new answer")
+      expect(store.getChat(chat.id)?.lastAgentMessageAt).toBe(empty ? undefined : 200)
+      expect(notifications).toEqual([chat.id])
+    } finally {
+      await rm(journal, { recursive: true })
+      await rename(heldJournal, journal)
+    }
+    const replayed = new EventStore(dataDir)
+    await replayed.initialize()
+    expect(replayed.getMessages(chat.id)).toEqual(replacement)
+    expect(replayed.getChat(chat.id)?.hasMessages).toBe(!empty)
+    // The failed journal write does not poison the serialized write queue.
+    await store.replaceTranscript(chat.id, [entry("assistant_text", 500, { text: "later answer" })])
+    expect(store.getMessages(chat.id)).toEqual([entry("assistant_text", 500, { text: "later answer" })])
+  })
+
   test("uses the runtime profile for the default data dir", () => {
     process.env.KANNA_RUNTIME_PROFILE = "dev"
 
@@ -1124,6 +1208,28 @@ describe("EventStore", () => {
     ])
   })
 
+  test("reopening a removed project preserves its sidebar title", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project", "Original Name")
+    await store.renameProjectSidebarTitle(project.id, "Sidebar Name")
+    await store.removeProject(project.id)
+
+    const reopened = await store.openProject("/tmp/project", "Synced Name")
+
+    expect(reopened.id).toBe(project.id)
+    expect(reopened.title).toBe("Synced Name")
+    expect(reopened.sidebarTitle).toBe("Sidebar Name")
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+
+    expect(reloaded.getProject(project.id)?.title).toBe("Synced Name")
+    expect(reloaded.getProject(project.id)?.sidebarTitle).toBe("Sidebar Name")
+  })
+
   test("archives chats without deleting their transcript", async () => {
     const dataDir = await createTempDataDir()
     const store = new EventStore(dataDir)
@@ -1418,6 +1524,63 @@ describe("EventStore", () => {
     await reloaded.setChatDoneState(chat.id, true)
     await reloaded.setChatDoneState(chat.id, false)
     expect(reloaded.getChat(chat.id)?.doneAt).toBeUndefined()
+  })
+
+  test("hides deleted provider chats in the compacted snapshot so they stay hidden after restart", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    const project = await store.openProject("/tmp/project")
+    const chat = await store.createChat(project.id)
+    await store.setChatProvider(chat.id, "claude")
+    await store.setSessionToken(chat.id, "session-1")
+    await store.deleteChat(chat.id)
+    expect(store.isProviderSessionHidden("claude", "session-1")).toBe(true)
+    await store.compact()
+
+    const snapshot = JSON.parse(await readFile(join(dataDir, "snapshot.json"), "utf8")) as SnapshotFile
+    expect(snapshot.chats).toHaveLength(0)
+    expect(snapshot.hiddenProviderSessions).toContainEqual({
+      provider: "claude",
+      sessionToken: "session-1",
+      hiddenAt: expect.any(Number),
+    })
+
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+
+    expect(reloaded.getChat(chat.id)).toBeNull()
+    expect(reloaded.state.chatsById.get(chat.id)).toBeUndefined()
+    expect(reloaded.isProviderSessionHidden("claude", "session-1")).toBe(true)
+  })
+
+  test("preserves hidden provider sessions through replay and compaction", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+
+    await store.hideProviderSession("claude", "session-1")
+
+    expect(store.isProviderSessionHidden("claude", "session-1")).toBe(true)
+    expect(store.isProviderSessionHidden("codex", "session-1")).toBe(false)
+
+    const replayed = new EventStore(dataDir)
+    await replayed.initialize()
+    expect(replayed.isProviderSessionHidden("claude", "session-1")).toBe(true)
+
+    await replayed.compact()
+
+    const snapshot = JSON.parse(await readFile(join(dataDir, "snapshot.json"), "utf8")) as SnapshotFile
+    expect(snapshot.hiddenProviderSessions).toContainEqual({
+      provider: "claude",
+      sessionToken: "session-1",
+      hiddenAt: expect.any(Number),
+    })
+
+    const compacted = new EventStore(dataDir)
+    await compacted.initialize()
+    expect(compacted.isProviderSessionHidden("claude", "session-1")).toBe(true)
   })
 })
 

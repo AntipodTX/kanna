@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test"
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import path from "node:path"
-import type { AppSettingsSnapshot, KeybindingsSnapshot, LlmProviderSnapshot, SidebarData, UpdateSnapshot } from "../shared/types"
+import type { AppSettingsSnapshot, KeybindingsSnapshot, LlmProviderSnapshot, SidebarData, UpdateSnapshot, TranscriptEntry } from "../shared/types"
 import { applySidebarPatch, type SidebarPatch } from "../shared/sidebar-patch"
 import { PROTOCOL_VERSION } from "../shared/types"
-import { findTranscriptWindowStart } from "../shared/transcript-window"
+import { processTranscriptMessages } from "../client/lib/parseTranscript"
+import { findTranscriptWindowStart, snapToRowStart } from "../shared/transcript-window"
 import { createEmptyState } from "./events"
 import { EventStore } from "./event-store"
+import { StartupSyncProgress } from "./startup-sync"
 import { deriveLocalProjectsSnapshot } from "./read-models"
 import { SERVER_PROVIDERS, applyCodexModels, resetServerProvidersForTests } from "./provider-catalog"
 import {
@@ -318,6 +320,7 @@ function createFakeStore(overrides: Record<string, unknown> = {}) {
     pruneStaleEmptyChats: async () => [],
     // Whole transcript by default; the window tests override these.
     getInitialTranscriptWindowStart: () => 0,
+    getEntryIdAt: () => null,
     widenTranscriptWindowStart: (_chatId: string, current: number) => current,
     ...overrides,
   } as never
@@ -414,6 +417,58 @@ function createTestRouter(overrides: Partial<CreateWsRouterArgs> = {}) {
 }
 
 describe("ws-router", () => {
+  test("publishes startup session sync progress snapshots", async () => {
+    const startupSync = new StartupSyncProgress()
+    const router = createTestRouter({ startupSync })
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+
+    await router.handleMessage(
+      ws as never,
+      JSON.stringify({
+        v: PROTOCOL_VERSION,
+        type: "subscribe",
+        id: "startup-sync-sub",
+        topic: { type: "startup-sync" },
+      })
+    )
+    startupSync.begin()
+    startupSync.append("[kanna] session sync: scanning Claude sessions")
+
+    expect(ws.sent).toContainEqual({
+      v: PROTOCOL_VERSION,
+      type: "snapshot",
+      id: "startup-sync-sub",
+      snapshot: {
+        type: "startup-sync",
+        data: {
+          enabled: false,
+          mode: "session-sync",
+          status: "idle",
+          messages: [],
+          startedAt: null,
+          completedAt: null,
+          error: null,
+        },
+      },
+    })
+    expect(ws.sent.at(-1)).toMatchObject({
+      v: PROTOCOL_VERSION,
+      type: "snapshot",
+      id: "startup-sync-sub",
+      snapshot: {
+        type: "startup-sync",
+        data: {
+          enabled: true,
+          status: "running",
+          messages: ["[kanna] session sync: scanning Claude sessions"],
+        },
+      },
+    })
+
+    router.dispose()
+  })
+
   test("renames a discovered project by path and updates all project lists", async () => {
     const projectPath = await mkdtemp(path.join(tmpdir(), "kanna-rename-project-"))
     try {
@@ -2514,7 +2569,7 @@ describe("ws-router provider auth", () => {
 
 describe("transcript windows", () => {
   /** prompt, text, text: three entries, two assistant messages. */
-  function turn(n: number) {
+  function turn(n: number): TranscriptEntry[] {
     return [
       { _id: `p${n}`, createdAt: n, kind: "user_prompt", content: `question ${n}` },
       { _id: `a${n}`, createdAt: n, kind: "assistant_text", text: "one" },
@@ -2522,7 +2577,7 @@ describe("transcript windows", () => {
     ]
   }
 
-  function createWindowedRouter(entries: Array<Record<string, unknown>>, overrides: Partial<CreateWsRouterArgs> = {}) {
+  function createWindowedRouter(entries: TranscriptEntry[], overrides: Partial<CreateWsRouterArgs> = {}) {
     const state = createEmptyState()
     state.projectsById.set("project-1", { id: "project-1", localPath: "/tmp/project", title: "Project", createdAt: 1, updatedAt: 1 })
     state.chatsById.set("chat-1", {
@@ -2532,23 +2587,24 @@ describe("transcript windows", () => {
     // The store's own window methods are covered in event-store.test.ts;
     // this fake mirrors them over the fixture so the router logic is what
     // is under test here.
-    const typed = entries as never[]
     const fake = createFakeStore({
       state,
       getChat: (chatId: string) => state.chatsById.get(chatId) ?? null,
       getProject: (projectId: string) => state.projectsById.get(projectId) ?? null,
       getClientTranscript: () => ({ messages: entries, startIndex: 0, readAnchor: null }),
-      getEntryIdAt: (_chatId: string, index: number) => (entries[index] as { _id?: string } | undefined)?._id ?? null,
+      getTranscriptLength: () => entries.length,
+      snapTranscriptWindowStart: (_chatId: string, start: number) => snapToRowStart(entries, start),
+      getEntryIdAt: (_chatId: string, index: number) => entries[index]?._id ?? null,
       getInitialTranscriptWindowStart: (_chatId: string, assistantMessages: number) =>
-        findTranscriptWindowStart(typed, { endExclusive: entries.length, assistantMessages }),
+        findTranscriptWindowStart(entries, { endExclusive: entries.length, assistantMessages }),
       widenTranscriptWindowStart: (_chatId: string, current: number, options: { assistantMessages: number; untilMessageId?: string; all?: boolean }) => {
         if (options.all) return 0
         if (options.untilMessageId !== undefined) {
           const index = entries.findIndex((item) => item._id === options.untilMessageId)
           if (index < 0 || index >= current) return current
-          return findTranscriptWindowStart(typed, { endExclusive: current, assistantMessages: options.assistantMessages, mustIncludeIndex: index })
+          return findTranscriptWindowStart(entries, { endExclusive: current, assistantMessages: options.assistantMessages, mustIncludeIndex: index })
         }
-        return findTranscriptWindowStart(typed, { endExclusive: current, assistantMessages: options.assistantMessages })
+        return findTranscriptWindowStart(entries, { endExclusive: current, assistantMessages: options.assistantMessages })
       },
     })
     const settings = createFakeAppSettings({
@@ -2559,6 +2615,114 @@ describe("transcript windows", () => {
 
   const chatData = (ws: FakeWebSocket, index: number) =>
     (ws.sent[index] as { snapshot: { data: { messages: Array<{ _id: string }>; startIndex: number; incremental?: boolean; outline?: unknown[] } } }).snapshot.data
+
+  test("retains the boundary of a window opened before its first entry arrives", async () => {
+    const entries: TranscriptEntry[] = []
+    const router = createWindowedRouter(entries)
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+    entries.push(...turn(1), ...turn(2), ...turn(3))
+    await router.broadcastSnapshots()
+    entries.unshift(...turn(0))
+    router.invalidateChatTranscript("chat-1")
+    await router.broadcastSnapshots()
+    const data = chatData(ws, ws.sent.length - 1)
+    expect(data.incremental).not.toBe(true)
+    expect(data.startIndex).toBe(3)
+    expect(data.messages[0]?._id).toBe("p1")
+    router.dispose()
+  })
+
+  test.each([false, true])("retained boundaries widen to their corrected Agent ancestry: %s", async (nested) => {
+    const root: TranscriptEntry = { _id: "root", createdAt: 4, kind: "tool_call", tool: { kind: "tool", toolKind: "subagent_task", toolName: "Agent", toolId: "agent-root", input: {} } }
+    const child: TranscriptEntry = { _id: "child", createdAt: 5, kind: "assistant_text", text: "findings" }
+    const entries: TranscriptEntry[] = [
+      ...turn(0), root,
+      ...(nested ? [
+        { _id: "interleaved", createdAt: 4, kind: "assistant_text", text: "main thread update" },
+        { _id: "nested", createdAt: 4, kind: "tool_call", parentToolUseId: "agent-root", tool: { kind: "tool", toolKind: "subagent_task", toolName: "Agent", toolId: "agent-nested", input: {} } },
+      ] satisfies TranscriptEntry[] : []),
+      child,
+      { _id: "tail", createdAt: 6, kind: "assistant_text", text: "summary" },
+    ]
+    const router = createWindowedRouter(entries)
+    const ws = new FakeWebSocket()
+    try {
+      router.handleOpen(ws as never)
+      await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+      expect(chatData(ws, 0).messages.map(entry => entry._id)).toEqual(["child", "tail"])
+      // Reconciliation preserves the row ID while correcting only attribution.
+      child.parentToolUseId = nested ? "agent-nested" : "agent-root"
+      router.invalidateChatTranscript("chat-1")
+      await router.broadcastSnapshots()
+      const data = chatData(ws, ws.sent.length - 1)
+      expect(data.incremental).not.toBe(true)
+      expect(data.startIndex).toBe(3)
+      expect(data.messages.map(entry => entry._id)).toEqual(entries.slice(3).map(entry => entry._id))
+      const rows = processTranscriptMessages(data.messages as never[])
+      const agent = rows.find(row => row.kind === "tool" && row.toolId === "agent-root")
+      expect(agent).toBeDefined()
+      if (!nested && agent?.kind === "tool") {
+        expect(agent.children?.map(entry => entry.id)).toEqual(["child"])
+        expect(rows.some(row => row.id === "child")).toBe(false)
+      }
+      // A second replacement moves indices; retain the widened parent ID.
+      entries.unshift(...turn(-1))
+      router.invalidateChatTranscript("chat-1")
+      await router.broadcastSnapshots()
+      const shifted = chatData(ws, ws.sent.length - 1)
+      expect(shifted.incremental).not.toBe(true)
+      expect(shifted.startIndex).toBe(6)
+      expect(shifted.messages.map(entry => entry._id)).toEqual(entries.slice(6).map(entry => entry._id))
+    } finally {
+      router.dispose()
+    }
+  })
+
+  test("translates independent expanded windows by retained entry identity on replacement", async () => {
+    const entries = [...turn(1), ...turn(2), ...turn(3), ...turn(4)]
+    const router = createWindowedRouter(entries)
+    const first = new FakeWebSocket()
+    const second = new FakeWebSocket()
+    for (const ws of [first, second]) {
+      router.handleOpen(ws as never)
+      await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+    }
+    await router.handleMessage(first as never, JSON.stringify({ v: 1, type: "command", id: "older", command: { type: "chat.loadOlder", chatId: "chat-1", untilMessageId: "p1" } }))
+    await router.handleMessage(second as never, JSON.stringify({ v: 1, type: "command", id: "older", command: { type: "chat.loadOlder", chatId: "chat-1", untilMessageId: "p2" } }))
+    // Insert older native history; retained reader boundaries shift independently.
+    entries.unshift(...turn(0))
+    router.invalidateChatTranscript("chat-1")
+    await router.broadcastSnapshots()
+    const firstData = chatData(first, first.sent.length - 1)
+    const secondData = chatData(second, second.sent.length - 1)
+    expect(firstData.incremental).not.toBe(true)
+    expect(secondData.incremental).not.toBe(true)
+    expect(firstData.startIndex).toBe(3)
+    expect(secondData.startIndex).toBe(6)
+    expect(firstData.messages[0]?._id).toBe("p1")
+    expect(secondData.messages[0]?._id).toBe("p2")
+    expect(firstData.outline).toHaveLength(5)
+    expect(secondData.outline).toHaveLength(5)
+    router.dispose()
+  })
+
+  test("replaces a subscribed transcript window after provider reconciliation", async () => {
+    const entries = [...turn(1), ...turn(2)]
+    const router = createWindowedRouter(entries)
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+    entries.splice(0, entries.length, ...turn(4), ...turn(5))
+    router.invalidateChatTranscript("chat-1")
+    await router.broadcastSnapshots()
+    const data = chatData(ws, ws.sent.length - 1)
+    expect(data.incremental).not.toBe(true)
+    expect(data.messages.map(entry => entry._id)).toEqual(["p5", "a5", "b5"])
+    expect(data.outline).toHaveLength(2)
+    router.dispose()
+  })
 
   test("opens on the last window of assistant messages with the whole outline", async () => {
     const router = createWindowedRouter([...turn(1), ...turn(2), ...turn(3)])

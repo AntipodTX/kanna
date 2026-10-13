@@ -2,6 +2,7 @@ import type { Dirent, Stats } from "node:fs"
 import { open, readFile, readdir, stat } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
+import { getDataRootDir } from "../shared/branding"
 import type { AgentProvider } from "../shared/types"
 import { resolveLocalPath } from "./paths"
 
@@ -71,7 +72,7 @@ export interface ProjectDiscoveryAdapter {
   scan(homeDir?: string): Promise<ProviderDiscoveredProject[]>
 }
 
-async function resolveEncodedClaudePath(folderName: string) {
+export async function resolveEncodedClaudePath(folderName: string) {
   const segments = folderName.replace(/^-/, "").split("-").filter(Boolean)
   let currentPath = ""
   let remainingSegments = [...segments]
@@ -113,6 +114,10 @@ async function normalizeExistingDirectory(localPath: string) {
   }
 }
 
+function isInternalKannaProjectPath(localPath: string, homeDir: string) {
+  return resolveLocalPath(localPath) === resolveLocalPath(getDataRootDir(homeDir))
+}
+
 function mergeDiscoveredProjects(projects: Iterable<DiscoveredProject>): DiscoveredProject[] {
   const merged = new Map<string, DiscoveredProject>()
 
@@ -151,6 +156,9 @@ export class ClaudeProjectDiscoveryAdapter implements ProjectDiscoveryAdapter {
       const resolvedPath = await resolveEncodedClaudePath(entry.name)
       const normalizedPath = await normalizeExistingDirectory(resolvedPath)
       if (!normalizedPath) {
+        return null
+      }
+      if (isInternalKannaProjectPath(normalizedPath, homeDir)) {
         return null
       }
 
@@ -360,6 +368,9 @@ export class CodexProjectDiscoveryAdapter implements ProjectDiscoveryAdapter {
       if (!normalizedPath) {
         return null
       }
+      if (isInternalKannaProjectPath(normalizedPath, homeDir)) {
+        return null
+      }
 
       return {
         provider: this.provider,
@@ -376,6 +387,9 @@ export class CodexProjectDiscoveryAdapter implements ProjectDiscoveryAdapter {
 
       const normalizedPath = await normalizeExistingDirectory(configuredPath)
       if (!normalizedPath) {
+        return null
+      }
+      if (isInternalKannaProjectPath(normalizedPath, homeDir)) {
         return null
       }
 
@@ -462,7 +476,7 @@ async function runDiscovery(homeDir: string, adapters: ProjectDiscoveryAdapter[]
   const scans = await Promise.all(adapters.map((adapter) => adapter.scan(homeDir)))
   return mergeDiscoveredProjects(
     scans.flatMap((projects) => projects.map(({ provider: _provider, ...project }) => project))
-  )
+  ).filter((project) => !isInternalKannaProjectPath(project.localPath, homeDir))
 }
 
 /**
