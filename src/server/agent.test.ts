@@ -2,12 +2,13 @@ import { describe, expect, test } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { AgentCoordinator, buildAttachmentHintText, buildConcurrentAgentsNotice, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, resolveClaudeRuntimeOptions, classifyClaudeBackgroundWorkState, createClaudeStopHook, type ClaudeBackgroundWorkState } from "./agent"
+import { AgentCoordinator, buildAttachmentHintText, buildConcurrentAgentsNotice, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, resolveClaudeRuntimeOptions, classifyClaudeBackgroundWorkState, createClaudeStopHook, type ClaudeBackgroundWorkState, startClaudeSession } from "./agent"
 import type { HarnessTurn } from "./harness-types"
 import type { SubagentActivityUpdate } from "./background-tasks"
-import type { ChatAttachment, TranscriptEntry } from "../shared/types"
+import type { ChatAttachment, TranscriptEntry, AgentProvider } from "../shared/types"
 import type { SessionArtifactStatus } from "./session-artifacts"
 import { timestamped } from "./transcript"
+import type { ContextRestoration } from "./events"
 
 
 
@@ -18,6 +19,9 @@ import { timestamped } from "./transcript"
 
 
 
+
+
+const withChatLinks = (content: string) => content
 
 async function waitFor(condition: () => boolean, timeoutMs = 2000) {
   const start = Date.now()
@@ -825,10 +829,13 @@ describe("AgentCoordinator codex integration", () => {
     const sessionCalls: Array<{ chatId: string; sessionToken: string | null }> = []
     const startTurnCalls: Array<{ content: string; planMode: boolean }> = []
     let turnCount = 0
+    const restorationAtStartup: any[] = []
 
     const fakeCodexManager = {
+      stopSession() {},
       async startSession(args: { chatId: string; sessionToken: string | null }) {
         sessionCalls.push({ chatId: args.chatId, sessionToken: args.sessionToken })
+        restorationAtStartup.push((store.chat as any).contextRestoration)
       },
       async startTurn(args: {
         content: string
@@ -957,6 +964,8 @@ describe("AgentCoordinator codex integration", () => {
     ])
     expect(store.messages.filter((entry) => entry.kind === "user_prompt")).toHaveLength(1)
     expect(store.messages.some((entry) => entry.kind === "context_cleared")).toBe(true)
+    expect(restorationAtStartup[1]).toMatchObject({ reason: "explicit_reset", provider: "codex" })
+    expect((store.chat as any).contextRestoration).toBeNull()
     expect(store.chat.sessionToken).toBe("thread-2")
   })
 
@@ -4283,7 +4292,8 @@ function createFakeChat(id: string, projectId: string, title = "New Chat") {
     id,
     projectId,
     title,
-    provider: null as "claude" | "codex" | null,
+    provider: null as AgentProvider | null,
+    contextRestoration: null as ContextRestoration | null,
     planMode: false,
     autoPlan: false,
     sessionToken: null as string | null,
@@ -4303,6 +4313,7 @@ function createFakeStore(options?: {
   const chatsById = new Map(chats.map((entry) => [entry.id, entry]))
   const projectsById = new Map(projects.map((entry) => [entry.id, entry]))
   const chat = chats[0]!
+  const messageOwners = new Map<string, string>()
   function requireChat(chatId: string) {
     const found = chatsById.get(chatId)
     if (!found) throw new Error(`Chat not found: ${chatId}`)
@@ -4323,10 +4334,19 @@ function createFakeStore(options?: {
     getTranscriptPath(chatId: string) {
       return `/tmp/transcripts/${chatId}.jsonl`
     },
-    getMessages() {
-      return this.messages
+    getMessages(chatId = chat.id) {
+      return chats.length === 1 ? this.messages : this.messages.filter(entry => (messageOwners.get(entry._id) ?? chat.id) === chatId)
     },
-    async setChatProvider(chatId: string, provider: "claude" | "codex") {
+    getTranscriptLength(chatId = chat.id) { return this.messages.filter(entry => (messageOwners.get(entry._id) ?? chat.id) === chatId).length },
+    getContextBounds(chatId = chat.id, endExclusive?: number) {
+      const entries = this.messages.filter(entry => (messageOwners.get(entry._id) ?? chat.id) === chatId).slice(0, endExclusive)
+      let start = 0
+      entries.forEach((entry, index) => { if (entry.kind === "context_cleared") start = index + 1 })
+      return { start, endExclusive: entries.length, hasConversation: entries.slice(start).some(entry => ["user_prompt", "assistant_text", "tool_call", "tool_result"].includes(entry.kind)) }
+    },
+    async setContextRestoration(chatId: string, restoration: any) { (requireChat(chatId) as any).contextRestoration = restoration },
+    async acknowledgeContextRestoration(chatId: string, id: string) { const chat = requireChat(chatId) as any; if (chat.contextRestoration?.id === id) chat.contextRestoration = null },
+    async setChatProvider(chatId: string, provider: AgentProvider) {
       requireChat(chatId).provider = provider
     },
     async setPlanMode(chatId: string, planMode: boolean) {
@@ -4338,7 +4358,8 @@ function createFakeStore(options?: {
     async renameChat(chatId: string, title: string) {
       requireChat(chatId).title = title
     },
-    async appendMessage(_chatId: string, entry: TranscriptEntry) {
+    async appendMessage(chatId: string, entry: TranscriptEntry) {
+      messageOwners.set(entry._id, chatId)
       this.messages.push(entry)
     },
     async recordTurnStarted() {},
@@ -4809,5 +4830,710 @@ describe("Claude background work snapshots", () => {
     })
     await expect(recoveringHook(stopInput, undefined, hookOptions)).resolves.toEqual({})
     expect(recoveredStates).toEqual(["unknown"])
+  })
+})
+
+
+describe("provider context read contract", () => {
+  function fixture(provider: AgentProvider, options: { fallback?: boolean; failInput?: boolean } = {}) {
+    const chat = createFakeChat("chat-1", "project-1", "New Chat")
+    chat.provider = provider as never
+    chat.sessionToken = "native-old"
+    const store = createFakeStore({ chats: [chat] })
+    store.messages.push(
+      timestamped({ kind: "user_prompt", content: "prior question" }),
+      timestamped({ kind: "assistant_text", text: "prior answer" }),
+    )
+    const sent: string[] = []
+    let starts = 0
+    const startupArgs: any[] = []
+    const stream = new AsyncEventQueue<any>()
+    const manager = {
+      async startSession(args: any) {
+        starts++
+        startupArgs.push(args)
+        return { sessionToken: options.fallback ? "native-new" : "native-old", resumeFellBack: Boolean(options.fallback),
+          startupOutcome: { kind: options.fallback ? "fresh" : "resumed" } }
+      },
+      async startTurn(args: any): Promise<HarnessTurn> {
+        startupArgs.push(args)
+        const content = args.prepareContent
+          ? await args.prepareContent({ kind: options.fallback ? "fresh" : "resumed" })
+          : args.content
+        if (options.failInput) throw new Error("input rejected")
+        sent.push(content)
+        return { provider, stream, interrupt: async () => {}, close: () => stream.close() }
+      },
+      stopSession() {}, closeChat() {},
+    }
+    const coordinator = new AgentCoordinator({
+      store: store as never, onStateChange: () => {}, checkSessionArtifact: () => "unknown",
+      codexManager: manager as never, cursorManager: manager as never, grokManager: manager as never,
+      piManager: manager as never, resolvePiConnection: async () => ({ provider: "openrouter", apiKey: "unused", baseUrl: "https://example.invalid" }),
+      startClaudeSession: async () => ({
+        provider: "claude", stream, startupOutcome: { kind: "resumed" },
+        getAccountInfo: async () => null, interrupt: async () => {}, close: () => stream.close(),
+        setModel: async () => {}, setPermissionMode: async () => {},
+        sendPrompt: async (content: string) => { if (options.failInput) throw new Error("input rejected"); sent.push(content) },
+      }) as never,
+    })
+    return { store, coordinator, sent, stream, startupArgs, starts: () => starts }
+  }
+
+  for (const provider of ["claude", "codex", "cursor", "grok", "pi"] as const) {
+    test(`${provider} cold resume and queued continuation never load the full payload`, async () => {
+      const f = fixture(provider)
+      f.store.getMessages = () => { throw new Error("full payload read on native reuse") }
+      try {
+        await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider, content: "next" })
+        expect(f.sent[0]).toContain("next")
+        expect(f.sent[0]).not.toContain("prior answer")
+        await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider, content: "queued next" })
+        f.stream.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) })
+        if (provider !== "claude") f.stream.close()
+        await waitFor(() => f.sent.length === 2)
+        expect(f.sent[1]).toContain("queued next")
+        expect(f.sent[1]).not.toContain("prior answer")
+      } finally { f.stream.close() }
+    })
+  }
+
+  test("actual Codex fresh fallback starts once and restores before the first input", async () => {
+    const f = fixture("codex", { fallback: true })
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "next" })
+      expect(f.starts()).toBe(1)
+      expect(f.sent[0]).toContain("prior answer")
+      expect(f.sent[0]?.match(/next/g)).toHaveLength(1)
+    } finally { f.stream.close() }
+  })
+
+  test("Claude waits for actual native startup before sending new input", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "native-old"
+    store.messages.push(timestamped({ kind: "user_prompt", content: "prior" }))
+    store.getMessages = () => { throw new Error("resume must not load full payload") }
+    let finish!: (outcome: { kind: "resumed" }) => void
+    const ready = new Promise<{ kind: "resumed" }>(resolve => { finish = resolve })
+    const stream = new AsyncEventQueue<any>()
+    const sent: string[] = []
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, checkSessionArtifact: () => "unknown",
+      startClaudeSession: async () => ({ provider: "claude", stream, interrupt: async () => {}, close: () => stream.close(), setModel: async () => {}, setPermissionMode: async () => {},
+        waitForStartupOutcome: () => ready, sendPrompt: async (content: string) => { sent.push(content) } }) as never,
+    })
+    const sending = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "next" })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(sent).toEqual([])
+    finish({ kind: "resumed" })
+    await sending
+    expect(sent).toEqual([withChatLinks("next")])
+    stream.close()
+  })
+
+  test("restart continuation restores a tokenless durable obligation without adding a user prompt", async () => {
+    const f = fixture("codex", { fallback: true })
+    f.store.chat.sessionToken = null
+    await f.store.setContextRestoration("chat-1", { id: "persisted", provider: "codex", fromProvider: "claude", reason: "provider_switch", endExclusive: 2 })
+    try {
+      expect(await f.coordinator.resumeInterruptedTurn("chat-1")).toBe(true)
+      expect(f.sent[0]).toContain("prior question")
+      expect(f.sent[0]).toContain("prior answer")
+      expect(f.sent[0]).toContain(RESUME_AFTER_RESTART_MESSAGE)
+      expect(f.store.messages.filter(entry => entry.kind === "user_prompt")).toHaveLength(1)
+    } finally { f.stream.close() }
+  })
+
+  test("all ordered provider switches send the preceding conversation once", async () => {
+    const providers = ["claude", "codex", "cursor", "grok", "pi"] as const
+    for (const from of providers) for (const to of providers) {
+      if (from === to) continue
+      const f = fixture(from)
+      try {
+        await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: to, content: "destination input" })
+        expect(f.sent).toHaveLength(1)
+        expect(f.sent[0]).toContain("prior question")
+        expect(f.sent[0]).toContain("prior answer")
+        expect(f.sent[0]?.match(/destination input/g)).toHaveLength(1)
+        expect((f.store.chat as any).contextRestoration?.provider).toBe(to)
+      } finally { f.stream.close() }
+    }
+  })
+
+  test("failed turn partial progress belongs to a different retry's restoration", async () => {
+    const f = fixture("codex")
+    f.store.recordTurnFailed = async () => { f.store.turnFinishedCount++ }
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "pi", content: "implement parser" })
+      f.stream.push({ type: "transcript", entry: timestamped({ kind: "assistant_text", text: "partial parser implementation" }) })
+      f.stream.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: "transport lost" }) })
+      f.stream.close()
+      await waitFor(() => f.store.turnFinishedCount === 1)
+      await new Promise(resolve => setTimeout(resolve, 10))
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "pi", content: "continue" })
+      expect(f.sent[1]).toContain("implement parser")
+      expect(f.sent[1]).toContain("partial parser implementation")
+      expect((f.store.chat as any).contextRestoration).not.toBeNull()
+    } finally { f.stream.close() }
+  })
+
+  test("warm Claude survives native file loss but a required restart restores context", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "native-old"
+    store.messages.push(timestamped({ kind: "user_prompt", content: "prior question" }), timestamped({ kind: "assistant_text", text: "prior answer" }))
+    let artifact: SessionArtifactStatus = "present"
+    const tokens: Array<string | null> = []
+    const sent: string[] = []
+    const streams: AsyncEventQueue<any>[] = []
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, checkSessionArtifact: () => artifact,
+      startClaudeSession: async args => {
+        tokens.push(args.sessionToken)
+        const stream = new AsyncEventQueue<any>()
+        streams.push(stream)
+        return { provider: "claude", stream, startupOutcome: { kind: args.sessionToken ? "resumed" : "fresh" }, interrupt: async () => {}, close: () => stream.close(), setModel: async () => {}, setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => { sent.push(content); stream.push({ type: "session_token", sessionToken: "native-current" }); stream.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) }) },
+        } as never
+      },
+    })
+    try {
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "first" })
+      await waitFor(() => store.turnFinishedCount === 1)
+      artifact = "missing"
+      const read = store.getMessages.bind(store)
+      store.getMessages = () => { throw new Error("usable warm session must not read payload") }
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "warm next" })
+      await waitFor(() => store.turnFinishedCount === 2)
+      expect(tokens).toEqual(["native-old"])
+      expect(sent[1]).toBe(withChatLinks("warm next"))
+      store.getMessages = read
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "restart next", autoPlan: true })
+      await waitFor(() => store.turnFinishedCount === 3)
+      expect(tokens[1]).toBeNull()
+      expect(sent[2]).toContain("prior answer")
+    } finally { streams.forEach(stream => stream.close()) }
+  })
+
+  test("failed native Claude readiness closes its new unsent handle without loading history", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.sessionToken = "native-old"
+    store.messages.push(timestamped({ kind: "user_prompt", content: "prior" }))
+    store.getMessages = () => { throw new Error("failed resume must not speculate full replay") }
+    const sent: string[] = []
+    let closed = 0
+    const stream = new AsyncEventQueue<any>()
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, checkSessionArtifact: () => "unknown",
+      startClaudeSession: async () => ({ provider: "claude", stream, interrupt: async () => {}, close: () => { closed++; stream.close() }, setModel: async () => {}, setPermissionMode: async () => {},
+        waitForStartupOutcome: async () => { throw new Error("native load rejected") }, sendPrompt: async (content: string) => { sent.push(content) } }) as never,
+    })
+    await expect(coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "next" })).rejects.toThrow("native load rejected")
+    expect(sent).toEqual([])
+    expect(closed).toBe(1)
+    expect(store.chat.sessionToken).toBe("native-old")
+  })
+
+  test("retry reconciles a durable destination written before provider metadata changed", async () => {
+    const f = fixture("codex")
+    await f.store.setContextRestoration("chat-1", { id: "switch-interrupted", provider: "pi", fromProvider: "codex", reason: "provider_switch", endExclusive: 2 })
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "continue here" })
+      expect(f.startupArgs[0].sessionToken).toBeNull()
+      expect((f.store.chat as any).contextRestoration?.provider).toBe("codex")
+      expect(f.sent[0]).toContain("prior answer")
+    } finally { f.stream.close() }
+  })
+
+  test("a different retry prompt also restores the preceding failed user request", async () => {
+    const options = { failInput: true }
+    const f = await fixture("codex", options)
+    try {
+      await expect(f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "pi", content: "implement the parser" })).rejects.toThrow("input rejected")
+      options.failInput = false
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "pi", content: "continue" })
+      expect(f.sent[0]).toContain("implement the parser")
+      expect(f.sent[0]).toContain("prior answer")
+      expect(f.sent[0]?.endsWith(withChatLinks("continue"))).toBe(true)
+      expect((f.store.chat as any).contextRestoration).not.toBeNull()
+      f.stream.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) })
+      f.stream.close()
+      await waitFor(() => (f.store.chat as any).contextRestoration === null)
+    } finally { f.stream.close() }
+  })
+
+  test("a fresh startup after explicit clear cannot restore the previous epoch", async () => {
+    const f = fixture("codex", { fallback: true })
+    f.store.messages.push(timestamped({ kind: "context_cleared" }), timestamped({ kind: "user_prompt", content: "new epoch task" }), timestamped({ kind: "assistant_text", text: "new epoch answer" }))
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "continue" })
+      expect(f.sent[0]).toContain("new epoch task")
+      expect(f.sent[0]).toContain("new epoch answer")
+      expect(f.sent[0]).not.toContain("prior question")
+      expect(f.sent[0]).not.toContain("/tmp/transcripts/chat-1.jsonl")
+    } finally { f.stream.close() }
+  })
+
+  test("failed provider-switch input retains a bounded durable restoration obligation", async () => {
+    const f = fixture("codex", { failInput: true })
+    try {
+      await expect(f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "pi", content: "next" })).rejects.toThrow("input rejected")
+      expect((f.store.chat as any).contextRestoration).toMatchObject({ provider: "pi", fromProvider: "codex", endExclusive: 2 })
+    } finally { f.stream.close() }
+  })
+})
+
+
+  test("native Claude factory exposes the first initialize barrier before consuming prompt input", async () => {
+  let captured: any
+  let initialized!: () => void
+  const initialization = new Promise<any>(resolve => { initialized = () => resolve({ models: [] }) })
+  let initializations = 0
+  const native = {
+    initializationResult: () => { initializations++; return initialization },
+    close: () => {},
+  }
+  const handle = await startClaudeSession({ localPath: "/tmp/project", model: "opus", planMode: false, autoPlan: false,
+    sessionToken: "native-source", forkSession: true, onToolRequest: async () => ({}) }, {
+    query: ((args: any) => { captured = args; return native }) as never,
+    resolveExecutable: async () => ({ ok: true, path: "/fake/claude", version: "2.1.284" }),
+  })
+  expect(typeof handle.waitForStartupOutcome).toBe("function")
+  let outcome: unknown = null
+  const preparing = handle.waitForStartupOutcome!().then(value => { outcome = value })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  expect(outcome).toBeNull()
+  const input = captured.prompt[Symbol.asyncIterator]().next()
+  initialized()
+  await preparing
+  expect(outcome).toEqual({ kind: "forked" })
+  await handle.waitForStartupOutcome!()
+  expect(initializations).toBe(1)
+  expect(captured.options.resume).toBe("native-source")
+  expect(captured.options.forkSession).toBe(true)
+  await handle.sendPrompt("new input", "prompt-id")
+  expect((await input).value.message.content).toBe("new input")
+  handle.close()
+})
+
+
+  for (const version of [null, "2.1.277", "2.1.285"] as const) {
+  test(`Claude version ${version ?? "wrapper"} keeps unaudited native continuity explicit`, async () => {
+    const handle = await startClaudeSession({ localPath: "/tmp/project", model: "opus", planMode: false, autoPlan: false,
+      sessionToken: "native-source", forkSession: false, onToolRequest: async () => ({}) }, {
+      query: (() => ({ initializationResult: async () => ({}), close: () => {} })) as never,
+      resolveExecutable: async () => ({ ok: true, path: "/fake/claude", version }),
+    })
+    expect((await handle.waitForStartupOutcome!()).kind).toBe("unknown")
+    handle.close()
+  })
+}
+
+
+  for (const provider of ["cursor", "grok"] as const) {
+  test(`${provider} explicit fresh invocation keeps actual startup unknown while restoring required context`, async () => {
+    const chat = createFakeChat("chat-1", "project-1", "Conversation")
+    chat.provider = provider as never
+    const store = createFakeStore({ chats: [chat] })
+    store.messages.push(timestamped({ kind: "user_prompt", content: "old task" }), timestamped({ kind: "assistant_text", text: "old answer" }))
+    const stream = new AsyncEventQueue<any>()
+    const sent: string[] = []
+    const outcomes: any[] = []
+    const manager = { async startTurn(args: any) { sent.push(args.content); return { provider, stream, interrupt: async () => {}, close: () => stream.close() } } }
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, cursorManager: manager as never, grokManager: manager as never })
+    try {
+      await (coordinator as any).startTurnForChat({ chatId: "chat-1", provider, content: "next", attachments: [], model: "model", planMode: false, autoPlan: false, appendUserPrompt: true,
+        onProviderReady: async (_isCurrentTurn: any, outcome: any) => { outcomes.push(outcome) },
+      })
+      expect(outcomes[0].kind).toBe("unknown")
+      expect(sent[0]).toContain("old answer")
+      expect((store.chat as any).contextRestoration).not.toBeNull()
+    } finally { stream.close() }
+  })
+}
+
+
+describe("owned provider context preparation integration", () => {
+  function gate() {
+    let release!: () => void
+    return { ready: new Promise<void>(resolve => { release = resolve }), release: () => release() }
+  }
+  async function contextStore(provider: AgentProvider) {
+    const store = createFakeStore()
+    store.chat.provider = provider
+    store.chat.title = "Existing conversation"
+    store.chat.sessionToken = "native-old"
+    store.messages = [timestamped({ kind: "user_prompt", content: "original question" }),
+      timestamped({ kind: "assistant_text", text: "original answer" })]
+    return store
+  }
+  const success = () => ({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) })
+  for (const stop of ["cancel", "close", "dispose"] as const) {
+    test(`a ${stop} during Pi native preparation cannot run its lazy callback or submit old input`, async () => {
+      const store = await contextStore("pi")
+      store.getMessages = () => { throw new Error("cancelled preparation must not load history") }
+      const entered = gate(), blocked = gate()
+      const prompts: string[] = []
+      const queues: AsyncEventQueue<any>[] = []
+      let starts = 0
+      const manager = {
+        closeChat() {}, dispose() {},
+        async startTurn(args: any) {
+          if (++starts === 1) { entered.release(); await blocked.ready }
+          const content = await args.prepareContent({ kind: "resumed" })
+          prompts.push(content)
+          const stream = new AsyncEventQueue<any>(); queues.push(stream)
+          return { provider: "pi", stream, interrupt: async () => {}, close: () => stream.close() }
+        },
+      }
+      const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, piManager: manager as never,
+        resolvePiConnection: async () => ({ provider: "openrouter", apiKey: "unused", baseUrl: "https://example.invalid" }) })
+      const send = (content: string) => coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "pi", content })
+      const original = send("cancelled request")
+      try {
+        await entered.ready
+        if (stop === "cancel") await coordinator.cancel("chat-1"); else if (stop === "close") await coordinator.closeChat("chat-1"); else coordinator.dispose()
+        await send("successor request")
+        const successor = coordinator.activeTurns.get("chat-1")
+        blocked.release(); await original
+        expect(prompts).toEqual(["successor request"])
+        expect(coordinator.activeTurns.get("chat-1")).toBe(successor)
+      } finally { blocked.release(); await original.catch(() => {}); for (const queue of queues) queue.close() }
+    })
+  }
+
+  test("Claude restoration ACK waits for its own successful native result", async () => {
+    const store = await contextStore("claude")
+    store.chat.contextRestoration = { id: "pending", provider: "claude", fromProvider: "claude", reason: "session_restore", endExclusive: 2 }
+    const stream = new AsyncEventQueue<any>()
+    let promptId: string | undefined
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      startClaudeSession: async () => ({ provider: "claude", echoesPromptIds: true, stream, startupOutcome: { kind: "fresh" },
+        interrupt: async () => {}, close: () => stream.close(), setModel: async () => {}, setPermissionMode: async () => {},
+        sendPrompt: async (_content, id) => { promptId = id },
+      }),
+    })
+    try {
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "next" })
+      expect(store.chat.contextRestoration).not.toBeNull()
+      stream.push({ type: "transcript", promptIds: [promptId], entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) })
+      await waitFor(() => store.turnFinishedCount === 1)
+      expect(store.chat.contextRestoration).toBeNull()
+    } finally { stream.close() }
+  })
+
+  for (const stop of ["cancel", "close", "dispose"] as const) test(`a ${stop} result awaiting transcript persistence cannot ACK or remove a successor`, async () => {
+    const store = await contextStore("codex")
+    store.chat.provider = "grok"
+    const resultEntered = gate(), resultBlocked = gate()
+    const append = store.appendMessage.bind(store)
+    store.appendMessage = async (chatId, entry) => {
+      if (entry.kind === "result") { resultEntered.release(); await resultBlocked.ready }
+      await append(chatId, entry)
+    }
+    let acknowledgements = 0
+    const ack = store.acknowledgeContextRestoration.bind(store)
+    store.acknowledgeContextRestoration = async (chatId, id) => { acknowledgements++; await ack(chatId, id) }
+    const queues: AsyncEventQueue<any>[] = []
+    const manager = {
+      stopSession() {}, stopAll() {},
+      async startSession() { return { sessionToken: "new", resumeFellBack: false, startupOutcome: { kind: "fresh" } } },
+      async startTurn() { const stream = new AsyncEventQueue<any>(); queues.push(stream); return { provider: "codex", providerTurnId: "accepted-turn", stream, interrupt: async () => {}, close: () => stream.close() } },
+    }
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, codexManager: manager as never })
+    const send = (content: string) => coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content })
+    try {
+      await send("original request")
+      queues[0]!.push(success())
+      await resultEntered.ready
+      if (stop === "cancel") await coordinator.cancel("chat-1"); else if (stop === "close") await coordinator.closeChat("chat-1"); else coordinator.dispose()
+      await send("successor request")
+      const successor = coordinator.activeTurns.get("chat-1")
+      const successorIntent = store.chat.contextRestoration
+      resultBlocked.release()
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(acknowledgements).toBe(0)
+      expect(coordinator.activeTurns.get("chat-1")).toBe(successor)
+      expect(store.chat.contextRestoration).toEqual(successorIntent)
+      expect(store.turnFinishedCount).toBe(0)
+    } finally { resultBlocked.release(); for (const queue of queues) queue.close() }
+  })
+
+})
+
+
+  test("cancellation during explicit context clear drains its local write and preserves the successor reset epoch", async () => {
+  const store = createFakeStore()
+  store.chat.provider = "codex"
+  store.chat.title = "Existing conversation"
+  store.chat.sessionToken = "source-session"
+  store.messages = [timestamped({ kind: "user_prompt", content: "old question" })]
+  let entered!: () => void, release!: () => void
+  const observed = new Promise<void>(resolve => { entered = resolve })
+  const blocked = new Promise<void>(resolve => { release = resolve })
+  const append = store.appendMessage.bind(store)
+  store.appendMessage = async (chatId, entry) => {
+    if (entry.kind === "context_cleared") { entered(); await blocked }
+    await append(chatId, entry)
+  }
+  let prompt!: { onToolRequest: (request: any) => Promise<unknown> }
+  const queues: AsyncEventQueue<any>[] = []
+  const starts: Array<string | null> = []
+  const manager = {
+    stopSession() {},
+    async startSession(args: any) { starts.push(args.sessionToken); return { sessionToken: "new", resumeFellBack: false, startupOutcome: { kind: "resumed" } } },
+    async startTurn(args: any) { prompt = args; const stream = new AsyncEventQueue<any>(); queues.push(stream); stream.push({ type: "session_token", sessionToken: "new" }); return { provider: "codex", stream, interrupt: async () => {}, close: () => stream.close() } },
+  }
+  const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, codexManager: manager as never })
+  let responding: ReturnType<typeof coordinator.respondTool> | undefined
+  let successor: ReturnType<typeof coordinator.send> | undefined
+  try {
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "make a plan" })
+    void prompt.onToolRequest({ tool: { kind: "tool", toolKind: "exit_plan_mode", toolName: "ExitPlanMode", toolId: "plan", input: { plan: "plan" } } }).catch(() => {})
+    await waitFor(() => coordinator.getPendingTool("chat-1") !== undefined)
+    responding = coordinator.respondTool({ type: "chat.respondTool", chatId: "chat-1", toolUseId: "plan", result: { confirmed: true, clearContext: true } })
+    await observed
+    await coordinator.cancel("chat-1")
+    successor = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "successor" })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(starts).toHaveLength(1)
+    release(); await Promise.all([responding, successor])
+    expect(starts).toHaveLength(2)
+    expect(starts[1]).toBeNull()
+    expect(store.chat.contextRestoration?.reason).toBe("explicit_reset")
+    await waitFor(() => store.chat.sessionToken === "new")
+    expect(store.chat.sessionToken).toBe("new")
+    expect(coordinator.activeTurns.get("chat-1")?.postToolFollowUp).toBeNull()
+  } finally { release(); await responding?.catch(() => {}); await successor?.catch(() => {}); for (const queue of queues) queue.close() }
+})
+
+
+  test("a failed reset boundary keeps its durable lower bound and never restores the older epoch", async () => {
+  const store = createFakeStore()
+  store.chat.provider = "codex"
+  store.chat.title = "Existing conversation"
+  store.chat.sessionToken = "source-session"
+  store.messages = [timestamped({ kind: "user_prompt", content: "forbidden old question" }), timestamped({ kind: "assistant_text", text: "forbidden old answer" })]
+  const append = store.appendMessage.bind(store)
+  store.appendMessage = async (chatId, entry) => { if (entry.kind === "context_cleared") throw new Error("boundary unavailable"); await append(chatId, entry) }
+  const queues: AsyncEventQueue<any>[] = []
+  let prompt!: { onToolRequest: (request: any) => Promise<unknown> }
+  const content: string[] = []
+  const manager = {
+    stopSession() {},
+    async startSession() { return { sessionToken: "new", resumeFellBack: false, startupOutcome: { kind: "fresh" } } },
+    async startTurn(args: any) { prompt = args; content.push(args.content); const stream = new AsyncEventQueue<any>(); queues.push(stream); return { provider: "codex", providerTurnId: "accepted-turn", stream, interrupt: async () => {}, close: () => stream.close() } },
+  }
+  const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, codexManager: manager as never })
+  try {
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "make a plan" })
+    void prompt.onToolRequest({ tool: { kind: "tool", toolKind: "exit_plan_mode", toolName: "ExitPlanMode", toolId: "plan", input: { plan: "plan" } } }).catch(() => {})
+    await waitFor(() => coordinator.getPendingTool("chat-1") !== undefined)
+    await expect(coordinator.respondTool({ type: "chat.respondTool", chatId: "chat-1", toolUseId: "plan", result: { confirmed: true, clearContext: true } })).rejects.toThrow("boundary unavailable")
+    expect(store.chat.contextRestoration?.startInclusive).toBe(store.messages.length)
+    await coordinator.cancel("chat-1")
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "new epoch input" })
+    expect(content[1]).toBe("new epoch input")
+    expect(content[1]).not.toContain("forbidden old")
+    expect(content[1]).not.toContain("/tmp/transcripts/")
+  } finally { for (const queue of queues) queue.close() }
+})
+
+
+  for (const provider of ["codex", "pi", "cursor", "grok"] as const) {
+    for (const stop of ["cancel", "close", "dispose"] as const) {
+      test(`main review: ${stop} invalidates ${provider} waiting for a predecessor write`, async () => {
+        const store = createFakeStore()
+        store.chat.provider = provider
+        store.chat.title = "Existing conversation"
+        let release!: () => void
+        const drain = new Promise<void>(resolve => { release = resolve })
+        let starts = 0
+        const manager = {
+          async startSession() { starts++; throw new Error("late native preparation") },
+          async startTurn() { starts++; throw new Error("late native input") },
+          stopSession() {}, stopAll() {}, closeChat() {}, dispose() {},
+        }
+        const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+          codexManager: manager as never, piManager: manager as never,
+          cursorManager: manager as never, grokManager: manager as never }) as any
+        coordinator.resolvePiConnection = async () => ({ provider: "openai", apiKey: "test", baseUrl: "https://example.invalid" })
+        coordinator.claudeReadinessCommits.set("chat-1", drain)
+        const pending = coordinator.startTurnForChat({ chatId: "chat-1", provider, content: "cancelled input",
+          attachments: [], model: "model", planMode: false, autoPlan: false, appendUserPrompt: true }).catch((error: unknown) => error)
+        try {
+          if (stop === "cancel") await coordinator.cancel("chat-1")
+          else if (stop === "close") await coordinator.closeChat("chat-1")
+          else coordinator.dispose()
+          release()
+          await pending
+          expect(starts).toBe(0)
+          expect(coordinator.activeTurns.has("chat-1")).toBe(false)
+          expect(store.messages.some(entry => entry.kind === "user_prompt")).toBe(false)
+        } finally { release(); await pending; coordinator.dispose() }
+      })
+    }
+  }
+
+
+  test("main review: a warm native tool host serves the current turn", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.title = "Existing conversation"
+    let nativeHost: any
+    let turns = 0
+    const queues: AsyncEventQueue<any>[] = []
+    const manager = {
+      stopSession() {}, stopAll() {},
+      async startSession(args: any) {
+        nativeHost ??= args.customTools
+        return { sessionToken: "native", resumeFellBack: false, startupOutcome: { kind: turns ? "reused" : "fresh" } }
+      },
+      async startTurn() {
+        const stream = new AsyncEventQueue<any>(); queues.push(stream)
+        if (++turns === 1) {
+          stream.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) })
+          stream.close()
+        }
+        return { provider: "codex", providerTurnId: "accepted-turn", stream, interrupt: async () => {}, close: () => stream.close() }
+      },
+    }
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, codexManager: manager as never }) as any
+    const send = (content: string) => coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content })
+    try {
+      await send("first")
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(coordinator.activeTurns.has("chat-1")).toBe(false)
+      await send("second")
+      const owner = coordinator.activeTurns.get("chat-1")
+      let executed = 0
+      owner.customTools = { abort() {}, async execute() { executed++; return { content: [{ type: "text", text: "current turn" }] } } }
+      const result = await nativeHost.execute("test_current_owner", {}, new AbortController().signal)
+      expect(result).toEqual({ content: [{ type: "text", text: "current turn" }] })
+      expect(executed).toBe(1)
+      expect(coordinator.activeTurns.get("chat-1")).toBe(owner)
+    } finally { for (const queue of queues) queue.close(); coordinator.dispose() }
+  })
+
+
+  test("main review: a warm Claude tool request serves the current turn", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.title = "Existing conversation"
+    const events = new AsyncEventQueue<any>()
+    let nativeCallback!: (request: any) => Promise<unknown>
+    let prompts = 0
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      startClaudeSession: async args => {
+        nativeCallback = args.onToolRequest
+        return { provider: "claude", stream: events, interrupt: async () => {}, close: () => events.close(),
+          sendPrompt: async () => {
+            if (++prompts === 1) events.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) })
+          }, setModel: async () => {}, setPermissionMode: async () => {}, setFastMode: async () => {} }
+      } }) as any
+    coordinator.refreshClaudeModelCatalog = async () => {}
+    let requests = 0
+    coordinator.requestToolInput = async () => { requests++; return { answer: "current turn" } }
+    const send = (content: string) => coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content })
+    try {
+      await send("first")
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(coordinator.activeTurns.has("chat-1")).toBe(false)
+      await send("second")
+      await expect(nativeCallback({})).resolves.toEqual({ answer: "current turn" })
+      expect(requests).toBe(1)
+    } finally { events.close(); coordinator.dispose() }
+  })
+
+
+  test("a cancelled restoration write drains before a successor prepares context", async () => {
+  const store = createFakeStore()
+  store.chat.provider = "grok"
+  store.chat.title = "Existing conversation"
+  store.chat.sessionToken = "old-native"
+  store.messages = [timestamped({ kind: "user_prompt", content: "original question" }),
+    timestamped({ kind: "assistant_text", text: "original answer" })]
+  let entered!: () => void, release!: () => void
+  const blocked = new Promise<void>(resolve => { release = resolve })
+  const observed = new Promise<void>(resolve => { entered = resolve })
+  const setIntent = store.setContextRestoration.bind(store)
+  let writes = 0, starts = 0
+  store.setContextRestoration = async (chatId, intent) => {
+    if (++writes === 1) { entered(); await blocked }
+    await setIntent(chatId, intent)
+  }
+  const sent: string[] = []
+  const streams: AsyncEventQueue<any>[] = []
+  const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {}, codexManager: {
+    stopSession() {}, stopAll() {},
+    async startSession() { starts++; return { sessionToken: "fresh-native", resumeFellBack: false, startupOutcome: { kind: "fresh" } } },
+    async startTurn(args: any) { sent.push(args.content); const stream = new AsyncEventQueue<any>(); streams.push(stream); return { provider: "codex", stream, interrupt: async () => {}, close: () => stream.close() } },
+  } as never })
+  const send = (content: string) => coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content })
+  const original = send("cancelled request")
+  let successor: Promise<unknown> | undefined
+  try {
+    await observed
+    await coordinator.cancel("chat-1")
+    successor = send("successor request")
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(starts).toBe(0)
+    release()
+    await original
+    await successor
+    expect(starts).toBe(1)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]).toContain("original answer")
+    expect(sent[0]).toContain("successor request")
+    expect(sent[0]).not.toContain("cancelled request")
+    expect(coordinator.activeTurns.get("chat-1")?.provider).toBe("codex")
+  } finally { release(); await original.catch(() => {}); await successor?.catch(() => {}); for (const stream of streams) stream.close(); coordinator.dispose() }
+})
+
+
+describe("main integration review of early preparation ownership", () => {
+  test.each(["question", "execution"])("main review: an old Claude tool %s waiting for startup cannot cross native replacement", async kind => {
+    const store = createFakeStore()
+    store.chat.provider = "claude"
+    store.chat.title = "Existing conversation"
+    let entered!: () => void, release!: () => void
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const preparing = new Promise<void>(resolve => { entered = resolve })
+    const nativeArgs: any[] = []
+    const queues: AsyncEventQueue<any>[] = []
+    let attached = 0, executed = 0
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      startClaudeSession: async args => {
+        const stream = new AsyncEventQueue<any>(); queues.push(stream); nativeArgs.push(args)
+        return { provider: "claude", stream, interrupt: async () => {}, close: () => stream.close(),
+          sendPrompt: async () => { if (nativeArgs.length === 1) stream.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }) }) },
+          setModel: async () => {}, setPermissionMode: async () => {}, setFastMode: async () => {} }
+      } }) as any
+    coordinator.refreshClaudeModelCatalog = async () => {}
+    coordinator.requestToolInput = async () => { attached++; return {} }
+    let successor: Promise<unknown> | undefined, oldCallback: Promise<any> | undefined
+    try {
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "first" })
+      await waitFor(() => !coordinator.activeTurns.has("chat-1"))
+      const oldSession = coordinator.claudeSessions.get("chat-1")
+      const setPlanMode = store.setPlanMode.bind(store)
+      store.setPlanMode = async (chatId, mode) => { entered(); await blocked; await setPlanMode(chatId, mode) }
+      successor = coordinator.startTurnForChat({ chatId: "chat-1", provider: "claude", content: "second",
+        attachments: [], model: "model", planMode: false, autoPlan: false, appendUserPrompt: true, resetSession: true })
+      await preparing
+      const owner = coordinator.activeTurns.get("chat-1")
+      owner.customTools = { abort() {}, async execute() { executed++; return { content: [{ type: "text", text: "wrong session" }] } } }
+      oldCallback = (kind === "question" ? nativeArgs[0].onToolRequest({})
+        : nativeArgs[0].customTools.execute("old_tool", {}, new AbortController().signal)).catch((error: unknown) => error)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      release()
+      await successor
+      expect(nativeArgs).toHaveLength(2)
+      expect(coordinator.claudeSessions.get("chat-1")).not.toBe(oldSession)
+      const result = await oldCallback
+      if (kind === "question") expect(result).toBeInstanceOf(Error)
+      else expect(result.isError).toBe(true)
+      expect(attached).toBe(0)
+      expect(executed).toBe(0)
+    } finally { release(); for (const queue of queues) queue.close(); await successor; await oldCallback; coordinator.dispose() }
   })
 })
