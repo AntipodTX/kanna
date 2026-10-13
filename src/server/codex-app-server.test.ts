@@ -710,7 +710,12 @@ describe("CodexAppServerManager", () => {
       expect(threadStart.params.model).toBe(combination.model)
       expect(turnStart.params.model).toBe(combination.model)
       expect(turnStart.params.effort).toBe(combination.effort)
-      expect(turnStart.params.collaborationMode?.settings?.reasoning_effort).toBe(combination.effort)
+      expect(turnStart.params.collaborationMode.settings).toMatchObject({
+        model: combination.model,
+        reasoning_effort: combination.effort,
+        developer_instructions: null,
+      })
+      expect(turnStart.params.input).toEqual([{ type: "text", text: "matrix test", text_elements: [] }])
 
       manager.stopSession(chatId)
     }
@@ -4636,6 +4641,60 @@ describe("CodexAppServerManager", () => {
 
     expect(turnStartRequests).toBe(2)
     expect(retryEvents.some((event) => event.type === "transcript" && event.entry.kind === "system_init")).toBe(true)
+  })
+
+
+  test("keeps collaboration mode without Kanna instructions when turn effort is omitted", async () => {
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-1", status: "completed", error: null } },
+        })
+        child.writeServerMessage({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: "turn-1", status: "completed", error: null },
+          },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+
+    await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+
+    const turn = await manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "Run pwd",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    })
+
+    await collectStream(turn.stream)
+
+    const turnStart = process.messages.find((message: any) => message.method === "turn/start") as
+      | { method: "turn/start"; params: { collaborationMode?: { settings?: { reasoning_effort?: string | null; developer_instructions?: string | null } } } }
+      | undefined
+
+    expect(turnStart?.params.collaborationMode?.settings?.reasoning_effort).toBeNull()
+    expect(turnStart?.params.collaborationMode?.settings?.developer_instructions).toBeNull()
   })
 })
 

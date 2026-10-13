@@ -60,11 +60,6 @@ import {
   type SkillReference,
 } from "./harness-skills"
 import {
-  buildKannaAgentCorrection,
-  buildKannaAgentId,
-} from "./attribution"
-import { buildKannaSystemInstructions, buildKannaSystemMessage } from "./harness-instructions"
-import {
   applyClaudeSdkModels,
   applyCodexModels,
   applyCursorModels,
@@ -307,13 +302,6 @@ interface ClaudeSessionState {
   backgroundWorkState: ClaudeBackgroundWorkState
   localPath: string
   model: string
-  /**
-   * The agent id baked into this session's system-prompt append. Frozen at
-   * query() time — unlike `model`, which setModel() updates in place — so a
-   * mismatch against the turn's model is exactly the drift the per-turn
-   * correction exists to cover.
-   */
-  promptAgentId: string
   effort?: string
   serviceTier?: "fast"
   planMode: boolean
@@ -1070,12 +1058,9 @@ export async function startClaudeSession(args: {
       // like the rest.
       forwardSubagentText: true,
       settingSources: ["user", "project", "local"],
-      // Append-only: the claude_code preset stays intact, Kanna's session
-      // instructions ride on the end of it (see harness-instructions.ts).
       systemPrompt: {
         type: "preset",
         preset: "claude_code",
-        append: buildKannaSystemInstructions(buildKannaAgentId("claude", args.model)),
       },
       // fastMode must go through the flag-settings layer: the CLI only allows
       // fast mode in Agent SDK sessions when flagSettings.fastMode is true,
@@ -2284,16 +2269,14 @@ export class AgentCoordinator {
       } else if (args.provider === "cursor") {
         await prepareWireContent({ kind: "unknown", reason: "Cursor print CLI has no pre-input load acknowledgement" })
         void this.refreshCursorModelCatalog()
-        const content = appendSystemMessageBlock(buildPromptText(wireContent, args.attachments), buildKannaSystemMessage(buildKannaAgentId("cursor", args.model)))
-        turn = await this.cursorManager.startTurn({ cwd: project.localPath, customTools, content,
+        turn = await this.cursorManager.startTurn({ cwd: project.localPath, customTools, content: buildPromptText(wireContent, args.attachments),
           model: args.model, sessionToken: forceFreshContext ? null : chat.sessionToken })
         active.turn = turn
         assertCurrent()
       } else if (args.provider === "grok") {
         await prepareWireContent({ kind: "unknown", reason: "Grok print CLI has no pre-input load acknowledgement" })
         void this.refreshGrokModelCatalog()
-        const content = appendSystemMessageBlock(buildPromptText(wireContent, args.attachments), buildKannaSystemMessage(buildKannaAgentId("grok", args.model)))
-        turn = await this.grokManager.startTurn({ cwd: project.localPath, content, model: args.model,
+        turn = await this.grokManager.startTurn({ cwd: project.localPath, content: buildPromptText(wireContent, args.attachments), model: args.model,
           effort: args.effort, planMode: args.planMode, sessionToken: forceFreshContext ? null : chat.pendingForkSessionToken ?? chat.sessionToken,
           forkSession: forceFreshContext ? false : Boolean(chat.pendingForkSessionToken), onToolRequest })
         active.turn = turn
@@ -2353,10 +2336,10 @@ export class AgentCoordinator {
         active.claudePromptSeq = promptSeq
         active.status = "running"
         this.emitStateChange(args.chatId)
-        const claudeAgentId = buildKannaAgentId("claude", args.model)
-        const claudePrompt = buildPromptText(wireContent, args.attachments)
-        await session.session.sendPrompt(session.promptAgentId === claudeAgentId
-          ? claudePrompt : appendSystemMessageBlock(claudePrompt, buildKannaAgentCorrection(claudeAgentId)), promptId)
+      await session.session.sendPrompt(
+        buildPromptText(wireContent, args.attachments),
+        promptId,
+      )
         return
       }
       void this.runTurn(active as ActiveTurn & { turn: HarnessTurn })
@@ -2454,7 +2437,6 @@ export class AgentCoordinator {
         backgroundWorkState: reportedBackgroundWorkState,
         localPath: args.localPath,
         model: args.model,
-        promptAgentId: buildKannaAgentId("claude", args.model),
         effort: args.effort,
         serviceTier: args.serviceTier,
         planMode: args.planMode,
