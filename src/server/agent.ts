@@ -1841,16 +1841,13 @@ export class AgentCoordinator {
   }
 
   private async dequeueAndStartQueuedMessage(chatId: string, queuedMessage: QueuedChatMessage, options?: { steered?: boolean }) {
+    const alreadyPersisted = this.store.hasUserPrompt(chatId, queuedMessage.id)
+    if (this.resolveProvider(queuedMessage, this.store.requireChat(chatId).provider) === "codex" && !alreadyPersisted)
+      await this.assertCodexHistoryReady(chatId)
+    await this.store.removeQueuedMessage(chatId, queuedMessage.id)
+    if (alreadyPersisted) { this.emitStateChange(chatId); return }
     const chat = this.store.requireChat(chatId)
     const provider = this.resolveProvider(queuedMessage, chat.provider)
-    if (provider === "codex")
-      await this.assertCodexHistoryReady(chatId)
-    const alreadyPersisted = this.store.hasUserPrompt(chatId, queuedMessage.id)
-    await this.store.removeQueuedMessage(chatId, queuedMessage.id)
-    if (alreadyPersisted) {
-      this.emitStateChange(chatId)
-      return
-    }
     const settings = this.getProviderSettings(provider, queuedMessage, chat)
     await this.startTurnForChat({
       chatId,
