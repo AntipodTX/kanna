@@ -14,6 +14,7 @@
 
 ### Fixes
 
+- Support reliable native Codex same-turn steering across the chat lifecycle.
 - Suppress stale Claude terminal results after steering.
 - Correct Claude chat lifecycle state after agent activity.
 - Avoid Codex thread initialization with an empty thread ID.

@@ -1,7 +1,7 @@
 import type { QueuedChatMessage } from "../../../shared/types"
 import { Button } from "../ui/button"
 import { TranscriptMarkdown } from "./shared"
-import { UserMessageAttachments } from "./UserMessage"
+import { UserMessage, UserMessageAttachments } from "./UserMessage"
 import { ArrowUp, X } from "lucide-react"
 
 interface QueuedUserMessageProps {
@@ -11,6 +11,18 @@ interface QueuedUserMessageProps {
 }
 
 export function QueuedUserMessage({ message, onRemove, onSendNow }: QueuedUserMessageProps) {
+  if (message.steering) {
+    return (
+      <div className="py-2">
+        <UserMessage
+          content={message.content}
+          attachments={message.attachments}
+          steered
+        />
+      </div>
+    )
+  }
+
   return (
     <div className="flex flex-col items-end gap-2 py-2">
       <UserMessageAttachments attachments={message.attachments} />

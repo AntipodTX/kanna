@@ -540,6 +540,12 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
     latestToolIds,
   }), [isProcessing, latestToolIds, localPath, messages])
   const resolvedRows = useStableResolvedRows(rawRows)
+  const visibleQueuedMessages = useMemo(() => {
+    // A steering prompt is persisted before native confirmation removes its
+    // queue row. Keep the durable queue, but render that input only once.
+    const promptIds = new Set(messages.filter(message => message.kind === "user_prompt" && !message.hidden).map(message => message.id))
+    return queuedMessages.filter(message => !message.steering || !promptIds.has(message.id))
+  }, [messages, queuedMessages])
 
   useEffect(() => {
     setToolGroupExpanded({})
@@ -1172,7 +1178,7 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
   const listFooter = (
     <div className="mx-auto w-full max-w-[816px] px-2">
       {isProcessing ? <ProcessingMessage status={runtimeStatus ?? undefined} /> : null}
-      {queuedMessages.map((message) => (
+      {visibleQueuedMessages.map((message) => (
         <QueuedUserMessage
           key={message.id}
           message={message}
