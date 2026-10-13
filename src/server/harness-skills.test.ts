@@ -2,25 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import {
-  appendSystemMessageBlock,
-  buildSkillSystemMessage,
-  collectAncestorDirsToRepoRoot,
-  dedupeSkillsByName,
-  findNestedSkillRoots,
-  findSkillByName,
-  findSkillMentions,
-  listGlobalSkills,
-  normalizeSkillDescription,
-  parseFrontmatter,
-  resolveSkillMentions,
-  scanClaudeSkills,
-  scanCodexSkills,
-  scanCommandsRoot,
-  scanCursorSkills,
-  scanGrokSkills,
-  scanSkillsRoot,
-} from "./harness-skills"
+import { appendSystemMessageBlock, buildSkillSystemMessage, collectAncestorDirsToRepoRoot, dedupeSkillsByName, findNestedSkillRoots, findSkillByName, findSkillMentions, listGlobalSkills, normalizeSkillDescription, parseFrontmatter, resolveSkillMentions, scanClaudeSkills, scanCodexSkills, scanCommandsRoot, scanCursorSkills, scanGrokSkills, scanSkillsRoot } from "./harness-skills"
 
 describe("findSkillMentions", () => {
   test("finds a leading invocation", () => {
