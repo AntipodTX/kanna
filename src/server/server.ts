@@ -57,9 +57,6 @@ import { StartupSyncProgress } from "./startup-sync"
 
 const MAX_UPLOAD_FILES = 50
 const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024
-const STALE_EMPTY_CHAT_PRUNE_INTERVAL_MS = 60 * 1000
-const STALE_CHAT_AUTO_ARCHIVE_INTERVAL_MS = 6 * 60 * 60 * 1000
-const STALE_CHAT_DELETE_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 type StartupRecoveryIncident = {
   kind: "snapshot" | "log"
@@ -421,56 +418,12 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     })
     .catch(() => undefined)
 
-  // Chat garbage collection, three tiers measured against the user's latest
-  // chat activity: empty drafts are hard-deleted after 5 idle minutes, chats
-  // 30+ days behind are auto-archived, and 90+ days behind are hard-deleted.
-  const runPruneStaleEmptyChats = () => {
-    void router.pruneStaleEmptyChats()
-      .then((prunedChatIds) => {
-        if (prunedChatIds.length > 0) {
-          return router.broadcastSnapshots()
-        }
-      })
-  }
-  const runAutoArchiveStaleChats = () => {
-    void router.autoArchiveStaleChats()
-      .then((archivedChatIds) => {
-        if (archivedChatIds.length > 0) {
-          return router.broadcastSnapshots()
-        }
-      })
-  }
-  const runDeleteStaleChats = () => {
-    void router.deleteStaleChats()
-      .then((deletedChatIds) => {
-        if (deletedChatIds.length > 0) {
-          return router.broadcastSnapshots()
-        }
-      })
-  }
-
-  // All three run once at startup — a long-idle instance gets cleaned
-  // immediately, not minutes or hours later. Lifecycle order: prune empties,
-  // hard-delete 90d+ (so they aren't pointlessly archived first), then
-  // archive 30d+. One broadcast at the end covers all changes.
-  const runStartupGc = async () => {
-    const pruned = await router.pruneStaleEmptyChats().catch(() => [])
-    const deleted = await router.deleteStaleChats().catch(() => [])
-    const archived = await router.autoArchiveStaleChats().catch(() => [])
-    if (pruned.length + deleted.length + archived.length > 0) {
-      await router.broadcastSnapshots()
-    }
-  }
+  const runStartupGc = async () => {}
   await shellPathReady
   // Start cleanup in the background. Interrupted turns are considered only
   // after both this sweep and the optional external-session sync finish.
   const startupGcDone = runStartupGc()
 
-  // Then keep sweeping for the lifetime of the (potentially months-long)
-  // process: empties every minute, deletes daily, archives every 6 hours.
-  const staleEmptyChatPruneInterval = setInterval(runPruneStaleEmptyChats, STALE_EMPTY_CHAT_PRUNE_INTERVAL_MS)
-  const staleChatAutoArchiveInterval = setInterval(runAutoArchiveStaleChats, STALE_CHAT_AUTO_ARCHIVE_INTERVAL_MS)
-  const staleChatDeleteInterval = setInterval(runDeleteStaleChats, STALE_CHAT_DELETE_INTERVAL_MS)
   worktreeProbe.start()
   projectIcons.start()
   // Claims recorded before base blobs never expire on their own, so a chat
@@ -901,9 +854,6 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     // A runtime handed in by the CLI is stopped by the CLI; one this process
     // attached at pair time is ours to take down.
     await selfPairedCloud?.stop()
-    clearInterval(staleEmptyChatPruneInterval)
-    clearInterval(staleChatAutoArchiveInterval)
-    clearInterval(staleChatDeleteInterval)
     worktreeProbe.stop()
     projectIcons.stop()
     await startupSyncDone

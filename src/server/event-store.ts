@@ -429,9 +429,10 @@ export class EventStore {
 
   /**
    * Chat metadata derived from transcript entries (lastMessageAt, hasMessages,
-   * message previews) is applied in memory on append and only persisted when a
-   * snapshot compaction runs. Rebuild it from the transcript files on boot so
-   * restarts between compactions don't regress it.
+   * message previews) is normally applied in memory on append and persisted by
+   * snapshot compaction. Transcript replacements additionally persist an exact
+   * metadata event. Rebuild from the files on boot as a fallback for appends
+   * made after the latest snapshot or replacement event.
    *
    * Only the tail of each transcript is read, which is enough for the common
    * case and bounded regardless of how large a conversation grows — but a chat

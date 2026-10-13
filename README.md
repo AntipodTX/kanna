@@ -15,6 +15,7 @@
 ### Fixes
 
 - Preserve chat history when local storage is corrupt.
+- Keep all chats, including empty drafts and old archived conversations, until explicitly archived or deleted. No automatic chat cleanup runs at startup, on a timer, or when serving snapshots.
 - Support reliable native Codex same-turn steering across the chat lifecycle.
 - Suppress stale Claude terminal results after steering.
 - Correct Claude chat lifecycle state after agent activity.
