@@ -2887,11 +2887,11 @@ export class AgentCoordinator {
       && (!this.activeTurns.has(session.chatId) || this.activeTurns.get(session.chatId)?.provider === "claude")
     try {
       for await (const event of session.session.stream) {
-        if (!isCurrentClaudeSession()) continue
+        if (!isCurrentClaudeSession()) break
         if (event.type === "session_token" && event.sessionToken) {
           session.sessionToken = event.sessionToken
           await this.store.setSessionToken(session.chatId, event.sessionToken)
-          if (!isCurrentClaudeSession()) continue
+          if (!isCurrentClaudeSession()) break
           this.emitStateChange(session.chatId)
           continue
         }
@@ -2916,9 +2916,10 @@ export class AgentCoordinator {
           && completedPromptSeqs.every((seq) => session.cancelledPromptSeqs.has(seq))
         if (!isCancelledPromptErrorResult) {
           await this.store.appendMessage(session.chatId, event.entry)
+        if (!isCurrentClaudeSession()) break
         }
 
-        if (!isCurrentClaudeSession()) continue
+        if (!isCurrentClaudeSession()) break
 
         // Background wakeups (Monitor, Cron*, ScheduleWakeup, RemoteTrigger)
         // emit new activity after the previous turn completed. Re-register an
