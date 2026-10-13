@@ -2206,6 +2206,7 @@ export class AgentCoordinator {
     onProviderReady?: (isCurrentTurn: () => boolean, outcome: HarnessStartupOutcome) => Promise<void>
     startupReservation?: symbol
     expectedCodexSessionToken?: string
+    restorationEntries?: readonly TranscriptEntry[]
   }) {
 
     if (this.activeCodexCommands.has(args.chatId)) throw new Error("A Codex command is already running")
@@ -2820,8 +2821,6 @@ export class AgentCoordinator {
         if (!args.isCurrentTurn()) return null
         throw error
       }
-      // A cancelled startup owns this handle, not the chat's next session.
-      // Close it before registering its stream or persisting any session token.
       if (!args.isCurrentTurn()) {
         await this.interruptAndCloseTurn(started)
         return null
