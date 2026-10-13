@@ -11,7 +11,7 @@ import { tmpdir } from "node:os"
 import type { TranscriptEntry } from "../shared/types"
 import type { SnapshotFile } from "./events"
 import { EventStore } from "./event-store"
-import { deriveLocalProjectsSnapshot } from "./read-models"
+import { deriveLocalProjectsSnapshot, SIDEBAR_ACTIVITY_RESOLUTION_MS } from "./read-models"
 
 const originalRuntimeProfile = process.env.KANNA_RUNTIME_PROFILE
 const tempDirs: string[] = []
@@ -1922,12 +1922,12 @@ describe("stateVersion", () => {
     const project = await store.openProject(dataDir, "proj")
     const chat = await store.createChat(project.id)
 
-    const at = Date.now()
+    const at = Math.floor(Date.now() / SIDEBAR_ACTIVITY_RESOLUTION_MS) * SIDEBAR_ACTIVITY_RESOLUTION_MS
     await store.appendMessage(chat.id, entry("user_prompt", at, { content: "go" }))
 
     const before = store.stateVersion
     for (let i = 0; i < 20; i++) {
-      // 20ms apart, so every one lands in the same 15s quantization bucket.
+      // This fixture starts at the aligned activity bucket boundary.
       await store.appendMessage(chat.id, entry("assistant_text", at + 100 + i * 20, { text: `step ${i}` }))
     }
     // The first one moves lastAgentMessageAt into a bucket; the rest are free.
