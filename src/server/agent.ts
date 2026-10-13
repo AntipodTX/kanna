@@ -1,4 +1,4 @@
-import { CodexPromptHistory, classifyCodexPromptHistory, planCodexPromptHistory, planCodexGapReplay, type CodexPromptBinding, type CodexPromptRecovery } from "./codex-prompt-history"
+import { CodexPromptHistory, classifyCodexPromptHistory, nativePromptMatches, planCodexPromptHistory, planCodexGapReplay, type CodexPromptBinding, type CodexPromptRecovery } from "./codex-prompt-history"
 import {
   query,
   type BackgroundTaskSummary,
@@ -181,6 +181,7 @@ interface ActiveTurn {
   provider: AgentProvider
   turn: HarnessTurn | null
   startupPending?: boolean
+  redeliveringPromptId?: string
   startupAbort?: AbortController
   toolsReady?: Promise<void>
   claudePromptSeq?: number
@@ -1243,14 +1244,22 @@ export class AgentCoordinator {
 
   constructor(args: AgentCoordinatorArgs) {
     this.store = args.store
-    this.codexPromptHistory = new CodexPromptHistory(args.store.dataDir, (chatId, binding) => {
+    this.codexPromptHistory = new CodexPromptHistory(args.store.dataDir, (chatId, binding, promptId) => {
       const key = this.codexIntegrityKey(chatId)
       const owner = this.activeTurns.get(chatId)
       return async () => {
         const chat = this.store.requireChat(chatId)
         if (this.codexIntegrityKey(chatId) !== key || this.activeTurns.get(chatId) !== owner
           || owner?.cancelRequested || (chat.sessionToken ?? chat.pendingForkSessionToken) !== binding.sessionToken) return
-        await this.saveCodexIntegrity(chatId)
+        const segment = chat.codexHistoryIntegrity?.segments?.[binding.sessionToken]
+        if (segment?.messages?.[promptId]) {
+          const messages = { ...segment.messages }
+          delete messages[promptId]
+          const nextMissing = segment.ids.find(id => messages[id])
+          const gap = nextMissing ? { messageId: nextMissing, error: "Message correspondence is unresolved" } : undefined
+          await this.saveCodexIntegrity(chatId, gap, { messages,
+            classification: { sessionToken: binding.sessionToken, ids: segment.ids } })
+        } else await this.saveCodexIntegrity(chatId)
       }
     })
     this.onStateChange = args.onStateChange
@@ -1840,39 +1849,86 @@ export class AgentCoordinator {
     }
   }
 
-  private async dequeueAndStartQueuedMessage(chatId: string, queuedMessage: QueuedChatMessage, options?: { steered?: boolean }) {
-    const alreadyPersisted = this.store.hasUserPrompt(chatId, queuedMessage.id)
-    if (this.resolveProvider(queuedMessage, this.store.requireChat(chatId).provider) === "codex" && !alreadyPersisted)
-      await this.assertCodexHistoryReady(chatId)
-    await this.store.removeQueuedMessage(chatId, queuedMessage.id)
-    if (alreadyPersisted) { this.emitStateChange(chatId); return }
+  private async codexPromptDelivery(chatId: string, messageId: string) {
+    const recovered = await this.codexHistoryBindings(chatId, { recover: true, messageId }, this.activeTurns.get(chatId))
+    if (recovered.bindings[messageId]?.sessionToken === this.store.requireChat(chatId).sessionToken) return "delivered"
+    if (recovered.messages[messageId] === "missing") return "missing"
+    throw new Error("Codex message delivery cannot be confirmed; retry after its history can be checked")
+  }
+
+  private async dequeueAndStartQueuedMessage(chatId: string, queuedMessage: QueuedChatMessage, options?: { steered?: boolean; retryPersisted?: boolean }) {
     const chat = this.store.requireChat(chatId)
     const provider = this.resolveProvider(queuedMessage, chat.provider)
-    const settings = this.getProviderSettings(provider, queuedMessage, chat)
-    await this.startTurnForChat({
-      chatId,
-      provider,
-      content: queuedMessage.content,
-      attachments: queuedMessage.attachments,
-      model: settings.model,
-      effort: settings.effort,
-      serviceTier: settings.serviceTier,
-      planMode: settings.planMode,
-      autoPlan: settings.autoPlan,
-      modelSettings: { model: settings.chatModel, modelOptions: settings.chatModelOptions },
-      appendUserPrompt: true,
-      steered: options?.steered,
-    })
+    const start = async (startupReservation?: symbol) => {
+      if (startupReservation && this.startingClaudeTurns.get(chatId) !== startupReservation) return
+      const alreadyPersisted = this.store.hasUserPrompt(chatId, queuedMessage.id)
+      if (provider === "codex") {
+        if (alreadyPersisted) {
+          const delivery = await this.codexPromptDelivery(chatId, queuedMessage.id)
+          if (delivery === "delivered") {
+            if (this.store.getQueuedMessage(chatId, queuedMessage.id))
+              await this.store.removeQueuedMessage(chatId, queuedMessage.id)
+            this.emitStateChange(chatId)
+            return
+          }
+          if (!options?.retryPersisted) return
+        } else await this.assertCodexHistoryReady(chatId)
+      } else {
+        await this.store.removeQueuedMessage(chatId, queuedMessage.id)
+        if (alreadyPersisted) { this.emitStateChange(chatId); return }
+      }
+      const prompt = alreadyPersisted ? this.store.getPromptHistoryEntries(chatId)
+        .find(entry => entry.kind === "user_prompt" && entry._id === queuedMessage.id) : undefined
+      const settings = this.getProviderSettings(provider, queuedMessage, chat)
+      if (provider === "codex" && alreadyPersisted && chat.sessionToken) {
+        const tail = this.store.getTranscriptLength(chatId) - 1
+        const boundary = this.store.getEntryIdAt(chatId,
+          tail - (this.store.getEntryIdAt(chatId, tail) === queuedMessage.id ? 1 : 0))
+        await this.codexPromptHistory.beginRedelivery(chatId, queuedMessage.id, chat.sessionToken, boundary)
+      }
+      await this.startTurnForChat({
+        chatId,
+        provider,
+        content: queuedMessage.content,
+        attachments: queuedMessage.attachments,
+        model: settings.model,
+        effort: settings.effort,
+        serviceTier: settings.serviceTier,
+        planMode: settings.planMode,
+        autoPlan: settings.autoPlan,
+        modelSettings: { model: settings.chatModel, modelOptions: settings.chatModelOptions },
+        appendUserPrompt: true,
+        moveUserPromptOnAcceptance: provider === "codex" && alreadyPersisted,
+        ...(provider === "codex" ? { userPromptEntry: prompt?.kind === "user_prompt" ? prompt : {
+          ...timestamped({ kind: "user_prompt", content: queuedMessage.content, attachments: queuedMessage.attachments,
+            steered: options?.steered }), _id: queuedMessage.id,
+        } as Extract<TranscriptEntry, { kind: "user_prompt" }> } : {}),
+        steered: options?.steered,
+        startupReservation,
+      })
+      if (provider === "codex") {
+        // Cancellation can finish startup without accepting the queued input.
+        const accepted = (await this.codexPromptHistory.read(chatId)).prompts[queuedMessage.id]
+        if (!this.store.hasUserPrompt(chatId, queuedMessage.id)
+          || accepted?.sessionToken !== this.store.requireChat(chatId).sessionToken) return
+        if (alreadyPersisted) await this.codexPromptHistory.finishRedelivery(chatId, queuedMessage.id)
+        if (this.store.getQueuedMessage(chatId, queuedMessage.id))
+          await this.store.removeQueuedMessage(chatId, queuedMessage.id)
+        this.emitStateChange(chatId)
+      }
+    }
+    if (provider === "claude") await this.withClaudeStartupReservation(chatId, start)
+    else await start()
   }
 
   private async maybeStartNextQueuedMessage(chatId: string) {
-    if (this.activeTurns.has(chatId) || this.hasPendingCodexSteer(chatId) || this.startingClaudeTurns.has(chatId)) return false
-    const nextQueuedMessage = typeof this.store.getQueuedMessages === "function"
-      ? this.store.getQueuedMessages(chatId)[0]
-      : undefined
-    if (!nextQueuedMessage) return false
-    await this.dequeueAndStartQueuedMessage(chatId, nextQueuedMessage)
-    return true
+    if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId) || this.hasPendingCodexSteer(chatId)) return false
+    const queued = typeof this.store.getQueuedMessages === "function" ? this.store.getQueuedMessages(chatId) : []
+    for (const message of queued) {
+      await this.dequeueAndStartQueuedMessage(chatId, message)
+      if (this.activeTurns.has(chatId)) return true
+    }
+    return false
   }
 
   /**
@@ -2000,6 +2056,8 @@ export class AgentCoordinator {
       modelOptions: ModelOptions
     }
     appendUserPrompt: boolean
+    userPromptEntry?: Extract<TranscriptEntry, { kind: "user_prompt" }>
+    moveUserPromptOnAcceptance?: boolean
     steered?: boolean
     sessionToken?: string | null
     pendingForkSessionToken?: string | null
@@ -2039,6 +2097,7 @@ export class AgentCoordinator {
       planMode: args.planMode, autoPlan: args.autoPlan, status: "starting",
       pendingTool: null, postToolFollowUp: null, hasFinalResult: false,
       cancelRequested: false, cancelRecorded: false, startupPending: true, startupAbort: new AbortController(),
+      redeliveringPromptId: args.moveUserPromptOnAcceptance ? args.userPromptEntry?._id : undefined,
     }
     this.activeTurns.set(args.chatId, active)
     this.startingClaudeTurns.delete(args.chatId)
@@ -2100,12 +2159,19 @@ export class AgentCoordinator {
       active.contextRestorationId = restoration.id
     }
 
-    let userPromptEntry: TranscriptEntry | null = null
-    let userPromptWritten = false
+    let userPromptEntry: TranscriptEntry | null = args.userPromptEntry ?? null
+    let userPromptWritten = Boolean(userPromptEntry && this.store.hasUserPrompt(args.chatId, userPromptEntry._id))
     let nativePromptBoundary: string | null | undefined
     let turnStartedRecorded = false
     const writeUserPrompt = async () => {
-      if (!args.appendUserPrompt || userPromptWritten) return
+      if (!args.appendUserPrompt) return
+      if (userPromptWritten) {
+        if (args.moveUserPromptOnAcceptance && userPromptEntry) {
+          await writeOwned(() => this.store.moveUserPromptToEnd(args.chatId, userPromptEntry!._id))
+          args.moveUserPromptOnAcceptance = false
+        }
+        return
+      }
       assertCurrent()
       userPromptEntry ??= timestamped({ kind: "user_prompt", content: args.content, attachments: args.attachments, steered: args.steered }, Date.now())
       nativePromptBoundary = args.replaceTranscriptPrefix
@@ -2363,7 +2429,9 @@ export class AgentCoordinator {
         const nativeBoundary = args.replaceTranscriptPrefix
           ? args.replaceTranscriptPrefix.at(-1)?._id ?? null
           : nativePromptBoundary !== undefined ? nativePromptBoundary
-            : this.store.getEntryIdAt(args.chatId, this.store.getTranscriptLength(args.chatId) - 1)
+            : this.store.getEntryIdAt(args.chatId, this.store.getTranscriptLength(args.chatId)
+              - (args.moveUserPromptOnAcceptance && userPromptEntry?._id ===
+                this.store.getEntryIdAt(args.chatId, this.store.getTranscriptLength(args.chatId) - 1) ? 2 : 1))
         if (args.appendUserPrompt) userPromptEntry ??= timestamped({
           kind: "user_prompt", content: args.content, attachments: args.attachments, steered: args.steered,
         })
@@ -2858,9 +2926,50 @@ export class AgentCoordinator {
       segments, messages: current?.messages, gap: current?.gap, invalidated: current?.invalidated })
   }
 
+  private async recoverCodexRedeliveries(chatId: string, checkingOwner?: ActiveTurn) {
+    const records = await this.codexPromptHistory.read(chatId)
+    for (const [id, attempt] of Object.entries(records.redeliveries ?? {})) {
+      const active = this.activeTurns.get(chatId)
+      if (id === active?.redeliveringPromptId) continue
+      if (this.startingClaudeTurns.has(chatId) || (active?.startupPending && active !== checkingOwner)
+        || this.hasPendingCodexSteer(chatId, id)) continue
+      const chat = this.store.requireChat(chatId)
+      if (chat.sessionToken !== attempt.sessionToken) continue
+      const prompt = this.store.getPromptHistoryEntries(chatId).find(entry => entry._id === id)
+      if (prompt?.kind !== "user_prompt") throw new Error("Saved answer is no longer present in the chat")
+      const owner = this.activeTurns.get(chatId)
+      const native = await this.codexManager.readPromptHistory({
+        cwd: this.store.getProject(chat.projectId)!.localPath, threadId: attempt.sessionToken,
+      })
+      if (this.activeTurns.get(chatId) !== owner || this.store.requireChat(chatId).sessionToken !== attempt.sessionToken)
+        throw new Error("Chat changed while checking saved answer delivery")
+      const inputs = native.inputs.filter(input => input.promptId === id)
+      if (inputs.length > 1 || (inputs[0] && !nativePromptMatches(inputs[0].text, prompt)))
+        throw new Error("Codex saved answer delivery is ambiguous")
+      if (!inputs.length && native.inputs.some(input => !input.promptId && nativePromptMatches(input.text, prompt)))
+        throw new Error("Codex saved answer delivery cannot be confirmed without its message identifier")
+      const input = inputs[0]
+      if (input) {
+        await this.store.moveUserPromptToEnd(chatId, id)
+        if (input.userIndex === 0) await this.codexPromptHistory.recordTurn(chatId,
+          attempt.sessionToken, input.turnId, attempt.boundaryEntryId)
+        const boundary = input.userIndex === 0 ? attempt.boundaryEntryId
+          : records.turns[`${attempt.sessionToken}:${input.turnId}`]?.boundaryEntryId
+        await this.codexPromptHistory.recordPrompt(chatId, id, {
+          sessionToken: attempt.sessionToken, turnId: input.turnId, mergeTurn: input.userIndex > 0,
+          ...(boundary !== undefined ? { boundaryEntryId: boundary } : {}),
+        })
+        if (this.store.getQueuedMessage(chatId, id)) await this.store.removeQueuedMessage(chatId, id)
+      }
+      await this.codexPromptHistory.finishRedelivery(chatId, id)
+      this.emitStateChange(chatId)
+    }
+  }
+
   private async codexHistoryBindings(chatId: string, options: {
     recover?: boolean; messageId?: string; retry?: boolean; force?: boolean; sessionToken?: string
   } = {}, owner?: ActiveTurn) {
+    await this.recoverCodexRedeliveries(chatId, owner)
     const chat = this.store.requireChat(chatId)
     const currentSessionToken = chat.sessionToken ?? chat.pendingForkSessionToken ?? null
     const entries = this.store.getPromptHistoryEntries(chatId), key = this.codexIntegrityKey(chatId)
@@ -3008,6 +3117,7 @@ export class AgentCoordinator {
   }
 
   private async assertCodexHistoryReady(chatId: string, owner?: ActiveTurn) {
+    await this.recoverCodexRedeliveries(chatId, owner)
     const chat = this.store.requireChat(chatId)
     if (chat.provider !== "codex" && chat.contextRestoration?.provider !== "codex") return
     const integrity = chat.codexHistoryIntegrity
@@ -3475,8 +3585,15 @@ export class AgentCoordinator {
             // exits after transcript persistence but before queue removal.
             _id: queuedMessage.id,
           } as Extract<TranscriptEntry, { kind: "user_prompt" }>
+          const persistedRetry = this.store.hasUserPrompt(command.chatId, queuedMessage.id)
           try {
-            await this.store.appendMessage(command.chatId, transcriptEntry)
+            if (persistedRetry) {
+              if (await this.codexPromptDelivery(command.chatId, queuedMessage.id) === "delivered") {
+                await this.store.removeQueuedMessage(command.chatId, queuedMessage.id)
+                this.emitStateChange(command.chatId)
+                return
+              }
+            } else await this.store.appendMessage(command.chatId, transcriptEntry)
             this.emitStateChange(command.chatId)
           } catch (error) {
             historyFailed = true
@@ -3484,6 +3601,12 @@ export class AgentCoordinator {
             throw error
           }
           if (this.activeTurns.get(command.chatId) !== active || active.cancelRequested) return
+          if (persistedRetry && chat.sessionToken) {
+            const tail = this.store.getTranscriptLength(command.chatId) - 1
+            await this.codexPromptHistory.beginRedelivery(command.chatId, queuedMessage.id, chat.sessionToken,
+              this.store.getEntryIdAt(command.chatId, tail
+                - (this.store.getEntryIdAt(command.chatId, tail) === queuedMessage.id ? 1 : 0)))
+          }
           let steer: ReturnType<CodexAppServerManager["startSteerTurn"]>
           try {
             steer = this.codexManager.startSteerTurn({
@@ -3510,10 +3633,12 @@ export class AgentCoordinator {
               accepted = true
               await steer.settled
               transcriptPersisted = true
+              if (persistedRetry) await this.store.moveUserPromptToEnd(command.chatId, queuedMessage.id)
               if (!chat.sessionToken) throw new Error("Accepted Codex input has no session token")
               await this.codexPromptHistory.recordPrompt(command.chatId, queuedMessage.id, {
                 sessionToken: chat.sessionToken, turnId: expectedTurnId, mergeTurn: true,
               })
+              if (persistedRetry) await this.codexPromptHistory.finishRedelivery(command.chatId, queuedMessage.id)
               if (this.store.getQueuedMessage(command.chatId, queuedMessage.id)) {
                 await this.store.removeQueuedMessage(command.chatId, queuedMessage.id)
                 this.emitStateChange(command.chatId)
@@ -3524,7 +3649,7 @@ export class AgentCoordinator {
               if (accepted) {
                 // A failed transcript write leaves the only durable copy in the
                 // queue. A persisted prompt is recovered by its stable queue ID.
-                if (transcriptPersisted && this.store.getQueuedMessage(command.chatId, queuedMessage.id))
+                if (!persistedRetry && transcriptPersisted && this.store.getQueuedMessage(command.chatId, queuedMessage.id))
                   await this.store.removeQueuedMessage(command.chatId, queuedMessage.id)
               }
               const message = error instanceof Error ? error.message : String(error)
@@ -3567,7 +3692,7 @@ export class AgentCoordinator {
       throw new Error("Chat is still running")
     }
 
-    await this.dequeueAndStartQueuedMessage(command.chatId, queuedMessage, { steered: true })
+    await this.dequeueAndStartQueuedMessage(command.chatId, queuedMessage, { steered: true, retryPersisted: true })
   }
 
   async dequeue(command: Extract<ClientCommand, { type: "message.dequeue" }>) {
@@ -4634,8 +4759,8 @@ export class AgentCoordinator {
     if (chat.provider !== "codex") throw new Error("This question belongs to a Codex chat")
     if (chat.sessionToken !== entry.tool.input.codexAsync.threadId) throw new Error("This question belongs to a different Codex session")
     const answers = asRecord(asRecord(command.result)?.answers)
-    const sent = new Map(entries.flatMap(entry => entry.kind === "user_prompt" ? parseCodexQuestionReplies(entry.content) : [])
-      .map(reply => [reply.questionItemId, reply.answer]))
+    const saved = new Map(entries.flatMap(entry => entry.kind === "user_prompt" && !entry.hidden && !entry.parentToolUseId
+      ? parseCodexQuestionReplies(entry.content).map(reply => [reply.questionItemId, { answer: reply.answer, entry }] as const) : []))
     const queued = this.store.getQueuedMessages(command.chatId)
     const queuedReplies = new Map(queued.flatMap(message => parseCodexQuestionReplies(message.content)
       .map(reply => [reply.questionItemId, { answer: reply.answer, message }] as const)))
@@ -4644,14 +4769,32 @@ export class AgentCoordinator {
     for (const question of entry.tool.input.questions) {
       const id = question.id!
       const raw = answers?.[id]
-      if (raw === undefined && sent.has(id)) continue
+      if (raw === undefined && saved.has(id)) continue
       if (!Array.isArray(raw) || raw.length !== 1 || typeof raw[0] !== "string" || !raw[0].trim()) {
         throw new Error("Choose or enter an answer for each question")
       }
       const answer = raw[0].trim()
-      const previous = sent.get(id) ?? queuedReplies.get(id)?.answer
+      const previous = saved.get(id)?.answer ?? queuedReplies.get(id)?.answer
       if (previous !== undefined && previous !== answer) throw new Error("An answer to this question has already been submitted")
-      if (sent.has(id)) continue
+      const existing = saved.get(id)
+      if (existing) {
+        if (this.hasPendingCodexSteer(command.chatId, existing.entry._id)) continue
+        const delivery = await this.codexPromptDelivery(command.chatId, existing.entry._id)
+        if (this.store.requireChat(command.chatId).sessionToken !== entry.tool.input.codexAsync.threadId)
+          throw new Error("This question belongs to a different Codex session")
+        if (delivery === "delivered") {
+          if (this.store.getQueuedMessage(command.chatId, existing.entry._id))
+            await this.store.removeQueuedMessage(command.chatId, existing.entry._id)
+          continue
+        }
+        if (!this.store.getQueuedMessage(command.chatId, existing.entry._id)) {
+          await this.store.enqueueMessage(command.chatId, { id: existing.entry._id, content: existing.entry.content,
+            attachments: existing.entry.attachments ?? [], provider: "codex", planMode: chat.planMode, autoPlan: chat.autoPlan })
+          this.emitStateChange(command.chatId)
+        }
+        queuedIds.add(existing.entry._id)
+        continue
+      }
       const pending = queuedReplies.get(id)
       if (pending) queuedIds.add(pending.message.id)
       else replies.push({ questionItemId: id, question: question.question, answer })
@@ -4667,7 +4810,12 @@ export class AgentCoordinator {
       const active = this.activeTurns.get(command.chatId)
       // Never take the generic cancel/restart route for an asynchronous answer.
       // A starting turn or a blocking tool will drain this durable input later.
-      if (active && (active.provider !== "codex" || !active.turn?.providerTurnId || active.pendingTool || active.cancelRequested)) continue
+      if (this.startingClaudeTurns.has(command.chatId)
+        || (active && (active.provider !== "codex" || !active.turn?.providerTurnId || active.pendingTool || active.cancelRequested))) {
+        if (this.store.hasUserPrompt(command.chatId, queuedMessageId))
+          throw new Error("Codex is starting or waiting for a tool; retry your saved answer after it is ready")
+        continue
+      }
       try {
         await this.steer({ type: "message.steer", chatId: command.chatId, queuedMessageId })
       } catch (error) {

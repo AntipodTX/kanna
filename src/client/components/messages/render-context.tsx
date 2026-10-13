@@ -4,6 +4,7 @@ import type { StandaloneTranscriptAttachmentMode } from "../../../shared/types"
 export interface TranscriptRenderOptions {
   historyActions: Record<string, "ordinary" | "merge-turn" | "recover">
   historyMessages: Record<string, "missing" | "unknown">
+  queuedMessageIds: string[]
   resolveHistoryAction: ((messageId: string) => Promise<boolean>) | null
   historyActionsLoading: boolean
   historyActionsError: string | null
@@ -27,6 +28,7 @@ export interface TranscriptRenderOptions {
 const DEFAULT_RENDER_OPTIONS: TranscriptRenderOptions = {
   historyActions: {},
   historyMessages: {},
+  queuedMessageIds: [],
   resolveHistoryAction: null,
   historyActionsLoading: false,
   historyActionsError: null,

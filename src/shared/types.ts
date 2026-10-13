@@ -1731,7 +1731,7 @@ export interface AskUserQuestionToolCall
   extends ToolCallBase<"ask_user_question", {
     questions: AskUserQuestionItem[]
     /** A non-blocking Codex message, answered by ordinary user input. */
-    codexAsync?: { threadId: string }
+    codexAsync?: { threadId: string; replyMessageIds?: Record<string, string> }
   }> { }
 
 export interface ExitPlanModeToolCall

@@ -4,7 +4,7 @@ import type { SessionArtifactStatus } from "./session-artifacts"
 import type { ChatAttachment, TranscriptEntry, AgentProvider } from "../shared/types"
 import type { SubagentActivityUpdate } from "./background-tasks"
 import type { HarnessTurn } from "./harness-types"
-import { CodexPromptHistory } from "./codex-prompt-history"
+import { CodexPromptHistory, planCodexPromptHistory } from "./codex-prompt-history"
 import { EventStore } from "./event-store"
 import { afterAll, describe, expect, test } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
@@ -2436,7 +2436,6 @@ describe("AgentCoordinator codex integration", () => {
     expect(startTurnCalls[0]?.content).not.toContain("already accepted follow up")
   })
 
-
   test("uses the restart fallback while a Codex plan response is pending", async () => {
     const streams: AsyncEventQueue<any>[] = []
     const startTurnCalls: Array<{ content: string }> = []
@@ -2465,9 +2464,7 @@ describe("AgentCoordinator codex integration", () => {
             turnId: `native-${i}`, promptId: e._id, text: (e as { content: string }).content, userIndex: 0,
           })) }
         },
-        async startSession() {
-          return "thread-1"
-        },
+        async startSession() { return codexStartResult("thread-1") },
         async startTurn(args: {
           content: string
           onToolRequest: (request: any) => Promise<unknown>
@@ -5882,6 +5879,10 @@ function createFakeStore(options?: {
       this.messages = [...entries]
       ;(requireChat(_chatId) as any).promptHistoryRevision = crypto.randomUUID()
     },
+    async moveUserPromptToEnd(chatId: string, messageId: string) {
+      const prompt = this.messages.find(entry => entry._id === messageId)!
+      await this.replaceTranscript(chatId, [...this.messages.filter(entry => entry._id !== messageId), prompt])
+    },
     async recordTurnStarted(
       _chatId: string,
       _model?: string,
@@ -7404,9 +7405,11 @@ describe("Codex async question answers", () => {
     const steers: string[] = []
     let interrupts = 0
     const nativeInputs: Array<{ turnId: string; promptId: string; text: string; userIndex: number }> = []
+    let historyReads = 0
+    store.recordTurnFailed = async () => {}
     const manager = {
       stopSession() {}, stopAll() {},
-      async readPromptHistory() { return { inputs: nativeInputs } },
+      async readPromptHistory() { historyReads++; return { inputs: nativeInputs } },
       async startSession() { return { sessionToken: "thread-1", resumeFellBack: false } },
       async startTurn(args: { content: string; clientUserMessageId: string }): Promise<HarnessTurn> {
         starts.push(args.content)
@@ -7418,6 +7421,8 @@ describe("Codex async question answers", () => {
       },
       startSteerTurn(args: { content: string; transcriptEntry: TranscriptEntry }) {
         steers.push(args.content)
+        nativeInputs.push({ turnId: `turn-${starts.length}`, promptId: args.transcriptEntry._id,
+          text: args.content, userIndex: nativeInputs.filter(input => input.turnId === `turn-${starts.length}`).length })
         const settled = new Promise<void>((resolve, reject) => streams.at(-1)!.push({
           type: "transcript", entry: args.transcriptEntry, onPersisted: (error?: Error) => error ? reject(error) : resolve(),
         }))
@@ -7428,7 +7433,8 @@ describe("Codex async question answers", () => {
       checkSessionArtifact: () => "present" })
     const command = { type: "chat.respondTool" as const, chatId: "chat-1", toolUseId: tool.toolId,
       result: { questions: [{ question: "Forged title" }], answers: { [tool.input.questions[0]!.id!]: ["All"] } } }
-    return { store, tool, coordinator, command, starts, steers, manager, streams, interrupts: () => interrupts }
+    return { store, tool, coordinator, command, starts, steers, manager, streams, nativeInputs,
+      historyReads: () => historyReads, interrupts: () => interrupts }
   }
 
   test("starts an idle turn with a native answer and ignores duplicate submission after reload", async () => {
@@ -7484,6 +7490,309 @@ describe("Codex async question answers", () => {
       expect(f.store.getQueuedMessages()).toHaveLength(1)
       await f.coordinator.respondTool(f.command)
       expect(f.store.getQueuedMessages()).toHaveLength(1)
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test("preserves a rejected durable answer until an explicit retry after normal continuation", async () => {
+    const f = setup()
+    f.store.recordTurnFailed = async () => {}
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      const deliver = f.manager.startSteerTurn
+      f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
+      const queuedId = f.store.getQueuedMessages()[0]?.id
+      expect(queuedId).toBeDefined()
+      expect(f.interrupts()).toBeGreaterThan(0)
+      expect(f.store.messages.some(entry => entry._id === queuedId)).toBe(true)
+      expect(f.coordinator.activeTurns.has("chat-1")).toBe(false)
+      f.manager.startSteerTurn = deliver
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Next" })
+      f.streams.at(-1)!.close()
+      await waitFor(() => !f.coordinator.activeTurns.has("chat-1"))
+      expect(f.store.getQueuedMessages()[0]?.id).toBe(queuedId)
+      expect(f.steers).toHaveLength(0)
+      expect((await f.coordinator.getHistoryActions("chat-1")).gap?.messageId).toBe(queuedId)
+      const reads = f.historyReads()
+      await Promise.all([f.coordinator.respondTool(f.command), f.coordinator.respondTool(f.command)])
+      expect(f.starts).toHaveLength(3)
+      expect(parseCodexQuestionReplies(f.starts[2]!)[0]?.answer).toBe("All")
+      expect(f.nativeInputs.at(-1)?.promptId).toBe(queuedId)
+      expect(f.store.messages.filter(entry => entry._id === queuedId)).toHaveLength(1)
+      expect(f.store.getQueuedMessages()).toHaveLength(0)
+      expect((f.store.chat as import("./events").ChatRecord).codexHistoryIntegrity?.messages?.[queuedId!]).toBeUndefined()
+      expect(f.historyReads()).toBe(reads)
+      expect(f.store.messages.filter(entry => entry.kind === "user_prompt").map(entry => entry.content))
+        .toEqual(["Work", "Next", f.starts[2]!])
+      const bound = await (f.coordinator as any).codexPromptHistory.read("chat-1")
+      expect(planCodexPromptHistory(f.store.messages, queuedId!, bound.prompts).content).toBe(f.starts[2]!)
+      const checked = await (f.coordinator as any).codexHistoryBindings("chat-1", { recover: true, force: true },
+        f.coordinator.activeTurns.get("chat-1"))
+      expect(checked.messages).toEqual({})
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test("retries a rejected answer during a later running turn without a duplicate prompt", async () => {
+    const f = setup()
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      const deliver = f.manager.startSteerTurn
+      f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
+      const id = f.store.getQueuedMessages()[0]!.id
+      f.manager.startSteerTurn = deliver
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Next" })
+      const reads = f.historyReads()
+      await Promise.all([f.coordinator.respondTool(f.command), f.coordinator.respondTool(f.command)])
+      await waitFor(() => f.store.getQueuedMessages().length === 0)
+      expect(f.steers).toHaveLength(1)
+      expect(f.starts).toHaveLength(2)
+      expect(f.store.messages.filter(entry => entry._id === id)).toHaveLength(1)
+      expect(f.nativeInputs.at(-1)?.promptId).toBe(id)
+      expect((f.store.chat as import("./events").ChatRecord).codexHistoryIntegrity?.messages?.[id]).toBeUndefined()
+      expect(f.historyReads()).toBe(reads)
+      expect(f.store.messages.filter(entry => entry.kind === "user_prompt").map(entry => entry.content))
+        .toEqual(["Work", "Next", f.steers[0]!])
+      const bound = await (f.coordinator as any).codexPromptHistory.read("chat-1")
+      expect(planCodexPromptHistory(f.store.messages, id, bound.prompts).content).toBe("Next\n" + f.steers[0]!)
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test("retries a retained tail after restart with a boundary before the answer itself", async () => {
+    const f = setup()
+    let reloaded: AgentCoordinator | undefined
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
+      const id = f.store.getQueuedMessages()[0]!.id
+      // An abrupt exit can happen before the error result is persisted.
+      await f.store.replaceTranscript("chat-1", f.store.messages.slice(0,
+        f.store.messages.findIndex(entry => entry._id === id) + 1))
+      reloaded = new AgentCoordinator({ store: f.store as never, onStateChange: () => {}, codexManager: f.manager as never })
+      await reloaded.respondTool(f.command)
+      const bound = await (reloaded as any).codexPromptHistory.read("chat-1")
+      expect(bound.prompts[id].boundaryEntryId).not.toBe(id)
+      expect(planCodexPromptHistory(f.store.messages, id, bound.prompts).content).toBe(f.starts[1]!)
+    } finally { await reloaded?.cancel("chat-1"); await f.coordinator.cancel("chat-1") }
+  })
+
+  test("recovers an accepted answer with a failed binding write before deciding to resend", async () => {
+    const f = setup()
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      const history = (f.coordinator as any).codexPromptHistory
+      const record = history.recordPrompt.bind(history)
+      history.recordPrompt = async () => { throw new Error("binding EIO") }
+      await f.coordinator.respondTool(f.command)
+      await waitFor(() => !f.coordinator.activeTurns.has("chat-1"))
+      const answer = f.store.messages.find(entry => entry.kind === "user_prompt" && parseCodexQuestionReplies(entry.content).length)!
+      history.recordPrompt = record
+      const reloaded = new AgentCoordinator({ store: f.store as never, onStateChange: () => {}, codexManager: f.manager as never })
+      const reads = f.historyReads()
+      await reloaded.respondTool(f.command)
+      expect(f.historyReads()).toBe(reads + 1)
+      expect(f.steers).toHaveLength(1)
+      expect(f.starts).toHaveLength(1)
+      expect((await history.read("chat-1")).prompts[answer._id]).toBeDefined()
+      expect(f.store.messages.filter(entry => entry._id === answer._id)).toHaveLength(1)
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test.each([[false, false], [true, false], [false, true], [true, true]])("recovers an accepted retry before moving its saved prompt (live=%s, continuation=%s)", async (live, continuation) => {
+    const f = setup()
+    let reloaded: AgentCoordinator | undefined
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      const deliver = f.manager.startSteerTurn
+      f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
+      const id = f.store.getQueuedMessages()[0]!.id
+      f.manager.startSteerTurn = deliver
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Next" })
+      if (!live) {
+        f.streams.at(-1)!.close()
+        await waitFor(() => !f.coordinator.activeTurns.has("chat-1"))
+      }
+      const move = f.store.moveUserPromptToEnd.bind(f.store)
+      f.store.moveUserPromptToEnd = async () => { throw new Error("move EIO") }
+      if (live) {
+        await f.coordinator.respondTool(f.command)
+        await waitFor(() => !f.coordinator.activeTurns.has("chat-1"))
+      } else await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("move EIO")
+      const starts = f.starts.length, steers = f.steers.length, reads = f.historyReads()
+      f.store.moveUserPromptToEnd = move
+      reloaded = new AgentCoordinator({ store: f.store as never, onStateChange: () => {}, codexManager: f.manager as never })
+      if (continuation) await reloaded.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Next2" })
+      else await reloaded.respondTool(f.command)
+      expect(f.starts).toHaveLength(starts + (continuation ? 1 : 0))
+      expect(f.steers).toHaveLength(steers)
+      expect(f.historyReads()).toBeGreaterThan(reads)
+      expect(f.store.messages.filter(entry => entry._id === id)).toHaveLength(1)
+      expect(f.store.getQueuedMessages()).toHaveLength(0)
+      const bound = await (reloaded as any).codexPromptHistory.read("chat-1")
+      expect(() => planCodexPromptHistory(f.store.messages, id, bound.prompts)).not.toThrow()
+      expect(f.store.messages.filter(entry => entry.kind === "user_prompt").map(entry => entry._id))
+        .toEqual(f.nativeInputs.map(input => input.promptId))
+    } finally { await reloaded?.cancel("chat-1"); await f.coordinator.cancel("chat-1") }
+  })
+
+  test("keeps an unknown delivery queued when the native history check fails", async () => {
+    const f = setup()
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
+      const id = f.store.getQueuedMessages()[0]!.id
+      f.manager.readPromptHistory = async () => { throw new Error("Codex unavailable") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Codex unavailable")
+      expect(f.store.getQueuedMessages()[0]?.id).toBe(id)
+      expect(f.store.messages.filter(entry => entry._id === id)).toHaveLength(1)
+      expect(f.starts).toHaveLength(1)
+      expect(f.steers).toHaveLength(0)
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test("does not redeliver an accepted retry when the API omits its stable identifier", async () => {
+    const f = setup()
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      const deliver = f.manager.startSteerTurn
+      f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
+      f.manager.startSteerTurn = deliver
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Next" })
+      const move = f.store.moveUserPromptToEnd.bind(f.store)
+      f.store.moveUserPromptToEnd = async () => { throw new Error("move EIO") }
+      await f.coordinator.respondTool(f.command)
+      await waitFor(() => !f.coordinator.activeTurns.has("chat-1"))
+      f.store.moveUserPromptToEnd = move
+      f.manager.readPromptHistory = async () => ({ inputs: f.nativeInputs.map(({ promptId, ...input }) => input) }) as any
+      const reloaded = new AgentCoordinator({ store: f.store as never, onStateChange: () => {}, codexManager: f.manager as never })
+      await expect(reloaded.respondTool(f.command)).rejects.toThrow("identifier")
+      expect(f.steers).toHaveLength(1)
+      expect(f.starts).toHaveLength(2)
+      expect(f.store.getQueuedMessages()).toHaveLength(1)
+      expect(Object.keys((await (reloaded as any).codexPromptHistory.read("chat-1")).redeliveries)).toHaveLength(1)
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test("retries an idle rejected answer from its durable queue using the original id", async () => {
+    const f = setup()
+    try {
+      const start = f.manager.startTurn
+      f.manager.startTurn = async () => { throw new Error("Launch rejected") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Launch rejected")
+      const id = f.store.getQueuedMessages()[0]!.id
+      expect(f.store.messages.some(entry => entry._id === id)).toBe(false)
+      f.manager.startTurn = start
+      await Promise.all([f.coordinator.respondTool(f.command), f.coordinator.respondTool(f.command)])
+      expect(f.starts).toHaveLength(1)
+      expect(f.nativeInputs[0]?.promptId).toBe(id)
+      expect(f.store.messages.filter(entry => entry._id === id)).toHaveLength(1)
+      expect(f.store.getQueuedMessages()).toHaveLength(0)
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test.each([false, true])("retains an idle answer cancelled before native acceptance (persisted=%s)", async persisted => {
+    const f = setup()
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let starting = false
+    try {
+      if (persisted) {
+        await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+        f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
+        await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
+      }
+      f.manager.startSession = async () => { starting = true; await gate; return { sessionToken: "thread-1", resumeFellBack: false } }
+      const pending = f.coordinator.respondTool(f.command)
+      await waitFor(() => starting)
+      const id = f.store.getQueuedMessages()[0]!.id, starts = f.starts.length
+      await f.coordinator.cancel("chat-1")
+      release()
+      await pending
+      expect(f.starts).toHaveLength(starts)
+      expect(f.store.getQueuedMessages()[0]?.id).toBe(id)
+      if (persisted) expect((await (f.coordinator as any).codexPromptHistory.read("chat-1")).redeliveries[id]).toBeDefined()
+    } finally { release(); await f.coordinator.cancel("chat-1") }
+  })
+
+  test("a fast completed answer can race with queue draining without a false delivery error", async () => {
+    const f = setup()
+    const failures: string[] = []
+    f.store.recordTurnFailed = async (_id?: string, message?: string) => { failures.push(message ?? "turn failed") }
+    const remove = f.store.removeQueuedMessage.bind(f.store)
+    f.store.removeQueuedMessage = async (chatId, id) => {
+      if (!f.store.getQueuedMessage(chatId, id)) throw new Error("Queued message not found")
+      await remove(chatId, id)
+    }
+    const start = f.manager.startTurn
+    f.manager.startTurn = async args => { const turn = await start(args); f.streams.at(-1)!.close(); return turn }
+    const history = (f.coordinator as any).codexPromptHistory
+    const read = history.read.bind(history)
+    let delayed = false
+    history.read = async (...args: any[]) => {
+      const records = await read(...args)
+      if (!delayed && Object.keys(records.prompts).length && f.store.getQueuedMessages().length) {
+        delayed = true
+        await new Promise(resolve => setTimeout(resolve, 40))
+      }
+      return records
+    }
+    try {
+      await f.coordinator.respondTool(f.command)
+      await new Promise(resolve => setTimeout(resolve, 80))
+      expect(f.starts).toHaveLength(1)
+      expect(f.store.getQueuedMessages()).toHaveLength(0)
+      expect(failures).toEqual([])
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test("a saved retry during a reserved startup reports that delivery did not start", async () => {
+    const f = setup()
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
+      await f.coordinator.getHistoryActions("chat-1", { recover: true })
+      ;(f.coordinator as any).startingClaudeTurns.set("chat-1", Symbol())
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("retry your saved answer")
+      expect(f.store.getQueuedMessages()).toHaveLength(1)
+      expect(f.starts).toHaveLength(1)
+    } finally { (f.coordinator as any).startingClaudeTurns.delete("chat-1"); await f.coordinator.cancel("chat-1") }
+  })
+
+  test("a retained missing answer can be retried after its old queue record disappeared", async () => {
+    const f = setup()
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
+      const id = f.store.getQueuedMessages()[0]!.id
+      await f.store.removeQueuedMessage("chat-1", id)
+      await f.coordinator.respondTool(f.command)
+      expect(f.starts).toHaveLength(2)
+      expect(f.nativeInputs.at(-1)?.promptId).toBe(id)
+      expect(f.store.messages.filter(entry => entry._id === id)).toHaveLength(1)
+      expect(f.store.getQueuedMessages()).toHaveLength(0)
+    } finally { await f.coordinator.cancel("chat-1") }
+  })
+
+  test("an explicit retry while a blocking tool is active reports that it was not delivered", async () => {
+    const f = setup()
+    try {
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Work" })
+      f.manager.startSteerTurn = () => { throw new Error("Native send failed") }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("Native send failed")
+      const id = f.store.getQueuedMessages()[0]!.id
+      await f.coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "Next" })
+      f.coordinator.activeTurns.get("chat-1")!.pendingTool = {
+        toolUseId: "blocking", tool: { ...f.tool, toolId: "blocking" }, resolve: () => {},
+      }
+      await expect(f.coordinator.respondTool(f.command)).rejects.toThrow("retry your saved answer")
+      expect(f.store.getQueuedMessages()[0]?.id).toBe(id)
+      expect(f.steers).toHaveLength(0)
     } finally { await f.coordinator.cancel("chat-1") }
   })
 
