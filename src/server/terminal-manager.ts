@@ -331,7 +331,8 @@ export class TerminalManager {
       return this.snapshotOf(existing)
     }
 
-    const shell = resolveShell()
+    const terminalExecutable = process.env.KANNA_TERMINAL_EXECUTABLE
+    const shell = terminalExecutable || resolveShell()
     const cols = normalizeTerminalDimension(args.cols, DEFAULT_COLS)
     const rows = normalizeTerminalDimension(args.rows, DEFAULT_ROWS)
     const scrollback = clampScrollback(args.scrollback)
@@ -375,7 +376,9 @@ export class TerminalManager {
     }
 
     try {
-      session.process = Bun.spawn([shell, ...resolveShellArgs(shell)], {
+      // A configured executable owns shell startup and receives no login arguments.
+      const shellArgs = terminalExecutable ? [] : resolveShellArgs(shell)
+      session.process = Bun.spawn([shell, ...shellArgs], {
         cwd: args.projectPath,
         env: createTerminalEnv(),
         terminal: session.terminal,
