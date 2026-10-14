@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test"
-import { mkdtemp, mkdir, rm } from "node:fs/promises"
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { applyUtf8Locale, TerminalManager, TerminalOutputLog } from "./terminal-manager"
@@ -17,6 +17,7 @@ let tempHomePath = ""
 const originalHome = process.env.HOME
 const originalZdotdir = process.env.ZDOTDIR
 const originalHistfile = process.env.HISTFILE
+const originalTerminalExecutable = process.env.KANNA_TERMINAL_EXECUTABLE
 
 beforeAll(async () => {
   if (!isSupportedPlatform) return
@@ -26,15 +27,23 @@ beforeAll(async () => {
   process.env.HOME = tempHomePath
   process.env.ZDOTDIR = tempHomePath
   process.env.HISTFILE = path.join(tempHomePath, ".zsh_history")
+  delete process.env.KANNA_TERMINAL_EXECUTABLE
 })
 
 afterEach(async () => {
+  delete process.env.KANNA_TERMINAL_EXECUTABLE
   if (!tempProjectPath) return
   await rm(tempProjectPath, { recursive: true, force: true })
   tempProjectPath = await mkdtemp(path.join(os.tmpdir(), "kanna-terminal-manager-"))
 })
 
 afterAll(async () => {
+  if (originalTerminalExecutable === undefined) {
+    delete process.env.KANNA_TERMINAL_EXECUTABLE
+  } else {
+    process.env.KANNA_TERMINAL_EXECUTABLE = originalTerminalExecutable
+  }
+
   if (originalHome === undefined) {
     delete process.env.HOME
   } else {
@@ -67,8 +76,7 @@ async function waitFor(check: () => boolean, timeoutMs: number, intervalMs = 25)
   throw new Error(`Timed out after ${timeoutMs}ms`)
 }
 
-async function createSession(terminalId: string) {
-  const manager = new TerminalManager()
+async function createSession(terminalId: string, manager = new TerminalManager()) {
   let output = ""
   manager.onEvent((event) => {
     if (event.type === "terminal.output" && event.terminalId === terminalId) {
@@ -98,6 +106,100 @@ async function waitForOutputToContain(getOutput: () => string, value: string, ti
 }
 
 describeIfSupported("TerminalManager", () => {
+  test("runs a configured executable with no arguments in the project PTY", async () => {
+    const executableDirectory = path.join(tempProjectPath, "transport with spaces")
+    await mkdir(executableDirectory)
+    const executable = path.join(executableDirectory, "bash")
+    await writeFile(executable, [
+      "#!/bin/sh",
+      "printf '__KANNA_TRANSPORT__:%s:%s:%s:%s:%s:%s\\n' \"$PWD\" \"$#\" \"$TERM\" \"$COLORTERM\" \"$TERM_PROGRAM\" \"$KANNA_TERMINAL\"",
+      "[ -t 0 ] && [ -t 1 ] && printf '__KANNA_PTY__\\n'",
+      "exec /bin/sh",
+      "",
+    ].join("\n"), { mode: 0o755 })
+    process.env.KANNA_TERMINAL_EXECUTABLE = executable
+    const terminalId = "terminal-configured-executable"
+    const manager = new TerminalManager()
+
+    try {
+      const { getOutput } = await createSession(terminalId, manager)
+      await waitForOutputToContain(getOutput, `__KANNA_TRANSPORT__:${tempProjectPath}:0:xterm-256color:truecolor:kanna:1`)
+      await waitForOutputToContain(getOutput, "__KANNA_PTY__")
+      expect(manager.getSnapshot(terminalId)).toMatchObject({
+        shell: executable,
+        title: "bash",
+        cwd: tempProjectPath,
+        status: "running",
+      })
+
+      manager.write(terminalId, "printf '__KANNA_%s__\\n' CUSTOM_COMMAND\r")
+      await waitForOutputToContain(getOutput, "__KANNA_CUSTOM_COMMAND__")
+      manager.write(terminalId, "exit 7\r")
+      await waitFor(() => manager.getSnapshot(terminalId)?.status === "exited", COMMAND_TIMEOUT_MS)
+      expect(manager.getSnapshot(terminalId)?.exitCode).toBe(7)
+    } finally {
+      manager.closeAll()
+    }
+    expect(manager.getResourceCounts().terminalSessions).toBe(0)
+  }, 15_000)
+
+  test("resolves a configured executable from PATH", async () => {
+    const executableName = "kanna-terminal-test"
+    await writeFile(path.join(tempProjectPath, executableName), "#!/bin/sh\nprintf '__KANNA_PATH_TRANSPORT__\\n'\nexec /bin/sh\n", { mode: 0o755 })
+    const originalPath = process.env.PATH
+    process.env.PATH = `${tempProjectPath}${path.delimiter}${originalPath ?? ""}`
+    process.env.KANNA_TERMINAL_EXECUTABLE = executableName
+    const terminalId = "terminal-executable-path"
+    const manager = new TerminalManager()
+
+    try {
+      const { getOutput } = await createSession(terminalId, manager)
+      await waitForOutputToContain(getOutput, "__KANNA_PATH_TRANSPORT__")
+      expect(manager.getSnapshot(terminalId)?.shell).toBe(executableName)
+      expect(manager.getSnapshot(terminalId)?.title).toBe(executableName)
+    } finally {
+      manager.closeAll()
+      if (originalPath === undefined) delete process.env.PATH
+      else process.env.PATH = originalPath
+    }
+  }, 15_000)
+
+  test.each([undefined, ""])("uses the default shell when the executable override is %j", async (executable) => {
+    if (executable === undefined) delete process.env.KANNA_TERMINAL_EXECUTABLE
+    else process.env.KANNA_TERMINAL_EXECUTABLE = executable
+    const terminalId = "terminal-default-executable"
+    const manager = new TerminalManager()
+
+    try {
+      const { getOutput } = await createSession(terminalId, manager)
+      const snapshot = manager.getSnapshot(terminalId)
+      expect(snapshot?.shell).toBeTruthy()
+      expect(snapshot?.title).toBe(path.basename(snapshot!.shell))
+      manager.write(terminalId, "printf '__KANNA_%s__\\n' DEFAULT_COMMAND\r")
+      await waitForOutputToContain(getOutput, "__KANNA_DEFAULT_COMMAND__")
+    } finally {
+      manager.closeAll()
+    }
+  })
+
+  test("reports an invalid executable instead of falling back to the default shell", () => {
+    process.env.KANNA_TERMINAL_EXECUTABLE = path.join(tempProjectPath, "missing-terminal")
+    const manager = new TerminalManager()
+
+    try {
+      expect(() => manager.createTerminal({
+        projectPath: tempProjectPath,
+        terminalId: "terminal-invalid-executable",
+        cols: 80,
+        rows: 24,
+        scrollback: 1_000,
+      })).toThrow()
+      expect(manager.getResourceCounts()).toMatchObject({ terminalSessions: 0, runningTerminals: 0 })
+    } finally {
+      manager.closeAll()
+    }
+  })
+
   test("ctrl+c interrupts the foreground job and keeps the shell alive", async () => {
     const terminalId = "terminal-ctrl-c-foreground"
     const { manager, getOutput } = await createSession(terminalId)
