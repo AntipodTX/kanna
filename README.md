@@ -4,6 +4,7 @@
 
 ### Features
 
+- Custom embedded-terminal executables via `KANNA_TERMINAL_EXECUTABLE`, including wrappers that start a shell in an external execution context.
 
 ### Fixes
 
