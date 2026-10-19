@@ -6,6 +6,7 @@ export interface HarnessEvent {
   sessionToken?: string
   /** Claude results: the ids of the prompts this turn answered, as the CLI echoes them. */
   promptIds?: string[]
+  onPersisted?: (error?: Error) => void
 }
 
 export interface HarnessToolRequest {

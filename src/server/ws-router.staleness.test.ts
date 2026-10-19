@@ -325,7 +325,9 @@ function createWorld(options?: { projectPath?: string }) {
       const queue = state.queuedMessagesByChatId.get(command.chatId) ?? []
       state.queuedMessagesByChatId.set(command.chatId, queue.filter((entry) => entry.id !== command.queuedMessageId))
     },
-  }
+  
+getPendingCodexSteerIds: () => new Set(),
+}
 
   const appSettingsListeners = new Set<(snapshot: unknown) => void>()
   let appSettingsSnapshot: Record<string, unknown> = {
