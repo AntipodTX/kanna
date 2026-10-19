@@ -3,7 +3,12 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { getDataRootDir } from "../shared/branding"
-import { ClaudeProjectDiscoveryAdapter, CodexProjectDiscoveryAdapter, discoverProjects, type ProjectDiscoveryAdapter } from "./discovery"
+import {
+  ClaudeProjectDiscoveryAdapter,
+  CodexProjectDiscoveryAdapter,
+  discoverProjects,
+  type ProjectDiscoveryAdapter,
+} from "./discovery"
 
 const tempDirs: string[] = []
 

@@ -1,7 +1,42 @@
-import type { AgentProvider, ClaudeModelOptions, CodexModelOptions, CursorModelOptions, ClaudeContextWindow, FaveModel, GrokModelOptions, ModelOptions, PiModelOptions, ProviderCatalogEntry, ProviderModelOption, ServiceTier, ClaudeReasoningEffort } from "../shared/types"
-import { CLAUDE_CONTEXT_WINDOW_OPTIONS, DEFAULT_CLAUDE_MODEL_OPTIONS, DEFAULT_CURSOR_MODEL_OPTIONS, PROVIDERS, codexReasoningEffortLabel, deriveModelLabel, withPiFaveModels, normalizeClaudeContextWindow, normalizeClaudeFastMode, normalizeCodexReasoningEffort, normalizeGrokReasoningEffort, normalizePiReasoningEffort, normalizeProviderModelId, isClaudeReasoningEffort, isCodexReasoningEffort, isGrokReasoningEffort, isPiReasoningEffort, modelIdFamily, supportsProviderFastMode, DEFAULT_CODEX_MODEL_OPTIONS, CLAUDE_REASONING_OPTIONS, isClaudeReasoningEffortSupported, CLAUDE_STANDARD_REASONING_EFFORT_LEVELS } from "../shared/types"
-
-
+import type {
+  AgentProvider,
+  ClaudeReasoningEffort,
+  ClaudeModelOptions,
+  CodexModelOptions,
+  CursorModelOptions,
+  ClaudeContextWindow,
+  FaveModel,
+  GrokModelOptions,
+  ModelOptions,
+  PiModelOptions,
+  ProviderCatalogEntry,
+  ProviderModelOption,
+  ServiceTier,
+} from "../shared/types"
+import {
+  CLAUDE_REASONING_OPTIONS,
+  CLAUDE_STANDARD_REASONING_EFFORT_LEVELS,
+  CLAUDE_CONTEXT_WINDOW_OPTIONS,
+  DEFAULT_CLAUDE_MODEL_OPTIONS,
+  DEFAULT_CODEX_MODEL_OPTIONS,
+  DEFAULT_CURSOR_MODEL_OPTIONS,
+  PROVIDERS,
+  codexReasoningEffortLabel,
+  deriveModelLabel,
+  withPiFaveModels,
+  normalizeClaudeContextWindow,
+  normalizeClaudeFastMode,
+  normalizeCodexReasoningEffort,
+  normalizeGrokReasoningEffort,
+  normalizePiReasoningEffort,
+  normalizeProviderModelId,
+  isClaudeReasoningEffort,
+  isCodexReasoningEffort,
+  isGrokReasoningEffort,
+  isPiReasoningEffort,
+  modelIdFamily,
+  supportsProviderFastMode,
+} from "../shared/types"
 
 export interface ClaudeSdkModelInfo {
   value: string
@@ -346,8 +381,6 @@ export function getServerProviderModelOption(
 }
 
 /** Undefined means that the SDK must receive no effort override for this model. */
-
-
 function resolveServerClaudeReasoningEffort(modelId: string, effort?: unknown): ClaudeReasoningEffort | undefined {
   const model = getServerProviderModelOption("claude", modelId)
   if (model && !model.supportsEffort) return undefined
@@ -373,6 +406,7 @@ export function normalizeServerClaudeReasoningEffort(modelId: string, effort?: u
   // effort control. The runtime boundary omits that override in this case.
   return resolveServerClaudeReasoningEffort(modelId, effort) ?? DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
 }
+
 export function normalizeClaudeModelOptions(
   model: string,
   modelOptions?: ModelOptions,

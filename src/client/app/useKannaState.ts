@@ -1,15 +1,31 @@
 import { recordClientPerformance, startClientPerformance } from "./clientPerformance"
-import { useCallback, useEffect, useMemo, useRef, useState, useLayoutEffect } from "react"
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router-dom"
 import { useShallow } from "zustand/react/shallow"
-import { PROVIDERS, withPiFaveModels, type AgentProvider, type AppSettingsPatch, type AskUserQuestionAnswerMap, type AppSettingsSnapshot, type ChatDiffSnapshot, type FaveModel, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type TranscriptEntry, type UpdateSnapshot, type ChatProviderPreferences, type CodexApprovalDecision, type StartupSyncSnapshot } from "../../shared/types"
-import { NEW_CHAT_COMPOSER_ID, useChatPreferencesStore, composerStateForProvider, composerStateFromModelSettings, type ComposerState } from "../stores/chatPreferencesStore"
+import { PROVIDERS, withPiFaveModels, type AgentProvider, type AppSettingsPatch, type AskUserQuestionAnswerMap, type AppSettingsSnapshot, type ChatDiffSnapshot, type ChatProviderPreferences, type CodexApprovalDecision, type FaveModel, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type StartupSyncSnapshot, type TranscriptEntry, type UpdateSnapshot } from "../../shared/types"
+import {
+  composerStateForProvider,
+  composerStateFromModelSettings,
+  NEW_CHAT_COMPOSER_ID,
+  type ComposerState,
+  useChatPreferencesStore,
+} from "../stores/chatPreferencesStore"
 import { useRightSidebarStore } from "../stores/rightSidebarStore"
 import { useTerminalLayoutStore } from "../stores/terminalLayoutStore"
 import { getEditorPresetLabel, useTerminalPreferencesStore } from "../stores/terminalPreferencesStore"
 import { useEffectiveEditorPreset } from "../components/open-external-menu"
 import { useChatInputStore } from "../stores/chatInputStore"
-import { findSidebarChat, getSidebarProjectGroups, useChatExists, useFirstProjectGroup, useNavbarRepoLabel, useProjectIdForChat, useSidebarChatStatus, useSidebarReady, useSidebarStore } from "../stores/sidebarStore"
+import {
+  findSidebarChat,
+  getSidebarProjectGroups,
+  useChatExists,
+  useFirstProjectGroup,
+  useNavbarRepoLabel,
+  useProjectIdForChat,
+  useSidebarChatStatus,
+  useSidebarReady,
+  useSidebarStore,
+} from "../stores/sidebarStore"
 import type { BranchActionFailure, BranchActionSuccess, ChatSnapshot, HydratedTranscriptMessage, LocalProjectsSnapshot, SidebarChatRow, SidebarData, TranscriptOutlineEntry } from "../../shared/types"
 import type { AskUserQuestionItem } from "../components/messages/types"
 import type { OpenLocalLinkTarget } from "../components/messages/shared"
@@ -17,41 +33,19 @@ import { useAppDialog } from "../components/ui/app-dialog"
 import { useTheme } from "../hooks/useTheme"
 import { processTranscriptMessages } from "../lib/parseTranscript"
 import { canCancelStatus, getLatestToolIds, isProcessingStatus } from "./derived"
-import { getActiveChatSnapshot, getMostRecentlyActiveProjectId, getNewestRemainingChatId, getPreviousPrompt, NEW_CHAT_OPTIMISTIC_SCOPE, reconcileOptimisticUserPrompts, resolveComposeIntent, type OptimisticProcessingState, type OptimisticUserPrompt, type ProjectRequest, type StartChatIntent } from "./kannaStateHelpers"
-import { foldChatSnapshot, sameDiffs, shouldPreserveExistingProjectDiffs } from "./snapshotEquality"
-import { cachedWindowToMessages, createTranscriptCacheWriter, readCachedWindow, readMemoryCachedWindow, type CachedTranscriptWindow } from "./chatTranscriptCache"
-import { DEFAULT_TRANSCRIPT_WINDOW_ASSISTANT_MESSAGES, trimTranscriptWindow } from "../../shared/transcript-window"
-import { CLOUD_WS_ENDPOINT_PATH, type CloudWsEndpointResponse } from "../../shared/cloud-api"
-import { KannaSocket, type SocketStatus } from "./socket"
-import { useAppSettingsSync } from "./useAppSettingsSync"
-import { useBackgroundChatSubscriptions } from "./useBackgroundChatSubscriptions"
-import { useChatCommands } from "./useChatCommands"
-import { useChatReadAnchor, type ChatReadAnchorState, type ReadAnchorLayoutSource } from "./useChatReadAnchor"
-import { useSendMessage } from "./useSendMessage"
-import { useShareExport } from "./useShareExport"
-import { useUpdateRestart } from "./useUpdateRestart"
-import type { EditorOpenSettings, OpenExternalAction, TerminalPreset } from "../../shared/protocol"
-import { applySidebarPatch, type SidebarPatch } from "../../shared/sidebar-patch"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+import {
+  getActiveChatSnapshot,
+  getMostRecentlyActiveProjectId,
+  getNewestRemainingChatId,
+  getPreviousPrompt,
+  NEW_CHAT_OPTIMISTIC_SCOPE,
+  reconcileOptimisticUserPrompts,
+  resolveComposeIntent,
+  type OptimisticProcessingState,
+  type OptimisticUserPrompt,
+  type ProjectRequest,
+  type StartChatIntent,
+} from "./kannaStateHelpers"
 
 function getComposerStateForActiveProvider(
   composerState: ComposerState,
@@ -106,20 +100,30 @@ export function getForkUserPromptSendOptions(
   }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+import {
+  foldChatSnapshot,
+  sameDiffs,
+  shouldPreserveExistingProjectDiffs,
+} from "./snapshotEquality"
+import {
+  cachedWindowToMessages,
+  createTranscriptCacheWriter,
+  readCachedWindow,
+  readMemoryCachedWindow,
+  type CachedTranscriptWindow,
+} from "./chatTranscriptCache"
+import { DEFAULT_TRANSCRIPT_WINDOW_ASSISTANT_MESSAGES, trimTranscriptWindow } from "../../shared/transcript-window"
+import { CLOUD_WS_ENDPOINT_PATH, type CloudWsEndpointResponse } from "../../shared/cloud-api"
+import { KannaSocket, type SocketStatus } from "./socket"
+import { useAppSettingsSync } from "./useAppSettingsSync"
+import { useBackgroundChatSubscriptions } from "./useBackgroundChatSubscriptions"
+import { useChatCommands } from "./useChatCommands"
+import { useChatReadAnchor, type ChatReadAnchorState, type ReadAnchorLayoutSource } from "./useChatReadAnchor"
+import { useSendMessage } from "./useSendMessage"
+import { useShareExport } from "./useShareExport"
+import { useUpdateRestart } from "./useUpdateRestart"
+import type { EditorOpenSettings, OpenExternalAction, TerminalPreset } from "../../shared/protocol"
+import { applySidebarPatch, type SidebarPatch } from "../../shared/sidebar-patch"
 
 export {
   getUiUpdateReadinessPath,

@@ -1,4 +1,4 @@
-const CODEX_APPROVAL_POLICY: CodexApprovalPolicy = "on-request"
+import type { HarnessStartupOutcome } from "./harness-types"
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { createInterface } from "node:readline"
@@ -14,15 +14,15 @@ import type {
   TranscriptEntry,
 } from "../shared/types"
 import { CODEX_SLASH_COMMANDS } from "../shared/types"
-import type { HarnessEvent, HarnessToolRequest, HarnessTurn, HarnessStartupOutcome } from "./harness-types"
+import type { HarnessEvent, HarnessToolRequest, HarnessTurn } from "./harness-types"
 import { appendSystemMessageBlock, buildSkillSystemMessage } from "./harness-skills"
 import { AsyncQueue } from "./async-queue"
 import type { KannaToolHost } from "./kanna-tools"
 import { createKannaMcpServer } from "./kanna-mcp"
 import { asNumber, asRecord } from "../shared/json"
 import { timestamped } from "./transcript"
-import type { CodexNativeInput } from "./codex-prompt-history"
 import { codexAsyncQuestionTool } from "../shared/codex-questions"
+import type { CodexNativeInput } from "./codex-prompt-history"
 import {
   type AccountRateLimitsUpdatedNotification,
   type CollabAgentToolCallItem,
@@ -59,13 +59,13 @@ import {
   type McpServerElicitationRequestResponse,
   type PermissionsRequestApprovalParams,
   type PermissionsRequestApprovalResponse,
-  type ModelListParams,
-  type ModelListResponse,
   type PlanDeltaNotification,
   type ReviewDecision,
-  type RawResponseItemCompletedNotification,
   type ServerNotification,
   type ServerRequest,
+  type ModelListParams,
+  type ModelListResponse,
+  type RawResponseItemCompletedNotification,
   type SkillsListParams,
   type SkillsListResponse,
   type Thread,
@@ -105,6 +105,8 @@ import {
   isServerNotification,
   isServerRequest,
 } from "./codex-app-server-protocol"
+
+const CODEX_APPROVAL_POLICY: CodexApprovalPolicy = "on-request"
 
 interface CodexAppServerProcess {
   stdin: Writable
@@ -238,10 +240,10 @@ export interface StartCodexSessionArgs {
 }
 
 export interface StartCodexTurnArgs {
-  isCurrentTurn?: () => boolean
-  signal?: AbortSignal
   clientUserMessageId?: string
   chatId: string
+  isCurrentTurn?: () => boolean
+  signal?: AbortSignal
   model: string
   effort?: CodexReasoningEffort
   serviceTier?: ServiceTier
@@ -1829,8 +1831,8 @@ export class CodexAppServerManager {
           },
         },
       } satisfies TurnStartParams)
-      // A native error can close context immediately after ACK; keep its
-      // queued result observable when this caller still owns the turn.
+      // A native failure can close this context immediately after its ACK.
+      // Preserve the queued error result for this still-owned caller.
       assertOwner()
       pendingTurn.turnId = response.turn.id
       if (shouldEmitSystemInit) {
@@ -2558,6 +2560,55 @@ export class CodexAppServerManager {
     }
   }
 
+  private handleCompactionNotification(context: SessionContext, notification: ServerNotification) {
+    const operation = context.pendingCompaction
+    if (!operation) return
+    switch (notification.method) {
+      case "turn/started":
+        if (notification.params.threadId === operation.threadId && !operation.turnId) {
+          operation.turnId = notification.params.turn.id
+        }
+        return
+      case "item/started":
+      case "item/completed": {
+        const { threadId, turnId, item } = notification.params
+        if (threadId !== operation.threadId || item.type !== "contextCompaction") return
+        if (operation.turnId && operation.turnId !== turnId) return
+        operation.turnId = turnId
+        if (notification.method === "item/completed") operation.compacted = true
+        return
+      }
+      case "thread/compacted": {
+        const { threadId, turnId } = notification.params
+        if (threadId !== operation.threadId || (operation.turnId && operation.turnId !== turnId)) return
+        operation.turnId = turnId
+        operation.compacted = true
+        return
+      }
+      case "turn/completed": {
+        const { threadId, turn } = notification.params
+        if (threadId !== operation.threadId || turn.id !== operation.turnId) return
+        if (turn.status !== "completed") {
+          operation.reject(new Error(formatCodexError(turn.error) || `Codex compaction ${turn.status}`))
+        } else if (!operation.compacted) {
+          operation.reject(new Error("Codex turn completed without a compaction result"))
+        } else {
+          operation.resolve()
+        }
+        return
+      }
+      case "error": {
+        const { threadId, turnId, willRetry, error } = notification.params
+        if (threadId && threadId !== operation.threadId) return
+        if (turnId && operation.turnId && turnId !== operation.turnId) return
+        if (!willRetry) this.failContext(context, formatCodexError(error) || "Codex compaction failed")
+        return
+      }
+      default:
+        return
+    }
+  }
+
   private handleItemStarted(
     pendingTurn: PendingTurn,
     notification: ItemStartedNotification,
@@ -2983,54 +3034,5 @@ export class CodexAppServerManager {
 
   private writeMessage(context: SessionContext, message: Record<string, unknown>) {
     context.child.stdin.write(`${JSON.stringify(message)}\n`)
-  }
-
-  private handleCompactionNotification(context: SessionContext, notification: ServerNotification) {
-    const operation = context.pendingCompaction
-    if (!operation) return
-    switch (notification.method) {
-      case "turn/started":
-        if (notification.params.threadId === operation.threadId && !operation.turnId) {
-          operation.turnId = notification.params.turn.id
-        }
-        return
-      case "item/started":
-      case "item/completed": {
-        const { threadId, turnId, item } = notification.params
-        if (threadId !== operation.threadId || item.type !== "contextCompaction") return
-        if (operation.turnId && operation.turnId !== turnId) return
-        operation.turnId = turnId
-        if (notification.method === "item/completed") operation.compacted = true
-        return
-      }
-      case "thread/compacted": {
-        const { threadId, turnId } = notification.params
-        if (threadId !== operation.threadId || (operation.turnId && operation.turnId !== turnId)) return
-        operation.turnId = turnId
-        operation.compacted = true
-        return
-      }
-      case "turn/completed": {
-        const { threadId, turn } = notification.params
-        if (threadId !== operation.threadId || turn.id !== operation.turnId) return
-        if (turn.status !== "completed") {
-          operation.reject(new Error(formatCodexError(turn.error) || `Codex compaction ${turn.status}`))
-        } else if (!operation.compacted) {
-          operation.reject(new Error("Codex turn completed without a compaction result"))
-        } else {
-          operation.resolve()
-        }
-        return
-      }
-      case "error": {
-        const { threadId, turnId, willRetry, error } = notification.params
-        if (threadId && threadId !== operation.threadId) return
-        if (turnId && operation.turnId && turnId !== operation.turnId) return
-        if (!willRetry) this.failContext(context, formatCodexError(error) || "Codex compaction failed")
-        return
-      }
-      default:
-        return
-    }
   }
 }

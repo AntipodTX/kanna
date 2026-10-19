@@ -226,6 +226,16 @@ describe("foldChatSnapshot providers", () => {
   })
 })
 
+test("history classification and progress changes reach the UI without transcript changes", () => {
+  for (const change of [
+    { historyRevision: "new" }, { historyIntegrityRevision: "new" },
+    { historyRepair: { phase: "running" as const, message: "Checking history" } },
+  ]) {
+    const current = snapshot(0, ["a"]), incoming = { ...current, runtime: { ...current.runtime, ...change } }
+    expect(foldChatSnapshot(current, null, incoming)).not.toBe(current)
+  }
+})
+
 describe("applyIncrementalChatSnapshot carried fields", () => {
   test("an incremental body without providers or anchor keeps the held ones", () => {
     const current = snapshot(0, ["a"])
@@ -258,15 +268,4 @@ describe("sameChatSnapshotCore", () => {
 
     expect(sameChatSnapshotCore(before, after)).toBe(false)
   })
-})
-
-
-  test("history classification and progress changes reach the UI without transcript changes", () => {
-  for (const change of [
-    { historyRevision: "new" }, { historyIntegrityRevision: "new" },
-    { historyRepair: { phase: "running" as const, message: "Checking history" } },
-  ]) {
-    const current = snapshot(0, ["a"]), incoming = { ...current, runtime: { ...current.runtime, ...change } }
-    expect(foldChatSnapshot(current, null, incoming)).not.toBe(current)
-  }
 })

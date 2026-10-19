@@ -86,7 +86,6 @@ test("a cancelled provenance write cannot stop the successor Codex session", asy
   }
 })
 
-
 for (const journalFailure of [false, true])
   test(`accepted live Codex input preserves queue and provenance with journal failure=${journalFailure}`, async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "kanna-live-provenance-"))

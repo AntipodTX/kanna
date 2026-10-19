@@ -309,14 +309,14 @@ export type PiReasoningEffort = (typeof PI_REASONING_OPTIONS)[number]["id"]
 export type GrokReasoningEffort = (typeof GROK_REASONING_OPTIONS)[number]["id"]
 
 export type ClaudeReasoningEffort = (typeof CLAUDE_REASONING_OPTIONS)[number]["id"]
+export type ClaudeContextWindow = "200k" | "1m"
+export type ServiceTier = "fast"
 
 export const CLAUDE_STANDARD_REASONING_EFFORT_LEVELS: readonly ClaudeReasoningEffort[] = [
   "low",
   "medium",
   "high",
 ] as const
-export type ClaudeContextWindow = "200k" | "1m"
-export type ServiceTier = "fast"
 
 export const CLAUDE_MAX_REASONING_EFFORT_LEVELS: readonly ClaudeReasoningEffort[] = [
   ...CLAUDE_STANDARD_REASONING_EFFORT_LEVELS,

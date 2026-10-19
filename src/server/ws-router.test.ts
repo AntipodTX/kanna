@@ -5,30 +5,23 @@ import path from "node:path"
 import type { AppSettingsSnapshot, KeybindingsSnapshot, LlmProviderSnapshot, SidebarData, UpdateSnapshot, TranscriptEntry } from "../shared/types"
 import { applySidebarPatch, type SidebarPatch } from "../shared/sidebar-patch"
 import { PROTOCOL_VERSION } from "../shared/types"
+import { processTranscriptMessages } from "../client/lib/parseTranscript"
 import { findTranscriptWindowStart, snapToRowStart } from "../shared/transcript-window"
 import { createEmptyState } from "./events"
 import { EventStore } from "./event-store"
+import { StartupSyncProgress } from "./startup-sync"
 import { deriveLocalProjectsSnapshot } from "./read-models"
 import { SERVER_PROVIDERS, applyCodexModels, resetServerProvidersForTests } from "./provider-catalog"
-import { assertSafeSkillId, assertSafeSkillSource, buildInstallSkillCommand, buildUninstallSkillCommand, listGlobalSkillsWithSources, listInstalledSkills, parseInstalledSkillsLock } from "./skills"
+import {
+  assertSafeSkillId,
+  assertSafeSkillSource,
+  buildInstallSkillCommand,
+  buildUninstallSkillCommand,
+  listGlobalSkillsWithSources,
+  listInstalledSkills,
+  parseInstalledSkillsLock,
+} from "./skills"
 import { createWsRouter } from "./ws-router"
-import { processTranscriptMessages } from "../client/lib/parseTranscript"
-import { StartupSyncProgress } from "./startup-sync"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 function withSidebarGroupDefaults(group: {
   groupKey: string
@@ -428,6 +421,86 @@ function createTestRouter(overrides: Partial<CreateWsRouterArgs> = {}) {
 }
 
 describe("ws-router", () => {
+  test("publishes startup session sync progress snapshots", async () => {
+    const startupSync = new StartupSyncProgress()
+    const router = createTestRouter({ startupSync })
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+
+    await router.handleMessage(
+      ws as never,
+      JSON.stringify({
+        v: PROTOCOL_VERSION,
+        type: "subscribe",
+        id: "startup-sync-sub",
+        topic: { type: "startup-sync" },
+      })
+    )
+    startupSync.begin()
+    startupSync.append("[kanna] session sync: scanning Claude sessions")
+
+    expect(ws.sent).toContainEqual({
+      v: PROTOCOL_VERSION,
+      type: "snapshot",
+      id: "startup-sync-sub",
+      snapshot: {
+        type: "startup-sync",
+        data: {
+          enabled: false,
+          mode: "session-sync",
+          status: "idle",
+          messages: [],
+          startedAt: null,
+          completedAt: null,
+          error: null,
+        },
+      },
+    })
+    expect(ws.sent.at(-1)).toMatchObject({
+      v: PROTOCOL_VERSION,
+      type: "snapshot",
+      id: "startup-sync-sub",
+      snapshot: {
+        type: "startup-sync",
+        data: {
+          enabled: true,
+          status: "running",
+          messages: ["[kanna] session sync: scanning Claude sessions"],
+        },
+      },
+    })
+
+    router.dispose()
+  })
+
+  test("keeps an old empty chat when a sidebar subscribes or reconnects", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "kanna-retain-draft-"))
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(path.join(dataDir, "project"))
+    const chat = await store.createChat(project.id)
+    store.requireChat(chat.id).createdAt = Date.now() - 10 * 60 * 1000
+    const router = createTestRouter({ store })
+    try {
+      for (let connection = 0; connection < 2; connection++) {
+        const ws = new FakeWebSocket()
+        router.handleOpen(ws as never)
+        await router.handleMessage(ws as never, JSON.stringify({
+          v: 1, type: "subscribe", id: "sidebar", topic: { type: "sidebar" },
+        }))
+        expect(store.getChat(chat.id)?.id).toBe(chat.id)
+        expect(store.getChat(chat.id)?.archivedAt).toBeUndefined()
+        expect(JSON.stringify(ws.sent)).toContain(chat.id)
+        await router.handleMessage(ws as never, JSON.stringify({
+          v: 1, type: "command", id: "drafts", command: { type: "chat.setDraftProtection", chatIds: [] },
+        }))
+        router.handleClose(ws as never)
+      }
+    } finally {
+      router.dispose()
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
   test("renames a discovered project by path and updates all project lists", async () => {
     const projectPath = await mkdtemp(path.join(tmpdir(), "kanna-rename-project-"))
     try {
@@ -619,6 +692,33 @@ describe("ws-router", () => {
       // list (empty here) instead of wiping it.
       faveModels: [],
     }])
+  })
+
+  test.each([
+    { type: "settings.readAppSettings" },
+    { type: "settings.writeAppSettings", analyticsEnabled: false },
+    { type: "settings.writeAppSettingsPatch", patch: { theme: "dark" } },
+  ] as const)("includes live models in $type replies", async (command) => {
+    const router = createTestRouter()
+    const ws = new FakeWebSocket()
+    try {
+      applyCodexModels([{ model: "gpt-6-astra", displayName: "GPT-6-Astra" }])
+      await router.handleMessage(ws as never, JSON.stringify({
+        v: PROTOCOL_VERSION,
+        type: "command",
+        id: "settings-live-models",
+        command,
+      }))
+      const reply = ws.sent.find((message) => (message as { type: string }).type === "ack") as {
+        result: AppSettingsSnapshot
+      }
+      expect(reply.result.availableProviders).toEqual(SERVER_PROVIDERS)
+      expect(reply.result.availableProviders?.find((provider) => provider.id === "codex")?.models)
+        .toEqual(expect.arrayContaining([expect.objectContaining({ id: "gpt-6-astra" })]))
+    } finally {
+      router.dispose()
+      resetServerProvidersForTests()
+    }
   })
 
   test("reads and writes app settings via commands", async () => {
@@ -1932,9 +2032,6 @@ describe("ws-router", () => {
     })
   })
 
-  
-
-  
 
   test("broadcasts background title-generation errors to connected clients", () => {
     let reportBackgroundError: ((message: string) => void) | null | undefined
@@ -2302,117 +2399,6 @@ describe("ws-router", () => {
       result: { snapshotChanged: false },
     })
   })
-
-
-  test("publishes startup session sync progress snapshots", async () => {
-    const startupSync = new StartupSyncProgress()
-    const router = createTestRouter({ startupSync })
-    const ws = new FakeWebSocket()
-    router.handleOpen(ws as never)
-
-    await router.handleMessage(
-      ws as never,
-      JSON.stringify({
-        v: PROTOCOL_VERSION,
-        type: "subscribe",
-        id: "startup-sync-sub",
-        topic: { type: "startup-sync" },
-      })
-    )
-    startupSync.begin()
-    startupSync.append("[kanna] session sync: scanning Claude sessions")
-
-    expect(ws.sent).toContainEqual({
-      v: PROTOCOL_VERSION,
-      type: "snapshot",
-      id: "startup-sync-sub",
-      snapshot: {
-        type: "startup-sync",
-        data: {
-          enabled: false,
-          mode: "session-sync",
-          status: "idle",
-          messages: [],
-          startedAt: null,
-          completedAt: null,
-          error: null,
-        },
-      },
-    })
-    expect(ws.sent.at(-1)).toMatchObject({
-      v: PROTOCOL_VERSION,
-      type: "snapshot",
-      id: "startup-sync-sub",
-      snapshot: {
-        type: "startup-sync",
-        data: {
-          enabled: true,
-          status: "running",
-          messages: ["[kanna] session sync: scanning Claude sessions"],
-        },
-      },
-    })
-
-    router.dispose()
-  })
-
-
-  test("keeps an old empty chat when a sidebar subscribes or reconnects", async () => {
-    const dataDir = await mkdtemp(path.join(tmpdir(), "kanna-retain-draft-"))
-    const store = new EventStore(dataDir)
-    await store.initialize()
-    const project = await store.openProject(path.join(dataDir, "project"))
-    const chat = await store.createChat(project.id)
-    store.requireChat(chat.id).createdAt = Date.now() - 10 * 60 * 1000
-    const router = createTestRouter({ store })
-    try {
-      for (let connection = 0; connection < 2; connection++) {
-        const ws = new FakeWebSocket()
-        router.handleOpen(ws as never)
-        await router.handleMessage(ws as never, JSON.stringify({
-          v: 1, type: "subscribe", id: "sidebar", topic: { type: "sidebar" },
-        }))
-        expect(store.getChat(chat.id)?.id).toBe(chat.id)
-        expect(store.getChat(chat.id)?.archivedAt).toBeUndefined()
-        expect(JSON.stringify(ws.sent)).toContain(chat.id)
-        await router.handleMessage(ws as never, JSON.stringify({
-          v: 1, type: "command", id: "drafts", command: { type: "chat.setDraftProtection", chatIds: [] },
-        }))
-        router.handleClose(ws as never)
-      }
-    } finally {
-      router.dispose()
-      await rm(dataDir, { recursive: true, force: true })
-    }
-  })
-
-
-  test.each([
-    { type: "settings.readAppSettings" },
-    { type: "settings.writeAppSettings", analyticsEnabled: false },
-    { type: "settings.writeAppSettingsPatch", patch: { theme: "dark" } },
-  ] as const)("includes live models in $type replies", async (command) => {
-    const router = createTestRouter()
-    const ws = new FakeWebSocket()
-    try {
-      applyCodexModels([{ model: "gpt-6-astra", displayName: "GPT-6-Astra" }])
-      await router.handleMessage(ws as never, JSON.stringify({
-        v: PROTOCOL_VERSION,
-        type: "command",
-        id: "settings-live-models",
-        command,
-      }))
-      const reply = ws.sent.find((message) => (message as { type: string }).type === "ack") as {
-        result: AppSettingsSnapshot
-      }
-      expect(reply.result.availableProviders).toEqual(SERVER_PROVIDERS)
-      expect(reply.result.availableProviders?.find((provider) => provider.id === "codex")?.models)
-        .toEqual(expect.arrayContaining([expect.objectContaining({ id: "gpt-6-astra" })]))
-    } finally {
-      router.dispose()
-      resetServerProvidersForTests()
-    }
-  })
 })
 
 describe("ws-router provider auth", () => {
@@ -2543,351 +2529,6 @@ describe("ws-router provider auth", () => {
     ])
   })
 })
-
-describe("transcript windows", () => {
-  /** prompt, text, text: three entries, two assistant messages. */
-  function turn(n: number): TranscriptEntry[] {
-    return [
-      { _id: `p${n}`, createdAt: n, kind: "user_prompt", content: `question ${n}` },
-      { _id: `a${n}`, createdAt: n, kind: "assistant_text", text: "one" },
-      { _id: `b${n}`, createdAt: n, kind: "assistant_text", text: "two" },
-    ]
-  }
-
-  function createWindowedRouter(entries: TranscriptEntry[], overrides: Partial<CreateWsRouterArgs> = {}) {
-    const state = createEmptyState()
-    state.projectsById.set("project-1", { id: "project-1", localPath: "/tmp/project", title: "Project", createdAt: 1, updatedAt: 1 })
-    state.chatsById.set("chat-1", {
-      id: "chat-1", projectId: "project-1", title: "Chat", createdAt: 1, updatedAt: 1, unread: false,
-      provider: null, planMode: false, autoPlan: false, sessionToken: null, lastTurnOutcome: null,
-    })
-    // The store's own window methods are covered in event-store.test.ts;
-    // this fake mirrors them over the fixture so the router logic is what
-    // is under test here.
-    const fake = createFakeStore({
-      state,
-      getChat: (chatId: string) => state.chatsById.get(chatId) ?? null,
-      getProject: (projectId: string) => state.projectsById.get(projectId) ?? null,
-      getClientTranscript: () => ({ messages: entries, startIndex: 0, readAnchor: null }),
-      getTranscriptLength: () => entries.length,
-      snapTranscriptWindowStart: (_chatId: string, start: number) => snapToRowStart(entries, start),
-      getEntryIdAt: (_chatId: string, index: number) => entries[index]?._id ?? null,
-      getInitialTranscriptWindowStart: (_chatId: string, assistantMessages: number) =>
-        findTranscriptWindowStart(entries, { endExclusive: entries.length, assistantMessages }),
-      widenTranscriptWindowStart: (_chatId: string, current: number, options: { assistantMessages: number; untilMessageId?: string; all?: boolean }) => {
-        if (options.all) return 0
-        if (options.untilMessageId !== undefined) {
-          const index = entries.findIndex((item) => item._id === options.untilMessageId)
-          if (index < 0 || index >= current) return current
-          return findTranscriptWindowStart(entries, { endExclusive: current, assistantMessages: options.assistantMessages, mustIncludeIndex: index })
-        }
-        return findTranscriptWindowStart(entries, { endExclusive: current, assistantMessages: options.assistantMessages })
-      },
-    })
-    const settings = createFakeAppSettings({
-      getSnapshot: () => ({ ...DEFAULT_APP_SETTINGS_SNAPSHOT, transcript: { windowAssistantMessages: 2 } }),
-    })
-    return createTestRouter({ store: fake, appSettings: settings, ...overrides })
-  }
-
-  const chatData = (ws: FakeWebSocket, index: number) =>
-    (ws.sent[index] as { snapshot: { data: { messages: Array<{ _id: string }>; startIndex: number; incremental?: boolean; outline?: unknown[] } } }).snapshot.data
-
-  test("opens on the last window of assistant messages with the whole outline", async () => {
-    const router = createWindowedRouter([...turn(1), ...turn(2), ...turn(3)])
-    const ws = new FakeWebSocket()
-    router.handleOpen(ws as never)
-
-    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
-
-    const data = chatData(ws, 0)
-    expect(data.startIndex).toBe(6)
-    expect(data.messages.map((entry) => entry._id)).toEqual(["p3", "a3", "b3"])
-    expect(data.outline).toHaveLength(3)
-  })
-
-  test("loadOlder pushes the older slice as an incremental body in front, without the outline", async () => {
-    const router = createWindowedRouter([...turn(1), ...turn(2), ...turn(3)])
-    const ws = new FakeWebSocket()
-    router.handleOpen(ws as never)
-    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
-
-    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "command", id: "older", command: { type: "chat.loadOlder", chatId: "chat-1" } }))
-
-    const older = chatData(ws, 1)
-    expect(older.incremental).toBe(true)
-    expect(older.startIndex).toBe(3)
-    expect(older.messages.map((entry) => entry._id)).toEqual(["p2", "a2", "b2"])
-    expect(older.outline).toBeUndefined()
-    expect(ws.sent[2]).toEqual({ v: PROTOCOL_VERSION, type: "ack", id: "older", result: { startIndex: 3 } })
-
-    // Until a message: jumps straight to the window holding it.
-    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "command", id: "older-2", command: { type: "chat.loadOlder", chatId: "chat-1", untilMessageId: "p1" } }))
-    expect(chatData(ws, 3).messages.map((entry) => entry._id)).toEqual(["p1", "a1", "b1"])
-    expect(ws.sent[4]).toEqual({ v: PROTOCOL_VERSION, type: "ack", id: "older-2", result: { startIndex: 0 } })
-  })
-
-  test("a cached span reaching further back than the default keeps the client's window", async () => {
-    const router = createWindowedRouter([...turn(1), ...turn(2), ...turn(3)])
-    const ws = new FakeWebSocket()
-    router.handleOpen(ws as never)
-
-    await router.handleMessage(ws as never, JSON.stringify({
-      v: 1, type: "subscribe", id: "sub",
-      topic: { type: "chat", chatId: "chat-1", cachedSpan: { start: 3, end: 8, endEntryId: "a3" } },
-    }))
-
-    // Only the entry past the cache is sent, and the window start is the cache's.
-    const data = chatData(ws, 0)
-    expect(data.incremental).toBe(true)
-    expect(data.startIndex).toBe(8)
-    expect(data.messages.map((entry) => entry._id)).toEqual(["b3"])
-  })
-
-  test("the provider catalog rides a cached span's first push and every change, nothing else", async () => {
-    const router = createWindowedRouter([...turn(1), ...turn(2), ...turn(3)])
-    const ws = new FakeWebSocket()
-    router.handleOpen(ws as never)
-    const providersOf = (index: number) =>
-      (chatData(ws, index) as { availableProviders?: Array<{ id: string; models: Array<{ id: string }> }> }).availableProviders
-
-    try {
-      await router.handleMessage(ws as never, JSON.stringify({
-        v: 1, type: "subscribe", id: "sub",
-        topic: { type: "chat", chatId: "chat-1", cachedSpan: { start: 3, end: 8, endEntryId: "a3" } },
-      }))
-      // The client's cache may hold an old catalog, so the incremental first
-      // push carries the current one.
-      expect(chatData(ws, 0).incremental).toBe(true)
-      expect(providersOf(0)?.map((provider) => provider.id)).toEqual(["claude", "codex", "cursor", "grok", "pi"])
-
-      // Unchanged catalog: no later push repeats it.
-      await router.broadcastSnapshots()
-      for (let index = 1; index < ws.sent.length; index += 1) {
-        expect(providersOf(index)).toBeUndefined()
-      }
-
-      // A model discovered at runtime reaches the open chat.
-      expect(applyCodexModels([{ model: "gpt-6-astra", displayName: "GPT-6-Astra" }])).toBe(true)
-      await router.broadcastSnapshots()
-      const last = providersOf(ws.sent.length - 1)
-      expect(last?.find((provider) => provider.id === "codex")?.models.map((model) => model.id)).toEqual(["gpt-6-astra"])
-    } finally {
-      resetServerProvidersForTests()
-    }
-  })
-
-  test("a background subscription is pushed at most once per interval, and the last change still lands", async () => {
-    const entries = [...turn(1), ...turn(2)]
-    const router = createWindowedRouter(entries, { backgroundChatPushIntervalMs: 40 })
-    const ws = new FakeWebSocket()
-    router.handleOpen(ws as never)
-
-    await router.handleMessage(ws as never, JSON.stringify({
-      v: 1, type: "subscribe", id: "bg", topic: { type: "chat", chatId: "chat-1", background: true },
-    }))
-    // The first push is never held back.
-    expect(ws.sent).toHaveLength(1)
-
-    // Two changes inside the interval: neither goes out yet.
-    entries.push(...turn(3))
-    await router.broadcastSnapshots()
-    entries.push(...turn(4))
-    await router.broadcastSnapshots()
-    expect(ws.sent).toHaveLength(1)
-
-    // One trailing push carries both.
-    await Bun.sleep(80)
-    expect(ws.sent).toHaveLength(2)
-    expect(chatData(ws, 1).messages.map((entry) => entry._id)).toEqual(["p3", "a3", "b3", "p4", "a4", "b4"])
-  })
-
-  test("unsubscribing a background chat cancels its pending push", async () => {
-    const entries = [...turn(1), ...turn(2)]
-    const router = createWindowedRouter(entries, { backgroundChatPushIntervalMs: 40 })
-    const ws = new FakeWebSocket()
-    router.handleOpen(ws as never)
-    await router.handleMessage(ws as never, JSON.stringify({
-      v: 1, type: "subscribe", id: "bg", topic: { type: "chat", chatId: "chat-1", background: true },
-    }))
-    entries.push(...turn(3))
-    await router.broadcastSnapshots()
-
-    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "unsubscribe", id: "bg" }))
-    await Bun.sleep(80)
-    // The first push and the unsubscribe ack, nothing after.
-    expect(ws.sent).toHaveLength(2)
-    expect(ws.sent[1]).toEqual({ v: PROTOCOL_VERSION, type: "ack", id: "bg" })
-  })
-
-
-  test("retains the boundary of a window opened before its first entry arrives", async () => {
-    const entries: TranscriptEntry[] = []
-    const router = createWindowedRouter(entries)
-    const ws = new FakeWebSocket()
-    router.handleOpen(ws as never)
-    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
-    entries.push(...turn(1), ...turn(2), ...turn(3))
-    await router.broadcastSnapshots()
-    entries.unshift(...turn(0))
-    router.invalidateChatTranscript("chat-1")
-    await router.broadcastSnapshots()
-    const data = chatData(ws, ws.sent.length - 1)
-    expect(data.incremental).not.toBe(true)
-    expect(data.startIndex).toBe(3)
-    expect(data.messages[0]?._id).toBe("p1")
-    router.dispose()
-  })
-
-
-  test.each([false, true])("retained boundaries widen to their corrected Agent ancestry: %s", async (nested) => {
-    const root: TranscriptEntry = { _id: "root", createdAt: 4, kind: "tool_call", tool: { kind: "tool", toolKind: "subagent_task", toolName: "Agent", toolId: "agent-root", input: {} } }
-    const child: TranscriptEntry = { _id: "child", createdAt: 5, kind: "assistant_text", text: "findings" }
-    const entries: TranscriptEntry[] = [
-      ...turn(0), root,
-      ...(nested ? [
-        { _id: "interleaved", createdAt: 4, kind: "assistant_text", text: "main thread update" },
-        { _id: "nested", createdAt: 4, kind: "tool_call", parentToolUseId: "agent-root", tool: { kind: "tool", toolKind: "subagent_task", toolName: "Agent", toolId: "agent-nested", input: {} } },
-      ] satisfies TranscriptEntry[] : []),
-      child,
-      { _id: "tail", createdAt: 6, kind: "assistant_text", text: "summary" },
-    ]
-    const router = createWindowedRouter(entries)
-    const ws = new FakeWebSocket()
-    try {
-      router.handleOpen(ws as never)
-      await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
-      expect(chatData(ws, 0).messages.map(entry => entry._id)).toEqual(["child", "tail"])
-      // Reconciliation preserves the row ID while correcting only attribution.
-      child.parentToolUseId = nested ? "agent-nested" : "agent-root"
-      router.invalidateChatTranscript("chat-1")
-      await router.broadcastSnapshots()
-      const data = chatData(ws, ws.sent.length - 1)
-      expect(data.incremental).not.toBe(true)
-      expect(data.startIndex).toBe(3)
-      expect(data.messages.map(entry => entry._id)).toEqual(entries.slice(3).map(entry => entry._id))
-      const rows = processTranscriptMessages(data.messages as never[])
-      const agent = rows.find(row => row.kind === "tool" && row.toolId === "agent-root")
-      expect(agent).toBeDefined()
-      if (!nested && agent?.kind === "tool") {
-        expect(agent.children?.map(entry => entry.id)).toEqual(["child"])
-        expect(rows.some(row => row.id === "child")).toBe(false)
-      }
-      // A second replacement moves indices; retain the widened parent ID.
-      entries.unshift(...turn(-1))
-      router.invalidateChatTranscript("chat-1")
-      await router.broadcastSnapshots()
-      const shifted = chatData(ws, ws.sent.length - 1)
-      expect(shifted.incremental).not.toBe(true)
-      expect(shifted.startIndex).toBe(6)
-      expect(shifted.messages.map(entry => entry._id)).toEqual(entries.slice(6).map(entry => entry._id))
-    } finally {
-      router.dispose()
-    }
-  })
-
-
-  test("translates independent expanded windows by retained entry identity on replacement", async () => {
-    const entries = [...turn(1), ...turn(2), ...turn(3), ...turn(4)]
-    const router = createWindowedRouter(entries)
-    const first = new FakeWebSocket()
-    const second = new FakeWebSocket()
-    for (const ws of [first, second]) {
-      router.handleOpen(ws as never)
-      await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
-    }
-    await router.handleMessage(first as never, JSON.stringify({ v: 1, type: "command", id: "older", command: { type: "chat.loadOlder", chatId: "chat-1", untilMessageId: "p1" } }))
-    await router.handleMessage(second as never, JSON.stringify({ v: 1, type: "command", id: "older", command: { type: "chat.loadOlder", chatId: "chat-1", untilMessageId: "p2" } }))
-    // Insert older native history; retained reader boundaries shift independently.
-    entries.unshift(...turn(0))
-    router.invalidateChatTranscript("chat-1")
-    await router.broadcastSnapshots()
-    const firstData = chatData(first, first.sent.length - 1)
-    const secondData = chatData(second, second.sent.length - 1)
-    expect(firstData.incremental).not.toBe(true)
-    expect(secondData.incremental).not.toBe(true)
-    expect(firstData.startIndex).toBe(3)
-    expect(secondData.startIndex).toBe(6)
-    expect(firstData.messages[0]?._id).toBe("p1")
-    expect(secondData.messages[0]?._id).toBe("p2")
-    expect(firstData.outline).toHaveLength(5)
-    expect(secondData.outline).toHaveLength(5)
-    router.dispose()
-  })
-
-
-  test("replaces a subscribed transcript window after provider reconciliation", async () => {
-    const entries = [...turn(1), ...turn(2)]
-    const router = createWindowedRouter(entries)
-    const ws = new FakeWebSocket()
-    router.handleOpen(ws as never)
-    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
-    entries.splice(0, entries.length, ...turn(4), ...turn(5))
-    router.invalidateChatTranscript("chat-1")
-    await router.broadcastSnapshots()
-    const data = chatData(ws, ws.sent.length - 1)
-    expect(data.incremental).not.toBe(true)
-    expect(data.messages.map(entry => entry._id)).toEqual(["p5", "a5", "b5"])
-    expect(data.outline).toHaveLength(2)
-    router.dispose()
-  })
-
-
-  for (const rewrittenTurns of [[8], [8, 9, 10], [8, 9, 10, 11]]) {
-    test(`history rewrites refresh all subscribed windows (${rewrittenTurns.length} turns)`, async () => {
-      const entries = [...turn(1), ...turn(2), ...turn(3)]
-      const router = createWindowedRouter(entries)
-      const sockets = [new FakeWebSocket(), new FakeWebSocket()]
-      try {
-        for (const ws of sockets) {
-          router.handleOpen(ws as never)
-          await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
-        }
-        await router.handleMessage(sockets[1] as never, JSON.stringify({ v: 1, type: "command", id: "older", command: { type: "chat.loadOlder", chatId: "chat-1", all: true } }))
-        entries.splice(0, entries.length, ...rewrittenTurns.flatMap(number => turn(number)))
-        router.invalidateChatTranscript?.("chat-1")
-        await router.broadcastSnapshots()
-        for (const ws of sockets) {
-          const data = chatData(ws, ws.sent.length - 1)
-          expect(data.incremental).not.toBe(true)
-          expect(data.startIndex).toBe((rewrittenTurns.length - 1) * 3)
-          const last = rewrittenTurns.at(-1)
-          expect(data.messages.map(entry => entry._id)).toEqual([`p${last}`, `a${last}`, `b${last}`])
-          expect(data.outline).toHaveLength(rewrittenTurns.length)
-        }
-      } finally {
-        router.dispose()
-      }
-    })
-  }
-
-
-  test.each([false, true])("history rewrites retain independent expanded boundaries when indexes shift: %s", async (shifted) => {
-    const entries = [1, 2, 3, 4, 5].flatMap(number => turn(number))
-    const router = createWindowedRouter(entries)
-    const sockets = [new FakeWebSocket(), new FakeWebSocket()]
-    try {
-      for (const ws of sockets) {
-        router.handleOpen(ws as never)
-        await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
-      }
-      await router.handleMessage(sockets[0] as never, JSON.stringify({ v: 1, type: "command", id: "all", command: { type: "chat.loadOlder", chatId: "chat-1", all: true } }))
-      await router.handleMessage(sockets[1] as never, JSON.stringify({ v: 1, type: "command", id: "some", command: { type: "chat.loadOlder", chatId: "chat-1", untilMessageId: "p3" } }))
-      const replacement = [...(shifted ? turn(0) : []), ...[1, 2, 3, 4, 9].flatMap(number => turn(number))]
-      entries.splice(0, entries.length, ...replacement)
-      router.invalidateChatTranscript("chat-1")
-      await router.broadcastSnapshots()
-      const starts = [shifted ? 3 : 0, shifted ? 9 : 6]
-      for (const [index, ws] of sockets.entries()) {
-        const data = chatData(ws, ws.sent.length - 1)
-        expect(data.incremental).not.toBe(true)
-        expect(data.startIndex).toBe(starts[index]!)
-        expect(data.messages.map(item => item._id)).toEqual(replacement.slice(starts[index]!).map(item => item._id))
-      }
-    } finally { router.dispose() }
-  })
-})
-
 
 describe("project transcript search", () => {
   function chat(projectId: string, id: string, title: string, updatedAt: number, extra: Record<string, unknown> = {}) {
@@ -3031,5 +2672,343 @@ describe("project transcript search", () => {
     expect(second.matches.map((match) => match.entryId)).toEqual(["older-1"])
     expect(second.hasMore).toBe(false)
     expect(second.nextCursor).toBeUndefined()
+  })
+})
+
+describe("transcript windows", () => {
+  /** prompt, text, text: three entries, two assistant messages. */
+  function turn(n: number): TranscriptEntry[] {
+    return [
+      { _id: `p${n}`, createdAt: n, kind: "user_prompt", content: `question ${n}` },
+      { _id: `a${n}`, createdAt: n, kind: "assistant_text", text: "one" },
+      { _id: `b${n}`, createdAt: n, kind: "assistant_text", text: "two" },
+    ]
+  }
+
+  function createWindowedRouter(entries: TranscriptEntry[], overrides: Partial<CreateWsRouterArgs> = {}) {
+    const state = createEmptyState()
+    state.projectsById.set("project-1", { id: "project-1", localPath: "/tmp/project", title: "Project", createdAt: 1, updatedAt: 1 })
+    state.chatsById.set("chat-1", {
+      id: "chat-1", projectId: "project-1", title: "Chat", createdAt: 1, updatedAt: 1, unread: false,
+      provider: null, planMode: false, autoPlan: false, sessionToken: null, lastTurnOutcome: null,
+    })
+    // The store's own window methods are covered in event-store.test.ts;
+    // this fake mirrors them over the fixture so the router logic is what
+    // is under test here.
+    const fake = createFakeStore({
+      state,
+      getChat: (chatId: string) => state.chatsById.get(chatId) ?? null,
+      getProject: (projectId: string) => state.projectsById.get(projectId) ?? null,
+      getClientTranscript: () => ({ messages: entries, startIndex: 0, readAnchor: null }),
+      getTranscriptLength: () => entries.length,
+      snapTranscriptWindowStart: (_chatId: string, start: number) => snapToRowStart(entries, start),
+      getEntryIdAt: (_chatId: string, index: number) => entries[index]?._id ?? null,
+      getInitialTranscriptWindowStart: (_chatId: string, assistantMessages: number) =>
+        findTranscriptWindowStart(entries, { endExclusive: entries.length, assistantMessages }),
+      widenTranscriptWindowStart: (_chatId: string, current: number, options: { assistantMessages: number; untilMessageId?: string; all?: boolean }) => {
+        if (options.all) return 0
+        if (options.untilMessageId !== undefined) {
+          const index = entries.findIndex((item) => item._id === options.untilMessageId)
+          if (index < 0 || index >= current) return current
+          return findTranscriptWindowStart(entries, { endExclusive: current, assistantMessages: options.assistantMessages, mustIncludeIndex: index })
+        }
+        return findTranscriptWindowStart(entries, { endExclusive: current, assistantMessages: options.assistantMessages })
+      },
+    })
+    const settings = createFakeAppSettings({
+      getSnapshot: () => ({ ...DEFAULT_APP_SETTINGS_SNAPSHOT, transcript: { windowAssistantMessages: 2 } }),
+    })
+    return createTestRouter({ store: fake, appSettings: settings, ...overrides })
+  }
+
+  const chatData = (ws: FakeWebSocket, index: number) =>
+    (ws.sent[index] as { snapshot: { data: { messages: Array<{ _id: string }>; startIndex: number; incremental?: boolean; outline?: unknown[] } } }).snapshot.data
+
+  test("retains the boundary of a window opened before its first entry arrives", async () => {
+    const entries: TranscriptEntry[] = []
+    const router = createWindowedRouter(entries)
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+    entries.push(...turn(1), ...turn(2), ...turn(3))
+    await router.broadcastSnapshots()
+    entries.unshift(...turn(0))
+    router.invalidateChatTranscript("chat-1")
+    await router.broadcastSnapshots()
+    const data = chatData(ws, ws.sent.length - 1)
+    expect(data.incremental).not.toBe(true)
+    expect(data.startIndex).toBe(3)
+    expect(data.messages[0]?._id).toBe("p1")
+    router.dispose()
+  })
+
+  test.each([false, true])("retained boundaries widen to their corrected Agent ancestry: %s", async (nested) => {
+    const root: TranscriptEntry = { _id: "root", createdAt: 4, kind: "tool_call", tool: { kind: "tool", toolKind: "subagent_task", toolName: "Agent", toolId: "agent-root", input: {} } }
+    const child: TranscriptEntry = { _id: "child", createdAt: 5, kind: "assistant_text", text: "findings" }
+    const entries: TranscriptEntry[] = [
+      ...turn(0), root,
+      ...(nested ? [
+        { _id: "interleaved", createdAt: 4, kind: "assistant_text", text: "main thread update" },
+        { _id: "nested", createdAt: 4, kind: "tool_call", parentToolUseId: "agent-root", tool: { kind: "tool", toolKind: "subagent_task", toolName: "Agent", toolId: "agent-nested", input: {} } },
+      ] satisfies TranscriptEntry[] : []),
+      child,
+      { _id: "tail", createdAt: 6, kind: "assistant_text", text: "summary" },
+    ]
+    const router = createWindowedRouter(entries)
+    const ws = new FakeWebSocket()
+    try {
+      router.handleOpen(ws as never)
+      await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+      expect(chatData(ws, 0).messages.map(entry => entry._id)).toEqual(["child", "tail"])
+      // Reconciliation preserves the row ID while correcting only attribution.
+      child.parentToolUseId = nested ? "agent-nested" : "agent-root"
+      router.invalidateChatTranscript("chat-1")
+      await router.broadcastSnapshots()
+      const data = chatData(ws, ws.sent.length - 1)
+      expect(data.incremental).not.toBe(true)
+      expect(data.startIndex).toBe(3)
+      expect(data.messages.map(entry => entry._id)).toEqual(entries.slice(3).map(entry => entry._id))
+      const rows = processTranscriptMessages(data.messages as never[])
+      const agent = rows.find(row => row.kind === "tool" && row.toolId === "agent-root")
+      expect(agent).toBeDefined()
+      if (!nested && agent?.kind === "tool") {
+        expect(agent.children?.map(entry => entry.id)).toEqual(["child"])
+        expect(rows.some(row => row.id === "child")).toBe(false)
+      }
+      // A second replacement moves indices; retain the widened parent ID.
+      entries.unshift(...turn(-1))
+      router.invalidateChatTranscript("chat-1")
+      await router.broadcastSnapshots()
+      const shifted = chatData(ws, ws.sent.length - 1)
+      expect(shifted.incremental).not.toBe(true)
+      expect(shifted.startIndex).toBe(6)
+      expect(shifted.messages.map(entry => entry._id)).toEqual(entries.slice(6).map(entry => entry._id))
+    } finally {
+      router.dispose()
+    }
+  })
+
+  for (const rewrittenTurns of [[8], [8, 9, 10], [8, 9, 10, 11]]) {
+    test(`history rewrites refresh all subscribed windows (${rewrittenTurns.length} turns)`, async () => {
+      const entries = [...turn(1), ...turn(2), ...turn(3)]
+      const router = createWindowedRouter(entries)
+      const sockets = [new FakeWebSocket(), new FakeWebSocket()]
+      try {
+        for (const ws of sockets) {
+          router.handleOpen(ws as never)
+          await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+        }
+        await router.handleMessage(sockets[1] as never, JSON.stringify({ v: 1, type: "command", id: "older", command: { type: "chat.loadOlder", chatId: "chat-1", all: true } }))
+        entries.splice(0, entries.length, ...rewrittenTurns.flatMap(number => turn(number)))
+        router.invalidateChatTranscript?.("chat-1")
+        await router.broadcastSnapshots()
+        for (const ws of sockets) {
+          const data = chatData(ws, ws.sent.length - 1)
+          expect(data.incremental).not.toBe(true)
+          expect(data.startIndex).toBe((rewrittenTurns.length - 1) * 3)
+          const last = rewrittenTurns.at(-1)
+          expect(data.messages.map(entry => entry._id)).toEqual([`p${last}`, `a${last}`, `b${last}`])
+          expect(data.outline).toHaveLength(rewrittenTurns.length)
+        }
+      } finally {
+        router.dispose()
+      }
+    })
+  }
+
+  test.each([false, true])("history rewrites retain independent expanded boundaries when indexes shift: %s", async (shifted) => {
+    const entries = [1, 2, 3, 4, 5].flatMap(number => turn(number))
+    const router = createWindowedRouter(entries)
+    const sockets = [new FakeWebSocket(), new FakeWebSocket()]
+    try {
+      for (const ws of sockets) {
+        router.handleOpen(ws as never)
+        await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+      }
+      await router.handleMessage(sockets[0] as never, JSON.stringify({ v: 1, type: "command", id: "all", command: { type: "chat.loadOlder", chatId: "chat-1", all: true } }))
+      await router.handleMessage(sockets[1] as never, JSON.stringify({ v: 1, type: "command", id: "some", command: { type: "chat.loadOlder", chatId: "chat-1", untilMessageId: "p3" } }))
+      const replacement = [...(shifted ? turn(0) : []), ...[1, 2, 3, 4, 9].flatMap(number => turn(number))]
+      entries.splice(0, entries.length, ...replacement)
+      router.invalidateChatTranscript("chat-1")
+      await router.broadcastSnapshots()
+      const starts = [shifted ? 3 : 0, shifted ? 9 : 6]
+      for (const [index, ws] of sockets.entries()) {
+        const data = chatData(ws, ws.sent.length - 1)
+        expect(data.incremental).not.toBe(true)
+        expect(data.startIndex).toBe(starts[index]!)
+        expect(data.messages.map(item => item._id)).toEqual(replacement.slice(starts[index]!).map(item => item._id))
+      }
+    } finally { router.dispose() }
+  })
+
+  test("translates independent expanded windows by retained entry identity on replacement", async () => {
+    const entries = [...turn(1), ...turn(2), ...turn(3), ...turn(4)]
+    const router = createWindowedRouter(entries)
+    const first = new FakeWebSocket()
+    const second = new FakeWebSocket()
+    for (const ws of [first, second]) {
+      router.handleOpen(ws as never)
+      await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+    }
+    await router.handleMessage(first as never, JSON.stringify({ v: 1, type: "command", id: "older", command: { type: "chat.loadOlder", chatId: "chat-1", untilMessageId: "p1" } }))
+    await router.handleMessage(second as never, JSON.stringify({ v: 1, type: "command", id: "older", command: { type: "chat.loadOlder", chatId: "chat-1", untilMessageId: "p2" } }))
+    // Insert older native history; retained reader boundaries shift independently.
+    entries.unshift(...turn(0))
+    router.invalidateChatTranscript("chat-1")
+    await router.broadcastSnapshots()
+    const firstData = chatData(first, first.sent.length - 1)
+    const secondData = chatData(second, second.sent.length - 1)
+    expect(firstData.incremental).not.toBe(true)
+    expect(secondData.incremental).not.toBe(true)
+    expect(firstData.startIndex).toBe(3)
+    expect(secondData.startIndex).toBe(6)
+    expect(firstData.messages[0]?._id).toBe("p1")
+    expect(secondData.messages[0]?._id).toBe("p2")
+    expect(firstData.outline).toHaveLength(5)
+    expect(secondData.outline).toHaveLength(5)
+    router.dispose()
+  })
+
+  test("replaces a subscribed transcript window after provider reconciliation", async () => {
+    const entries = [...turn(1), ...turn(2)]
+    const router = createWindowedRouter(entries)
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+    entries.splice(0, entries.length, ...turn(4), ...turn(5))
+    router.invalidateChatTranscript("chat-1")
+    await router.broadcastSnapshots()
+    const data = chatData(ws, ws.sent.length - 1)
+    expect(data.incremental).not.toBe(true)
+    expect(data.messages.map(entry => entry._id)).toEqual(["p5", "a5", "b5"])
+    expect(data.outline).toHaveLength(2)
+    router.dispose()
+  })
+
+  test("opens on the last window of assistant messages with the whole outline", async () => {
+    const router = createWindowedRouter([...turn(1), ...turn(2), ...turn(3)])
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+
+    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+
+    const data = chatData(ws, 0)
+    expect(data.startIndex).toBe(6)
+    expect(data.messages.map((entry) => entry._id)).toEqual(["p3", "a3", "b3"])
+    expect(data.outline).toHaveLength(3)
+  })
+
+  test("loadOlder pushes the older slice as an incremental body in front, without the outline", async () => {
+    const router = createWindowedRouter([...turn(1), ...turn(2), ...turn(3)])
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "subscribe", id: "sub", topic: { type: "chat", chatId: "chat-1" } }))
+
+    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "command", id: "older", command: { type: "chat.loadOlder", chatId: "chat-1" } }))
+
+    const older = chatData(ws, 1)
+    expect(older.incremental).toBe(true)
+    expect(older.startIndex).toBe(3)
+    expect(older.messages.map((entry) => entry._id)).toEqual(["p2", "a2", "b2"])
+    expect(older.outline).toBeUndefined()
+    expect(ws.sent[2]).toEqual({ v: PROTOCOL_VERSION, type: "ack", id: "older", result: { startIndex: 3 } })
+
+    // Until a message: jumps straight to the window holding it.
+    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "command", id: "older-2", command: { type: "chat.loadOlder", chatId: "chat-1", untilMessageId: "p1" } }))
+    expect(chatData(ws, 3).messages.map((entry) => entry._id)).toEqual(["p1", "a1", "b1"])
+    expect(ws.sent[4]).toEqual({ v: PROTOCOL_VERSION, type: "ack", id: "older-2", result: { startIndex: 0 } })
+  })
+
+  test("a cached span reaching further back than the default keeps the client's window", async () => {
+    const router = createWindowedRouter([...turn(1), ...turn(2), ...turn(3)])
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+
+    await router.handleMessage(ws as never, JSON.stringify({
+      v: 1, type: "subscribe", id: "sub",
+      topic: { type: "chat", chatId: "chat-1", cachedSpan: { start: 3, end: 8, endEntryId: "a3" } },
+    }))
+
+    // Only the entry past the cache is sent, and the window start is the cache's.
+    const data = chatData(ws, 0)
+    expect(data.incremental).toBe(true)
+    expect(data.startIndex).toBe(8)
+    expect(data.messages.map((entry) => entry._id)).toEqual(["b3"])
+  })
+
+  test("the provider catalog rides a cached span's first push and every change, nothing else", async () => {
+    const router = createWindowedRouter([...turn(1), ...turn(2), ...turn(3)])
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+    const providersOf = (index: number) =>
+      (chatData(ws, index) as { availableProviders?: Array<{ id: string; models: Array<{ id: string }> }> }).availableProviders
+
+    try {
+      await router.handleMessage(ws as never, JSON.stringify({
+        v: 1, type: "subscribe", id: "sub",
+        topic: { type: "chat", chatId: "chat-1", cachedSpan: { start: 3, end: 8, endEntryId: "a3" } },
+      }))
+      // The client's cache may hold an old catalog, so the incremental first
+      // push carries the current one.
+      expect(chatData(ws, 0).incremental).toBe(true)
+      expect(providersOf(0)?.map((provider) => provider.id)).toEqual(["claude", "codex", "cursor", "grok", "pi"])
+
+      // Unchanged catalog: no later push repeats it.
+      await router.broadcastSnapshots()
+      for (let index = 1; index < ws.sent.length; index += 1) {
+        expect(providersOf(index)).toBeUndefined()
+      }
+
+      // A model discovered at runtime reaches the open chat.
+      expect(applyCodexModels([{ model: "gpt-6-astra", displayName: "GPT-6-Astra" }])).toBe(true)
+      await router.broadcastSnapshots()
+      const last = providersOf(ws.sent.length - 1)
+      expect(last?.find((provider) => provider.id === "codex")?.models.map((model) => model.id)).toEqual(["gpt-6-astra"])
+    } finally {
+      resetServerProvidersForTests()
+    }
+  })
+
+  test("a background subscription is pushed at most once per interval, and the last change still lands", async () => {
+    const entries = [...turn(1), ...turn(2)]
+    const router = createWindowedRouter(entries, { backgroundChatPushIntervalMs: 40 })
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+
+    await router.handleMessage(ws as never, JSON.stringify({
+      v: 1, type: "subscribe", id: "bg", topic: { type: "chat", chatId: "chat-1", background: true },
+    }))
+    // The first push is never held back.
+    expect(ws.sent).toHaveLength(1)
+
+    // Two changes inside the interval: neither goes out yet.
+    entries.push(...turn(3))
+    await router.broadcastSnapshots()
+    entries.push(...turn(4))
+    await router.broadcastSnapshots()
+    expect(ws.sent).toHaveLength(1)
+
+    // One trailing push carries both.
+    await Bun.sleep(80)
+    expect(ws.sent).toHaveLength(2)
+    expect(chatData(ws, 1).messages.map((entry) => entry._id)).toEqual(["p3", "a3", "b3", "p4", "a4", "b4"])
+  })
+
+  test("unsubscribing a background chat cancels its pending push", async () => {
+    const entries = [...turn(1), ...turn(2)]
+    const router = createWindowedRouter(entries, { backgroundChatPushIntervalMs: 40 })
+    const ws = new FakeWebSocket()
+    router.handleOpen(ws as never)
+    await router.handleMessage(ws as never, JSON.stringify({
+      v: 1, type: "subscribe", id: "bg", topic: { type: "chat", chatId: "chat-1", background: true },
+    }))
+    entries.push(...turn(3))
+    await router.broadcastSnapshots()
+
+    await router.handleMessage(ws as never, JSON.stringify({ v: 1, type: "unsubscribe", id: "bg" }))
+    await Bun.sleep(80)
+    // The first push and the unsubscribe ack, nothing after.
+    expect(ws.sent).toHaveLength(2)
+    expect(ws.sent[1]).toEqual({ v: PROTOCOL_VERSION, type: "ack", id: "bg" })
   })
 })

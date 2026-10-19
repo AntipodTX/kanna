@@ -140,6 +140,20 @@ describe("readAppSettingsSnapshot", () => {
     })
   })
 
+  test("normalizes the idle session timeout setting", async () => {
+    const filePath = await createTempFilePath()
+    await writeFile(filePath, JSON.stringify({ idleSessionTimeout: "15m" }), "utf8")
+
+    await expect(readAppSettingsSnapshot(filePath)).resolves.toMatchObject({
+      idleSessionTimeout: "15m",
+    })
+
+    await writeFile(filePath, JSON.stringify({ idleSessionTimeout: "bogus" }), "utf8")
+    await expect(readAppSettingsSnapshot(filePath)).resolves.toMatchObject({
+      idleSessionTimeout: "1h",
+    })
+  })
+
   test("devbox extra is server-computed: in every snapshot, never persisted", async () => {
     const filePath = await createTempFilePath()
     const manager = new AppSettingsManager(filePath, { devbox: true })
@@ -212,21 +226,6 @@ describe("readAppSettingsSnapshot", () => {
       manager.dispose()
     }
   })
-
-
-  test("normalizes the idle session timeout setting", async () => {
-    const filePath = await createTempFilePath()
-    await writeFile(filePath, JSON.stringify({ idleSessionTimeout: "15m" }), "utf8")
-
-    await expect(readAppSettingsSnapshot(filePath)).resolves.toMatchObject({
-      idleSessionTimeout: "15m",
-    })
-
-    await writeFile(filePath, JSON.stringify({ idleSessionTimeout: "bogus" }), "utf8")
-    await expect(readAppSettingsSnapshot(filePath)).resolves.toMatchObject({
-      idleSessionTimeout: "1h",
-    })
-  })
 })
 
 describe("AppSettingsManager", () => {
@@ -296,6 +295,21 @@ describe("AppSettingsManager", () => {
       setupDismissed: true,
     })
     reopened.dispose()
+  })
+
+  test("writes idle session timeout patches", async () => {
+    const filePath = await createTempFilePath()
+    const manager = new AppSettingsManager(filePath)
+
+    await manager.initialize()
+    const snapshot = await manager.writePatch({ idleSessionTimeout: "never" })
+
+    expect(snapshot.idleSessionTimeout).toBe("never")
+    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
+      idleSessionTimeout: "never",
+    })
+
+    manager.dispose()
   })
 
   test("patches expanded settings without replacing the stored user id", async () => {
@@ -432,22 +446,6 @@ describe("AppSettingsManager", () => {
     expect(legacy.providerDefaults.codex).toMatchObject({
       model: "gpt-5.5",
       modelOptions: { reasoningEffort: "xhigh", fastMode: false },
-    })
-
-    manager.dispose()
-  })
-
-
-  test("writes idle session timeout patches", async () => {
-    const filePath = await createTempFilePath()
-    const manager = new AppSettingsManager(filePath)
-
-    await manager.initialize()
-    const snapshot = await manager.writePatch({ idleSessionTimeout: "never" })
-
-    expect(snapshot.idleSessionTimeout).toBe("never")
-    expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
-      idleSessionTimeout: "never",
     })
 
     manager.dispose()

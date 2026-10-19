@@ -1,8 +1,8 @@
-import { codexAsyncQuestionTool, encodeCodexQuestionReplies } from "../../shared/codex-questions"
 import { describe, expect, test } from "bun:test"
 import { processTranscriptMessages } from "./parseTranscript"
 import { getLatestToolIds } from "../app/derived"
 import type { TranscriptEntry } from "../../shared/types"
+import { codexAsyncQuestionTool, encodeCodexQuestionReplies } from "../../shared/codex-questions"
 
 function entry(partial: Omit<TranscriptEntry, "_id" | "createdAt">): TranscriptEntry {
   return {
@@ -13,6 +13,30 @@ function entry(partial: Omit<TranscriptEntry, "_id" | "createdAt">): TranscriptE
 }
 
 describe("processTranscriptMessages", () => {
+  test("an async card does not hide an older blocking question", () => {
+    const blocking = entry({ kind: "tool_call", tool: { kind: "tool", toolKind: "ask_user_question", toolName: "AskUserQuestion", toolId: "blocking", input: { questions: [{ question: "Blocking?" }] } } })
+    const tool = codexAsyncQuestionTool({ id: "async", delivery: "async", questions: [{ title: "Async?" }] }, "thread")!
+    expect(getLatestToolIds(processTranscriptMessages([blocking, entry({ kind: "tool_call", tool })])).AskUserQuestion).toBe(blocking._id)
+  })
+  test("hydrates async answers after turn completion identically on reload and incremental updates", () => {
+    const tool = codexAsyncQuestionTool({ id: "async-1", delivery: "async", questions: [
+      { title: "Same?", options: ["A", "B"] }, { title: "Same?" },
+    ] }, "thread-1")!
+    const entries = [entry({ kind: "tool_call", tool }), entry({ kind: "result", subtype: "success", isError: false, durationMs: 1, result: "Done" })]
+    const before = processTranscriptMessages(entries)
+    const replies = tool.input.questions.map((question, index) => ({ questionItemId: question.id!, question: question.question, answer: `Answer ${index}` }))
+    const partial = [...entries, entry({ kind: "user_prompt", content: encodeCodexQuestionReplies([replies[0]!]) })]
+    const partialMessages = processTranscriptMessages(partial, before)
+    expect(partialMessages[0]).toMatchObject({ result: { answers: { [replies[0]!.questionItemId]: ["Answer 0"] } } })
+    expect(before[0]).not.toHaveProperty("result")
+    const complete = [...partial, entry({ kind: "user_prompt", content: encodeCodexQuestionReplies([replies[1]!]) })]
+    const incremental = processTranscriptMessages(complete, partialMessages)
+    expect(incremental).toEqual(processTranscriptMessages(complete))
+    expect(incremental[0]).toMatchObject({ result: { answers: {
+      [replies[0]!.questionItemId]: ["Answer 0"], [replies[1]!.questionItemId]: ["Answer 1"],
+    } } })
+  })
+
   test("hydrates tool results onto prior tool calls", () => {
     const messages = processTranscriptMessages([
       entry({
@@ -325,7 +349,6 @@ describe("processTranscriptMessages", () => {
     expect(messages[0].result).toEqual({ answers: { "Provider?": ["Claude"] } })
   })
 
-
   test("preserves Claude plan adjustment text when a later echoed tool result arrives", () => {
     const messages = processTranscriptMessages([
       entry({
@@ -363,7 +386,6 @@ describe("processTranscriptMessages", () => {
       message: "Keep the existing deployment order",
     })
   })
-
 
   test("recovers an empty Claude ExitPlanMode input from prior plan write and edit events", () => {
     const planPath = "/home/test/.claude/plans/current-plan.md"
@@ -424,7 +446,6 @@ describe("processTranscriptMessages", () => {
     expect(exitPlan.input.plan).toBe("## Plan\n\n- Updated first step")
   })
 
-
   test("does not reuse an inline plan for a later unrelated empty ExitPlanMode call", () => {
     const messages = processTranscriptMessages([
       entry({
@@ -458,7 +479,6 @@ describe("processTranscriptMessages", () => {
     }
     expect(unrelatedExitPlan.input.plan).toBeUndefined()
   })
-
 
   test("does not mutate the source transcript input when recovering a plan", () => {
     const planPath = "/home/test/.claude/plans/source-plan.md"
@@ -502,33 +522,6 @@ describe("processTranscriptMessages", () => {
     }
     expect(exitPlan.input.plan).toBe("## Source plan")
     expect(sourceInput).toEqual({})
-  })
-
-
-  test("an async card does not hide an older blocking question", () => {
-    const blocking = entry({ kind: "tool_call", tool: { kind: "tool", toolKind: "ask_user_question", toolName: "AskUserQuestion", toolId: "blocking", input: { questions: [{ question: "Blocking?" }] } } })
-    const tool = codexAsyncQuestionTool({ id: "async", delivery: "async", questions: [{ title: "Async?" }] }, "thread")!
-    expect(getLatestToolIds(processTranscriptMessages([blocking, entry({ kind: "tool_call", tool })])).AskUserQuestion).toBe(blocking._id)
-  })
-
-
-  test("hydrates async answers after turn completion identically on reload and incremental updates", () => {
-    const tool = codexAsyncQuestionTool({ id: "async-1", delivery: "async", questions: [
-      { title: "Same?", options: ["A", "B"] }, { title: "Same?" },
-    ] }, "thread-1")!
-    const entries = [entry({ kind: "tool_call", tool }), entry({ kind: "result", subtype: "success", isError: false, durationMs: 1, result: "Done" })]
-    const before = processTranscriptMessages(entries)
-    const replies = tool.input.questions.map((question, index) => ({ questionItemId: question.id!, question: question.question, answer: `Answer ${index}` }))
-    const partial = [...entries, entry({ kind: "user_prompt", content: encodeCodexQuestionReplies([replies[0]!]) })]
-    const partialMessages = processTranscriptMessages(partial, before)
-    expect(partialMessages[0]).toMatchObject({ result: { answers: { [replies[0]!.questionItemId]: ["Answer 0"] } } })
-    expect(before[0]).not.toHaveProperty("result")
-    const complete = [...partial, entry({ kind: "user_prompt", content: encodeCodexQuestionReplies([replies[1]!]) })]
-    const incremental = processTranscriptMessages(complete, partialMessages)
-    expect(incremental).toEqual(processTranscriptMessages(complete))
-    expect(incremental[0]).toMatchObject({ result: { answers: {
-      [replies[0]!.questionItemId]: ["Answer 0"], [replies[1]!.questionItemId]: ["Answer 1"],
-    } } })
   })
 })
 

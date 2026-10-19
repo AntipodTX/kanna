@@ -5,17 +5,17 @@ import { homedir } from "node:os"
 import path from "node:path"
 import { getDataDir, LOG_PREFIX } from "../shared/branding"
 import { toMessagePreview } from "../shared/message-preview"
-import { buildTranscriptOutline, findTranscriptWindowStart, snapToRowStart } from "../shared/transcript-window"
 import { ClaudeExitPlanRecovery, isEmptyClaudeExitPlan } from "../shared/claude-plan-recovery"
 import { getUserMessageDisplayText } from "../shared/user-message-content"
+import { buildTranscriptOutline, findTranscriptWindowStart, snapToRowStart } from "../shared/transcript-window"
 import type { TranscriptOutlineEntry } from "../shared/types"
 import type { AgentProvider, ModelOptions, QueuedChatMessage, ResolvedChatReadAnchor, TranscriptEntry } from "../shared/types"
 import { cloneModelOptions, STORE_VERSION } from "../shared/types"
 import {
   type ChatEvent,
   type ChatRecord,
-  type ContextRestoration,
   type CodexHistoryIntegrity,
+  type ContextRestoration,
   type ProjectEvent,
   type QueuedMessageEvent,
   type SnapshotFile,
@@ -2301,44 +2301,6 @@ export class EventStore {
     return write
   }
 
-  private createTranscriptMetadataEvent(chatId: string, entries: TranscriptEntry[]): ChatEvent {
-    let lastMessageAt: number | undefined
-    let lastAgentMessageAt: number | undefined
-    let lastAgentMessagePreviewAt: number | undefined
-    let lastUserMessagePreview: string | undefined
-    let lastAgentMessagePreview: string | undefined
-    for (const entry of entries) {
-      if (isAgentAuthoredEntry(entry)) lastAgentMessageAt = Math.max(lastAgentMessageAt ?? 0, entry.createdAt)
-      if (entry.kind === "user_prompt") {
-        lastMessageAt = Math.max(lastMessageAt ?? 0, entry.createdAt)
-        if (!entry.hidden) {
-          const preview = buildChatMessagePreview(entry.content)
-          if (preview) lastUserMessagePreview = preview
-        }
-      } else if (entry.kind === "assistant_text" && !entry.hidden && !entry.parentToolUseId) {
-        const preview = buildChatMessagePreview(entry.text)
-        if (preview) {
-          lastAgentMessagePreview = preview
-          lastAgentMessagePreviewAt = entry.createdAt
-        }
-      }
-    }
-
-    return {
-      v: STORE_VERSION,
-      type: "chat_transcript_metadata_set",
-      timestamp: Date.now(),
-      chatId,
-      hasMessages: entries.length > 0,
-      promptHistoryRevision: crypto.randomUUID(),
-      lastMessageAt: lastMessageAt ?? null,
-      lastAgentMessageAt: lastAgentMessageAt ?? null,
-      lastAgentMessagePreviewAt: lastAgentMessagePreviewAt ?? null,
-      lastUserMessagePreview: lastUserMessagePreview ?? null,
-      lastAgentMessagePreview: lastAgentMessagePreview ?? null,
-    }
-  }
-
   async replaceTranscript(chatId: string, entries: TranscriptEntry[]) {
     this.requireChat(chatId)
     return this.enqueueWrite(() => this.replaceTranscriptEntries(chatId, entries))
@@ -2996,6 +2958,43 @@ export class EventStore {
     }
   }
 
+  private createTranscriptMetadataEvent(chatId: string, entries: TranscriptEntry[]): ChatEvent {
+    let lastMessageAt: number | undefined
+    let lastAgentMessageAt: number | undefined
+    let lastAgentMessagePreviewAt: number | undefined
+    let lastUserMessagePreview: string | undefined
+    let lastAgentMessagePreview: string | undefined
+    for (const entry of entries) {
+      if (isAgentAuthoredEntry(entry)) lastAgentMessageAt = Math.max(lastAgentMessageAt ?? 0, entry.createdAt)
+      if (entry.kind === "user_prompt") {
+        lastMessageAt = Math.max(lastMessageAt ?? 0, entry.createdAt)
+        if (!entry.hidden && !entry.parentToolUseId) {
+          const preview = buildChatUserMessagePreview(entry.content)
+          if (preview) lastUserMessagePreview = preview
+        }
+      } else if (entry.kind === "assistant_text" && !entry.hidden && !entry.parentToolUseId) {
+        const preview = buildChatMessagePreview(entry.text)
+        if (preview) {
+          lastAgentMessagePreview = preview
+          lastAgentMessagePreviewAt = entry.createdAt
+        }
+      }
+    }
+
+    return {
+      v: STORE_VERSION,
+      type: "chat_transcript_metadata_set",
+      timestamp: Date.now(),
+      chatId,
+      hasMessages: entries.length > 0,
+      promptHistoryRevision: crypto.randomUUID(),
+      lastMessageAt: lastMessageAt ?? null,
+      lastAgentMessageAt: lastAgentMessageAt ?? null,
+      lastAgentMessagePreviewAt: lastAgentMessagePreviewAt ?? null,
+      lastUserMessagePreview: lastUserMessagePreview ?? null,
+      lastAgentMessagePreview: lastAgentMessagePreview ?? null,
+    }
+  }
 
   async compact() {
     const snapshot = this.createSnapshot()
