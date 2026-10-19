@@ -5,6 +5,8 @@ import { tmpdir } from "node:os"
 import { EventStore } from "./event-store"
 import { AgentCoordinator } from "./agent"
 import { CodexPromptHistory } from "./codex-prompt-history"
+import { timestamped } from "./transcript"
+import type { TranscriptEntry } from "../shared/types"
 import { AsyncQueue } from "./async-queue"
 import type { HarnessEvent } from "./harness-types"
 
@@ -84,3 +86,113 @@ test("a cancelled provenance write cannot stop the successor Codex session", asy
   }
 })
 
+
+for (const journalFailure of [false, true])
+  test(`accepted live Codex input preserves queue and provenance with journal failure=${journalFailure}`, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "kanna-live-provenance-"))
+    let coordinator: AgentCoordinator | undefined
+    try {
+      const store = new EventStore(dir)
+      await store.initialize()
+      const project = await store.openProject(dir, "Project")
+      const chat = await store.createChat(project.id)
+      await store.setChatProvider(chat.id, "codex")
+      await store.setSessionToken(chat.id, "source")
+      await store.replaceTranscript(chat.id, [
+        {
+          ...timestamped({ kind: "user_prompt", content: "Earlier" }),
+          _id: "first",
+        },
+        {
+          ...timestamped({ kind: "assistant_text", text: "prior result" }),
+          _id: "before",
+        },
+        timestamped({ kind: "assistant_text", text: "hidden continuation" }),
+      ])
+      const journal = new CodexPromptHistory(dir)
+      await journal.recordPrompt(chat.id, "first", {
+        sessionToken: "source",
+        turnId: "previous",
+        mergeTurn: false,
+        boundaryEntryId: null,
+      })
+      await journal.recordTurn(chat.id, "source", "hidden", "before")
+      const errors: string[] = []
+      let accepted = 0
+      coordinator = new AgentCoordinator({
+        store,
+        onStateChange: () => {},
+        codexManager: {
+          readPromptHistory: async () => ({ inputs: store.getMessages(chat.id).filter((e) => e.kind === "user_prompt").map((e, i) => ({
+            turnId: i === 0 ? "previous" : "hidden", userIndex: i === 0 ? 0 : 1, promptId: e._id, text: (e as { content: string }).content,
+          })) }),
+          stopSession: () => {},
+          startSteerTurn: (args: { transcriptEntry: TranscriptEntry }) => {
+            accepted++
+            return {
+              settled: Promise.resolve(),
+            }
+          },
+          stopAll: () => {},
+          getResourceCounts: () => ({}),
+        } as never,
+      })
+      coordinator.setBackgroundErrorReporter(error => errors.push(error))
+      coordinator.activeTurns.set(chat.id, {
+        provider: "codex",
+        status: "running",
+        turn: { providerTurnId: "hidden", interrupt: async () => {}, close: () => {} },
+        pendingTool: null,
+      } as never)
+      if (journalFailure) {
+        ;(
+          coordinator as unknown as {
+            codexPromptHistory: { recordPrompt: () => Promise<void> }
+          }
+        ).codexPromptHistory.recordPrompt = async () => {
+          throw new Error("cache EIO")
+        }
+      }
+      const queued = await coordinator.enqueue({
+        type: "message.enqueue",
+        chatId: chat.id,
+        content: "Search",
+      })
+      await coordinator.steer({
+        type: "message.steer",
+        chatId: chat.id,
+        queuedMessageId: queued.queuedMessageId,
+      })
+      for (let i = 0; i < 100 && store.getQueuedMessages(chat.id).length; i++)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(store.getQueuedMessages(chat.id)).toEqual([])
+      expect(accepted).toBe(1)
+      expect(
+        store
+          .getMessages(chat.id)
+          .filter((entry) => entry._id === queued.queuedMessageId),
+      ).toHaveLength(1)
+      coordinator.activeTurns.delete(chat.id)
+      if (journalFailure) {
+        expect(errors.join("\n")).toContain("cache EIO")
+        expect(store.getMessages(chat.id).some((e) => e.kind === "result" && e.isError && e.result.includes("cache EIO"))).toBe(true)
+      }
+      else {
+        expect(
+          (await journal.read(chat.id)).prompts[queued.queuedMessageId],
+        ).toMatchObject({
+          sessionToken: "source",
+          turnId: "hidden",
+          mergeTurn: true,
+        })
+        expect((await coordinator.getHistoryActions(chat.id)).actions).toEqual({
+          first: "ordinary",
+          [queued.queuedMessageId]: "merge-turn",
+        })
+      }
+    } finally {
+      coordinator?.activeTurns.clear()
+      await coordinator?.dispose()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })

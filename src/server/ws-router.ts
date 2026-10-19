@@ -134,8 +134,6 @@ export interface ClientState {
    * push waiting out the interval, if any.
    */
   chatBackgroundPushes?: Map<string, { at: number; timer: ReturnType<typeof setTimeout> | null }>
-
-  chatWindowEntryIds?: Map<string, string>
 }
 
 interface CreateWsRouterArgs {
