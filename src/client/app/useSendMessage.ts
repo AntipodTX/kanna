@@ -1,12 +1,11 @@
 import { useCallback, useLayoutEffect, useRef, type Dispatch, type SetStateAction } from "react"
 import type { NavigateFunction } from "react-router-dom"
 import type { AgentProvider, ChatAttachment, ModelOptions, TranscriptEntry } from "../../shared/types"
-import { NEW_CHAT_COMPOSER_ID, useChatPreferencesStore } from "../stores/chatPreferencesStore"
+import { composerStateFromModelSettings, NEW_CHAT_COMPOSER_ID, useChatPreferencesStore } from "../stores/chatPreferencesStore"
 import { generateUUID } from "../lib/utils"
 import { getSidebarProjectGroups } from "../stores/sidebarStore"
 import { clearSending, markSending } from "../stores/pendingSendStore"
 import {
-  composerStateFromSendOptions,
   countMatchingUserPrompts,
   getMostRecentlyActiveProjectId,
   getUserPromptSignature,
@@ -167,7 +166,7 @@ export function useSendMessage(params: {
         const chatPreferences = useChatPreferencesStore.getState()
         chatPreferences.setComposerState(
           result.chatId,
-          composerStateFromSendOptions(options) ?? chatPreferences.getComposerState(NEW_CHAT_COMPOSER_ID)
+          composerStateFromModelSettings(options) ?? chatPreferences.getComposerState(NEW_CHAT_COMPOSER_ID)
         )
         setPendingChatId(result.chatId)
         navigate(`/chat/${result.chatId}`)

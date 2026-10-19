@@ -337,6 +337,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     updateManager,
     providerAuth,
   })
+  store.onTranscriptReplaced = (chatId) => router.invalidateChatTranscript(chatId)
   // Overlay the account's live Cursor and Codex model lists on the static
   // catalog (no-op when the CLI is missing or logged out); broadcasts on change.
   void agent.refreshCursorModelCatalog()

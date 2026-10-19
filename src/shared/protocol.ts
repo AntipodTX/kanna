@@ -1,3 +1,9 @@
+export interface CodexHistoryActionsSnapshot {
+  actions: Record<string, "ordinary" | "merge-turn" | "recover">
+  gap?: { messageId: string; error: string }
+  messages?: Record<string, "missing" | "unknown">
+}
+
 import type {
   AppSettingsSnapshot,
   AppSettingsPatch,
@@ -208,7 +214,15 @@ export type ClientCommand =
       terminal?: TerminalPreset
     }
   | { type: "chat.create"; projectId: string }
-  | { type: "chat.fork"; chatId: string }
+  | {
+      type: "chat.fork"
+      chatId: string
+      messageId?: string
+      model?: string
+      modelOptions?: ModelOptions
+      effort?: string
+      planMode?: boolean
+    }
   | { type: "chat.rename"; chatId: string; title: string }
   | { type: "chat.setPinned"; chatId: string; pinned: boolean }
   | { type: "chat.archive"; chatId: string }
@@ -312,6 +326,17 @@ export type ClientCommand =
   | { type: "chat.stopDraining"; chatId: string }
   /** Stops one background task (a monitor, a workflow, a subagent) and leaves the turn running. */
   | { type: "chat.stopTask"; chatId: string; taskId: string }
+  | { type: "chat.getHistoryActions"; chatId: string; recover?: boolean; messageId?: string; retry?: boolean }
+  | {
+      type: "chat.editUserPrompt"
+      chatId: string
+      messageId: string
+      content: string
+      model?: string
+      modelOptions?: ModelOptions
+      effort?: string
+      planMode?: boolean
+    }
   | {
       type: "chat.exportStandalone"
       sourceOrigin?: string
