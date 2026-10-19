@@ -1770,6 +1770,48 @@ export interface AskUserQuestionToolCall
 export interface ExitPlanModeToolCall
   extends ToolCallBase<"exit_plan_mode", { plan?: string; summary?: string }> { }
 
+export type McpApprovalPersistMode = "session" | "always"
+
+export interface CodexApprovalToolCall
+  extends ToolCallBase<"codex_approval", (
+    | {
+        approvalKind: "command_execution"
+        command?: string
+        cwd?: string
+        reason?: string
+        approvalId?: string
+      }
+    | {
+        approvalKind: "file_change"
+        grantRoot?: string
+        reason?: string
+      }
+    | {
+        approvalKind: "permissions"
+        cwd?: string
+        reason?: string
+        permissions?: {
+          network?: { enabled?: boolean | null } | null
+          fileSystem?: {
+            read?: string[] | null
+            write?: string[] | null
+            globScanMaxDepth?: number
+            entries?: unknown[]
+          } | null
+        }
+      }
+    | {
+        approvalKind: "mcp_tool_call"
+        serverName: string
+        message: string
+        toolName?: string
+        toolTitle?: string
+        toolDescription?: string
+        toolParams?: unknown
+        persistModes: McpApprovalPersistMode[]
+      }
+  )> { }
+
 export interface TodoWriteToolCall
   extends ToolCallBase<"todo_write", { todos: TodoItem[] }> { }
 
@@ -1821,6 +1863,7 @@ export interface UnknownToolCall
 export type NormalizedToolCall =
   | AskUserQuestionToolCall
   | ExitPlanModeToolCall
+  | CodexApprovalToolCall
   | TodoWriteToolCall
   | SkillToolCall
   | GlobToolCall
@@ -2362,10 +2405,18 @@ export interface ExitPlanModeToolResult {
   discarded?: boolean
 }
 
+export type CodexApprovalDecision = "accept" | "acceptForSession" | "acceptAlways" | "decline" | "cancel"
+
+export interface CodexApprovalToolResult {
+  decision: CodexApprovalDecision
+  discarded?: boolean
+}
+
 /** Per-kind hydrated result payloads; kinds not listed hydrate with `unknown`. */
 interface HydratedToolResultOverrides {
   ask_user_question: AskUserQuestionToolResult
   exit_plan_mode: ExitPlanModeToolResult
+  codex_approval: CodexApprovalToolResult
   read_file: ReadFileToolResult | string
 }
 
@@ -2378,6 +2429,7 @@ export type HydratedToolCallOf<K extends NormalizedToolCall["toolKind"]> = Hydra
 
 export type HydratedAskUserQuestionToolCall = HydratedToolCallOf<"ask_user_question">
 export type HydratedExitPlanModeToolCall = HydratedToolCallOf<"exit_plan_mode">
+export type HydratedCodexApprovalToolCall = HydratedToolCallOf<"codex_approval">
 export type HydratedTodoWriteToolCall = HydratedToolCallOf<"todo_write">
 export type HydratedSkillToolCall = HydratedToolCallOf<"skill">
 export type HydratedGlobToolCall = HydratedToolCallOf<"glob">
@@ -2607,7 +2659,7 @@ export interface ResolvedChatReadAnchor {
 
 export interface PendingToolSnapshot {
   toolUseId: string
-  toolKind: "ask_user_question" | "exit_plan_mode"
+  toolKind: "ask_user_question" | "exit_plan_mode" | "codex_approval"
   /** One line of what the tool is asking; see `SidebarChatRow.pendingUserInputPreview`. */
   preview?: string
 }
