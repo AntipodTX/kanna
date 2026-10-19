@@ -9,6 +9,7 @@
 - Isolated Codex approval prompts with consistent plan-progress rendering.
 - Automatic cleanup of idle agent sessions without interrupting background work.
 - Claude XHigh and Ultracode effort options driven by current SDK metadata.
+- Local PostCSS configuration overrides for downstream development.
 
 ### Fixes
 
