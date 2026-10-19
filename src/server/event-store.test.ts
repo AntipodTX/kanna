@@ -1859,3 +1859,77 @@ describe("chat pins", () => {
     expect(store.getChat(chat.id)!.pinnedAt).toBeUndefined()
   })
 })
+
+
+describe("durable context restoration", () => {
+  test("survives log and snapshot reload and rejects a stale acknowledgement", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(dataDir, "Project")
+    const chat = await store.createChat(project.id)
+    const obligation = { id: "restore-a", provider: "codex" as const, fromProvider: "claude" as const, reason: "provider_switch" as const, endExclusive: 2, startInclusive: 1 }
+    await store.setContextRestoration(chat.id, obligation)
+    const reloaded = new EventStore(dataDir)
+    await reloaded.initialize()
+    expect(reloaded.requireChat(chat.id).contextRestoration).toEqual(obligation)
+    await reloaded.setContextRestoration(chat.id, { ...obligation, id: "restore-b" })
+    await reloaded.acknowledgeContextRestoration(chat.id, "restore-a")
+    expect(reloaded.requireChat(chat.id).contextRestoration?.id).toBe("restore-b")
+    await reloaded.compact()
+    const snapshotted = new EventStore(dataDir)
+    await snapshotted.initialize()
+    expect(snapshotted.requireChat(chat.id).contextRestoration?.id).toBe("restore-b")
+    expect(snapshotted.requireChat(chat.id).contextRestoration?.startInclusive).toBe(1)
+    await snapshotted.acknowledgeContextRestoration(chat.id, "restore-b")
+    expect(snapshotted.requireChat(chat.id).contextRestoration).toBeNull()
+  })
+
+  test("header context bounds begin after the most recent explicit clear", async () => {
+    const dataDir = await createTempDataDir()
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(dataDir, "Project")
+    const chat = await store.createChat(project.id)
+    await store.appendMessage(chat.id, entry("user_prompt", 1, { content: "old" }))
+    await store.appendMessage(chat.id, { _id: "clear", createdAt: 2, kind: "context_cleared" })
+    await store.appendMessage(chat.id, entry("assistant_text", 3, { text: "new epoch" }))
+    store.getMessages = () => { throw new Error("header probe loaded payload") }
+    expect(store.getContextBounds(chat.id)).toEqual({ start: 2, endExclusive: 3, hasConversation: true })
+  })
+})
+
+
+test("a mid-turn fork inherits pending restoration restricted to its completed prefix", async () => {
+  const dataDir = await createTempDataDir()
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  const project = await store.openProject(dataDir, "Project")
+  const source = await store.createChat(project.id)
+  await store.setChatProvider(source.id, "codex")
+  await store.setSessionToken(source.id, "partially-restored-native")
+  const prefix = [entry("user_prompt", 1, { content: "allowed" }), entry("assistant_text", 2, { text: "allowed answer" }), entry("result", 3, { subtype: "success", isError: false, durationMs: 0, result: "done" })]
+  for (const message of [...prefix, entry("user_prompt", 4, { content: "removed" })]) await store.appendMessage(source.id, message)
+  await store.setContextRestoration(source.id, { id: "source-obligation", provider: "codex", fromProvider: "claude", reason: "provider_switch", endExclusive: 4 })
+  const fork = await store.forkChat(source.id, { atLastCompletedTurn: true })
+  expect(fork.contextRestoration).toMatchObject({ provider: "codex", fromProvider: "claude", endExclusive: 3 })
+  expect(fork.contextRestoration?.id).not.toBe("source-obligation")
+})
+
+
+test("queued prompt identity is checked in headers without payload reads", async () => {
+  const dataDir = await createTempDataDir()
+  const store = new EventStore(dataDir)
+  await store.initialize()
+  const project = await store.openProject(dataDir, "Project")
+  const chat = await store.createChat(project.id)
+  await store.appendMessage(chat.id, { _id: "queued-id", createdAt: 1, kind: "user_prompt", content: "persisted steer" })
+  await store.appendMessage(chat.id, { _id: "tool-id", createdAt: 2, kind: "tool_result", toolId: "t", content: "payload" })
+  store.getMessages = () => { throw new Error("queue identity loaded full payload") }
+  expect(store.hasUserPrompt(chat.id, "queued-id")).toBe(true)
+  expect(store.hasUserPrompt(chat.id, "tool-id")).toBe(false)
+  expect(store.hasUserPrompt(chat.id, "missing-id")).toBe(false)
+})
+
+
+
