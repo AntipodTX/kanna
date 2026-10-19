@@ -8,6 +8,7 @@
 
 ### Fixes
 
+- Preserve Claude plan transcript adjustments during rendering.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
