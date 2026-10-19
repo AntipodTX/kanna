@@ -2,7 +2,7 @@ import { describe, expect, test, afterAll } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { AgentCoordinator, buildAttachmentHintText, buildConcurrentAgentsNotice, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, classifyClaudeBackgroundWorkState, createClaudeStopHook, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, type ClaudeBackgroundWorkState, startClaudeSession, resolveClaudeRuntimeOptions, buildClaudeSdkUserMessage } from "./agent"
+import { AgentCoordinator, buildAttachmentHintText, buildConcurrentAgentsNotice, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, classifyClaudeBackgroundWorkState, createClaudeStopHook, type ClaudeBackgroundWorkState, startClaudeSession, resolveClaudeRuntimeOptions, buildClaudeSdkUserMessage } from "./agent"
 import type { HarnessTurn } from "./harness-types"
 import type { SubagentActivityUpdate } from "./background-tasks"
 import type { ChatAttachment, TranscriptEntry, AgentProvider } from "../shared/types"
@@ -6788,6 +6788,7 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
       events.close()
     }
   })
+
 
 })
 
