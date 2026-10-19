@@ -1423,6 +1423,109 @@ describe("AgentCoordinator codex integration", () => {
 })
 
 describe("AgentCoordinator claude integration", () => {
+  test("tracks Claude startup as active so cancel and queuing work before the session is ready", async () => {
+    const events = new AsyncEventQueue<any>()
+    let resolveStartRequested!: () => void
+    const startRequested = new Promise<void>((resolve) => {
+      resolveStartRequested = resolve
+    })
+    let resolveStartSession!: (turn: any) => void
+    const startSessionGate = new Promise<any>((resolve) => {
+      resolveStartSession = resolve
+    })
+    let startAttempts = 0
+
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => {
+        startAttempts += 1
+        resolveStartRequested()
+        if (startAttempts > 1) {
+          throw new Error("Claude startup should not be re-entered")
+        }
+        return await startSessionGate
+      },
+    })
+
+    const firstSend = coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first prompt",
+      model: "claude-opus-4-1",
+    })
+
+    await startRequested
+
+    expect(coordinator.getActiveStatuses().get("chat-1")).toBe("starting")
+
+    await expect(coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "second prompt",
+      model: "claude-opus-4-1",
+    })).resolves.toMatchObject({ chatId: "chat-1", queued: true })
+    expect(startAttempts).toBe(1)
+    expect(store.queuedMessages.map((message) => message.content)).toEqual(["second prompt"])
+
+    let interrupted = false
+    resolveStartSession({
+      provider: "claude",
+      stream: events,
+      getAccountInfo: async () => null,
+      interrupt: async () => {
+        interrupted = true
+      },
+      close: () => {},
+      setModel: async () => {},
+      setPermissionMode: async () => {},
+      sendPrompt: async () => {},
+    })
+    await firstSend
+
+    await coordinator.cancel("chat-1")
+    expect(interrupted).toBe(true)
+
+    events.close()
+  })
+
+  test("Claude cancellation during startup interrupts the ready session without sending its prompt", async () => {
+    const events = new AsyncEventQueue<any>()
+    let markStarting!: () => void
+    const starting = new Promise<void>((resolve) => { markStarting = resolve })
+    let releaseStart!: (session: any) => void
+    const ready = new Promise<any>((resolve) => { releaseStart = resolve })
+    let prompts = 0
+    let interrupts = 0
+    const coordinator = new AgentCoordinator({
+      store: createFakeStore() as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => {
+        markStarting()
+        return await ready
+      },
+    })
+    const send = coordinator.send({
+      type: "chat.send", chatId: "chat-1", provider: "claude", content: "cancel before ready", model: "claude-opus-4-1",
+    })
+    await starting
+    await coordinator.cancel("chat-1")
+    releaseStart({
+      provider: "claude", stream: events,
+      interrupt: async () => { interrupts += 1 }, close: () => {},
+      setModel: async () => {}, setPermissionMode: async () => {},
+      sendPrompt: async () => { prompts += 1 },
+    })
+    await send
+    events.close()
+    expect(prompts).toBe(0)
+    expect(interrupts).toBe(1)
+    expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+  })
+
   test("tracks analytics for new chats, queued messages, and forks", async () => {
     const events = new AsyncEventQueue<any>()
     const analyticsEvents: string[] = []
@@ -2257,7 +2360,7 @@ describe("concurrent agents notice injection", () => {
     await coordinator.send({ type: "chat.send", chatId: "chat-2", provider: "claude", content: "second prompt", model: "claude-opus-4-1" })
 
     expect(prompts).toHaveLength(2)
-    // chat-1 started alone — nothing is appended.
+    // chat-1 started alone — no automatic instructions.
     expect(prompts[0]).toBe("first prompt")
     // chat-2 started while chat-1 was running in the same directory.
     expect(prompts[1]?.startsWith("second prompt")).toBe(true)
