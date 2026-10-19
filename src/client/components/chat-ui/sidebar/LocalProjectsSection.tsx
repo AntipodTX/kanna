@@ -1,5 +1,5 @@
 import { memo, type MouseEvent as ReactMouseEvent, type ReactNode, useMemo, useSyncExternalStore } from "react"
-import { ChevronRight, Loader2, MoreHorizontal, SquarePen } from "lucide-react"
+import { ChevronRight, Loader2, MoreHorizontal, Search, SquarePen } from "lucide-react"
 import {
   DndContext,
   PointerSensor,
@@ -39,6 +39,7 @@ interface Props {
   renderChatRow: (chat: SidebarChatRow) => ReactNode
   onShowArchivedProject?: (projectId: string) => void
   onNewLocalChat?: (localPath: string) => void
+  onOpenProjectSearch?: (projectId: string) => void
   onCopyPath?: (localPath: string) => void
   onOpenExternalPath?: (action: "open_finder" | "open_editor", localPath: string) => void
   onRenameProject?: (projectId: string, sidebarTitle: string | undefined, realTitle: string) => void
@@ -64,6 +65,7 @@ interface SortableProjectGroupProps {
   renderChatRow: (chat: SidebarChatRow) => ReactNode
   onShowArchivedProject?: (projectId: string) => void
   onNewLocalChat?: (localPath: string) => void
+  onOpenProjectSearch?: (projectId: string) => void
   onCopyPath?: (localPath: string) => void
   onOpenExternalPath?: (action: "open_finder" | "open_editor", localPath: string) => void
   onRenameProject?: (projectId: string, sidebarTitle: string | undefined, realTitle: string) => void
@@ -219,6 +221,7 @@ const SortableProjectGroup = memo(function SortableProjectGroup({
   renderChatRow,
   onShowArchivedProject,
   onNewLocalChat,
+  onOpenProjectSearch,
   onCopyPath,
   onOpenExternalPath,
   onRenameProject,
@@ -239,6 +242,7 @@ const SortableProjectGroup = memo(function SortableProjectGroup({
     : { ...projectLabel, name: getPathBasename(localPath) }
   const isExpanded = newSidebar || expandedGroups.has(groupKey)
   const isEmptyProject = group.chats.length === 0
+  const hasSearchableChats = group.chats.length > 0 || (group.archivedChats?.length ?? 0) > 0
   const hasMore = group.olderChats.length > 0
   const hasProjectMenu = Boolean(onHideProject && onCopyPath && onOpenExternalPath)
 
@@ -296,7 +300,7 @@ const SortableProjectGroup = memo(function SortableProjectGroup({
           )} */}
         </span>
       </div>
-      {(hasProjectMenu || onNewLocalChat) && (
+      {(hasProjectMenu || onNewLocalChat || (onOpenProjectSearch && hasSearchableChats)) && (
         <div className="absolute right-2 flex items-center gap-[1px] opacity-100 md:opacity-0 md:group-hover/section:opacity-100">
           {hasProjectMenu ? (
             <Tooltip>
@@ -340,6 +344,28 @@ const SortableProjectGroup = memo(function SortableProjectGroup({
               </TooltipTrigger>
               <TooltipContent side="right" sideOffset={4}>
                 {!isConnected ? `Start ${APP_NAME} to connect` : "New Chat"}
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
+          {onOpenProjectSearch && hasSearchableChats ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-5.5 w-5.5 !rounded"
+                  aria-label="Search Project"
+                  title="Search Project"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    onOpenProjectSearch(groupKey)
+                  }}
+                >
+                  <Search className="size-3.5 text-slate-500 dark:text-slate-400" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="right" sideOffset={4}>
+                Search Project
               </TooltipContent>
             </Tooltip>
           ) : null}
@@ -422,6 +448,7 @@ const LocalProjectsSectionImpl = function LocalProjectsSection({
   renderChatRow,
   onShowArchivedProject,
   onNewLocalChat,
+  onOpenProjectSearch,
   onCopyPath,
   onOpenExternalPath,
   onRenameProject,
@@ -512,6 +539,7 @@ const LocalProjectsSectionImpl = function LocalProjectsSection({
           renderChatRow={renderChatRow}
           onShowArchivedProject={onShowArchivedProject}
           onNewLocalChat={onNewLocalChat}
+          onOpenProjectSearch={onOpenProjectSearch}
           onCopyPath={onCopyPath}
           onOpenExternalPath={onOpenExternalPath}
           onRenameProject={onRenameProject}

@@ -2887,3 +2887,149 @@ describe("transcript windows", () => {
     } finally { router.dispose() }
   })
 })
+
+
+describe("project transcript search", () => {
+  function chat(projectId: string, id: string, title: string, updatedAt: number, extra: Record<string, unknown> = {}) {
+    return {
+      id,
+      projectId,
+      title,
+      createdAt: updatedAt,
+      updatedAt,
+      unread: false,
+      provider: null,
+      planMode: false,
+      autoPlan: false,
+      sessionToken: null,
+      lastTurnOutcome: null,
+      ...extra,
+    }
+  }
+
+  function createProjectSearchRouter() {
+    const state = createEmptyState()
+    state.projectsById.set("project-1", {
+      id: "project-1",
+      localPath: "/tmp/project-one",
+      title: "Project One",
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    state.projectsById.set("project-2", {
+      id: "project-2",
+      localPath: "/tmp/project-two",
+      title: "Project Two",
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    state.chatsById.set("recent", chat("project-1", "recent", "Recent chat", 40) as never)
+    state.chatsById.set("older", chat("project-1", "older", "Older chat", 30) as never)
+    state.chatsById.set("archived", chat("project-1", "archived", "Archived chat", 50, { archivedAt: 51 }) as never)
+    state.chatsById.set("deleted", chat("project-1", "deleted", "Deleted chat", 60, { deletedAt: 61 }) as never)
+    state.chatsById.set("other-project", chat("project-2", "other-project", "Other project", 70) as never)
+
+    const messagesByChatId = new Map<string, never[]>([
+      ["recent", [
+        { _id: "recent-1", kind: "assistant_text", createdAt: 40, text: "needle recent one" },
+        { _id: "recent-2", kind: "assistant_text", createdAt: 41, text: "needle recent two" },
+        {
+          _id: "recent-tool",
+          kind: "tool_call",
+          createdAt: 42,
+          tool: {
+            kind: "tool",
+            toolKind: "bash",
+            toolName: "Bash",
+            toolId: "recent-tool-id",
+            input: { command: "printf needle-tool" },
+          },
+        },
+        { _id: "recent-tool-result", kind: "tool_result", createdAt: 43, toolId: "recent-tool-id", content: "needle-tool output" },
+      ] as never[]],
+      ["older", [
+        { _id: "older-1", kind: "user_prompt", createdAt: 30, content: "needle older" },
+      ] as never[]],
+      ["archived", [
+        { _id: "archived-1", kind: "assistant_text", createdAt: 50, text: "needle archived" },
+      ] as never[]],
+      ["deleted", [
+        { _id: "deleted-1", kind: "assistant_text", createdAt: 60, text: "needle deleted" },
+      ] as never[]],
+      ["other-project", [
+        { _id: "other-1", kind: "assistant_text", createdAt: 70, text: "needle elsewhere" },
+      ] as never[]],
+    ])
+
+    const headerReads: string[] = []
+    const fullTranscriptReads: string[] = []
+    const router = createTestRouter({
+      store: createFakeStore({
+        state,
+        getProject: (projectId: string) => state.projectsById.get(projectId) ?? null,
+        getClientTranscript: (chatId: string) => {
+          headerReads.push(chatId)
+          return { messages: messagesByChatId.get(chatId) ?? [], startIndex: 0, readAnchor: null, outline: [] }
+        },
+        getMessages: (chatId: string) => {
+          fullTranscriptReads.push(chatId)
+          return messagesByChatId.get(chatId) ?? []
+        },
+      }),
+    })
+    return { router, headerReads, fullTranscriptReads }
+  }
+
+  async function search(
+    router: ReturnType<typeof createTestRouter>,
+    id: string,
+    command: Record<string, unknown>,
+  ) {
+    const ws = new FakeWebSocket()
+    await router.handleMessage(ws as never, JSON.stringify({
+      v: PROTOCOL_VERSION,
+      type: "command",
+      id,
+      command: { type: "project.search", projectId: "project-1", query: "needle", ...command },
+    }))
+    expect(ws.sent[0]).toBeDefined()
+    return (ws.sent[0] as { result: {
+      matches: Array<{ chatId: string; entryId: string; isArchived: boolean }>
+      nextCursor?: string
+      hasMore: boolean
+    } }).result
+  }
+
+  test("searches only visible chat text unless archived chats or tool payloads are requested", async () => {
+    const fixture = createProjectSearchRouter()
+
+    const regular = await search(fixture.router, "regular", {})
+    expect(regular.matches.map((match) => match.entryId)).toEqual(["recent-1", "recent-2", "older-1"])
+    expect(fixture.fullTranscriptReads).toEqual([])
+    expect(fixture.headerReads).toEqual(["recent", "older"])
+
+    const expanded = await search(fixture.router, "expanded", { includeArchived: true, includeToolEntries: true })
+    expect(expanded.matches.map((match) => [match.entryId, match.isArchived])).toEqual([
+      ["archived-1", true],
+      ["recent-1", false],
+      ["recent-2", false],
+      ["recent-tool", false],
+      ["recent-tool-result", false],
+      ["older-1", false],
+    ])
+    expect(fixture.fullTranscriptReads).toEqual(["archived", "recent", "older"])
+  })
+
+  test("continues through a chat and into older chats without duplicates", async () => {
+    const { router } = createProjectSearchRouter()
+    const first = await search(router, "page-1", { limit: 2 })
+    const second = await search(router, "page-2", { limit: 2, cursor: first.nextCursor })
+
+    expect(first.matches.map((match) => match.entryId)).toEqual(["recent-1", "recent-2"])
+    expect(first.hasMore).toBe(true)
+    expect(first.nextCursor).toBeTruthy()
+    expect(second.matches.map((match) => match.entryId)).toEqual(["older-1"])
+    expect(second.hasMore).toBe(false)
+    expect(second.nextCursor).toBeUndefined()
+  })
+})
