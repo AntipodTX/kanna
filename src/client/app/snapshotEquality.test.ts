@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { ChatSnapshot, TranscriptEntry } from "../../shared/types"
-import { applyIncrementalChatSnapshot, foldChatSnapshot } from "./snapshotEquality"
+import { applyIncrementalChatSnapshot, foldChatSnapshot, sameChatSnapshotCore } from "./snapshotEquality"
 
 function entry(id: string): TranscriptEntry {
   return { _id: id, createdAt: 0, kind: "assistant_text", text: id } as TranscriptEntry
@@ -236,5 +236,24 @@ describe("applyIncrementalChatSnapshot carried fields", () => {
     expect(next?.availableProviders).toBe(current.availableProviders)
     expect(next?.readAnchor).toBe(current.readAnchor)
     expect(ids(next)).toEqual(["a", "b"])
+  })
+})
+
+describe("sameChatSnapshotCore", () => {
+  test("detects a queued message entering the transient steering state", () => {
+    const before = snapshot(0, [])
+    before.queuedMessages = [{
+      id: "queued-1",
+      content: "follow up",
+      attachments: [],
+      createdAt: 1,
+      steering: false,
+    }]
+    const after = {
+      ...before,
+      queuedMessages: before.queuedMessages.map((message) => ({ ...message, steering: true })),
+    }
+
+    expect(sameChatSnapshotCore(before, after)).toBe(false)
   })
 })

@@ -1,7 +1,8 @@
 import type { QueuedChatMessage } from "../../../shared/types"
+import { formatCodexQuestionReply } from "../../../shared/codex-questions"
 import { Button } from "../ui/button"
 import { TranscriptMarkdown } from "./shared"
-import { UserMessageAttachments } from "./UserMessage"
+import { UserMessage, UserMessageAttachments } from "./UserMessage"
 import { ArrowUp, X } from "lucide-react"
 
 interface QueuedUserMessageProps {
@@ -11,6 +12,18 @@ interface QueuedUserMessageProps {
 }
 
 export function QueuedUserMessage({ message, onRemove, onSendNow }: QueuedUserMessageProps) {
+  if (message.steering) {
+    return (
+      <div className="py-2">
+        <UserMessage
+          content={message.content}
+          attachments={message.attachments}
+          steered
+        />
+      </div>
+    )
+  }
+
   return (
     <div className="flex flex-col items-end gap-2 py-2">
       <UserMessageAttachments attachments={message.attachments} />
@@ -26,7 +39,7 @@ export function QueuedUserMessage({ message, onRemove, onSendNow }: QueuedUserMe
           <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-end gap-2.5 rounded-2xl border border-dashed border-border bg-transparent pl-3.5 pr-1.5 py-1.5 prose prose-sm prose-invert text-left text-primary [&_p]:whitespace-pre-line">
             <div className="min-w-0">
               {message.content ? (
-                <TranscriptMarkdown text={message.content} />
+                <TranscriptMarkdown text={formatCodexQuestionReply(message.content)} />
               ) : (
                 <p className="text-muted-foreground">Queued</p>
               )}
