@@ -4,6 +4,7 @@
 
 ### Features
 
+- Local PostCSS configuration overrides for downstream development.
 
 ### Fixes
 
