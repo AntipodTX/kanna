@@ -2,7 +2,7 @@ import { homedir } from "node:os"
 import { PerformanceLog } from "./performance-log"
 import path from "node:path"
 import { stat } from "node:fs/promises"
-import { APP_NAME, getDataDir, getRuntimeProfile, LOG_PREFIX } from "../shared/branding"
+import { APP_NAME, getDataDir, getKeybindingsFilePath, getRuntimeProfile, LOG_PREFIX } from "../shared/branding"
 import type { ChatAttachment } from "../shared/types"
 import type { ShareMode } from "../shared/share"
 import {
@@ -52,12 +52,29 @@ import { instanceFingerprint } from "./instance"
 import { deleteProjectUpload, inferAttachmentContentType, inferProjectFileContentType, persistProjectUpload } from "./uploads"
 import { getProjectUploadDir } from "./paths"
 import { inheritShellPath } from "./process-utils"
+import { syncExternalSessions } from "./session-sync"
+import { StartupSyncProgress } from "./startup-sync"
 
 const MAX_UPLOAD_FILES = 50
 const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024
 const STALE_EMPTY_CHAT_PRUNE_INTERVAL_MS = 60 * 1000
 const STALE_CHAT_AUTO_ARCHIVE_INTERVAL_MS = 6 * 60 * 60 * 1000
 const STALE_CHAT_DELETE_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+type StartupRecoveryIncident = {
+  kind: "snapshot" | "log"
+  sourcePath: string
+  backupPath: string | null
+  line?: number
+  reason: string
+}
+
+function getStartupRecoveryIncidents(store: EventStore): StartupRecoveryIncident[] {
+  const recoveryStore = store as EventStore & {
+    getStartupRecoveryIncidents?: () => StartupRecoveryIncident[]
+  }
+  return recoveryStore.getStartupRecoveryIncidents?.() ?? []
+}
 
 async function withOriginAgentCluster(response: Response | Promise<Response> | undefined) {
   const resolved = await response
@@ -107,8 +124,10 @@ export interface StartKannaServerOptions {
   openBrowser?: boolean
   share?: ShareMode
   dataDir?: string
+  homeDir?: string
   password?: string | null
   strictPort?: boolean
+  syncSessions?: boolean
   /**
    * When true, the auth layer trusts X-Forwarded-Proto for CSRF origin
    * checks, redirect URLs, and the Secure cookie flag. The hostname still
@@ -136,6 +155,8 @@ export interface StartKannaServerOptions {
    */
   directCloud?: boolean
   onMigrationProgress?: (message: string) => void
+  sessionSync?: typeof syncExternalSessions
+  resumeTurns?: typeof resumeInterruptedTurns
   update?: {
     version: string
     fetchLatestVersion: (packageName: string) => Promise<string>
@@ -147,22 +168,48 @@ export interface StartKannaServerOptions {
 export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const port = options.port ?? 3210
   const hostname = options.host ?? "127.0.0.1"
+  const homeDir = options.homeDir ?? homedir()
   const strictPort = options.strictPort ?? false
   const runtimeProfile = getRuntimeProfile()
   // Runs alongside the store setup below (~0.5 s for a zsh with nvm) and is
   // awaited before anything can start an agent.
   const shellPathReady = inheritShellPath()
   const auth = options.password ? createAuthManager(options.password, { trustProxy: options.trustProxy ?? false }) : null
-  const diagnostics = new PerformanceLog(options.dataDir ?? getDataDir(homedir()), undefined, options.update?.version)
-  const store = new EventStore(options.dataDir, diagnostics)
+  const dataDir = options.dataDir ?? getDataDir(homeDir)
+  const diagnostics = new PerformanceLog(dataDir, undefined, options.update?.version)
+  const store = new EventStore(dataDir, diagnostics)
   const diffStore = new DiffStore(store.dataDir)
   const machineDisplayName = getMachineDisplayName()
+  const startupSync = new StartupSyncProgress()
   // Mutable: device-code pairing can attach a cloud runtime mid-flight, and
   // every request path below reads the current value.
   let cloud: CloudRuntime | null = options.cloud ?? null
   /** Only set when *this* process paired; the CLI owns a handed-in runtime. */
   let selfPairedCloud: CloudRuntime | null = null
   await store.initialize()
+  const startupRecoveryIncidents = getStartupRecoveryIncidents(store)
+  if (startupRecoveryIncidents.length > 0) {
+    startupSync.begin("storage-recovery")
+    for (const incident of startupRecoveryIncidents) {
+      const location = incident.line
+        ? `${path.basename(incident.sourcePath)}:${incident.line}`
+        : path.basename(incident.sourcePath)
+      const sourceName = path.basename(incident.sourcePath)
+      const backupDetail = incident.backupPath
+        ? incident.kind === "snapshot"
+          ? `and backed up to ${incident.backupPath}`
+          : `and ${sourceName} was backed up to ${incident.backupPath}`
+        : incident.kind === "snapshot"
+          ? "but could not be backed up"
+          : `but ${sourceName} could not be backed up`
+      const message = incident.kind === "snapshot"
+        ? `${LOG_PREFIX} storage recovery: snapshot ${location} was ignored ${backupDetail}; reason: ${incident.reason}`
+        : `${LOG_PREFIX} storage recovery: log event ${location} was ignored ${backupDetail}; reason: ${incident.reason}`
+      options.onMigrationProgress?.(message)
+      startupSync.append(message)
+    }
+    startupSync.complete()
+  }
   await diffStore.initialize()
   await store.migrateLegacyTranscripts(options.onMigrationProgress)
   // Not awaited: this streams every transcript once per data dir, which on a
@@ -174,7 +221,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   let discoveredProjects: DiscoveredProject[] = []
 
   async function refreshDiscovery() {
-    discoveredProjects = await discoverProjects()
+    discoveredProjects = await discoverProjects(homeDir)
     return discoveredProjects
   }
 
@@ -227,7 +274,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const portTunnels = new PortTunnelManager({
     log: (message) => console.log(`${LOG_PREFIX} ${message}`),
   })
-  const keybindings = new KeybindingsManager()
+  const keybindings = new KeybindingsManager(getKeybindingsFilePath(homeDir))
   // Dev-box UI flag: the real thing is `kanna --cloud`; KANNA_DEVBOX_UI=1 is
   // the dev-mode override (`bun run dev:cloud`) so the UI is developable
   // without a cloud identity.
@@ -336,7 +383,9 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     machineDisplayName,
     updateManager,
     providerAuth,
+    startupSync,
   })
+  store.onTranscriptReplaced = (chatId) => router.invalidateChatTranscript(chatId)
   // Overlay the account's live Cursor and Codex model lists on the static
   // catalog (no-op when the CLI is missing or logged out); broadcasts on change.
   void agent.refreshCursorModelCatalog()
@@ -393,27 +442,9 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     }
   }
   await shellPathReady
-  // Chats that were mid-turn when Kanna last exited pick up where they left
-  // off. Not awaited — each resume starts a harness process, and boot should
-  // not wait on them; chained onto the GC sweep so a chat about to be archived
-  // or deleted for staleness isn't resumed on its way out.
-  void runStartupGc()
-    .then(() => resumeInterruptedTurns({
-      store,
-      agent,
-      onError: (chatId, error) => {
-        console.warn(`${LOG_PREFIX} could not resume chat ${chatId} after restart:`, error)
-      },
-    }))
-    .then(async (resumedChatIds) => {
-      if (resumedChatIds.length > 0) {
-        console.log(`${LOG_PREFIX} resumed ${resumedChatIds.length} chat(s) interrupted by the last shutdown`)
-        await router.broadcastSnapshots()
-      }
-    })
-    .catch((error) => {
-      console.warn(`${LOG_PREFIX} resuming interrupted chats failed:`, error)
-    })
+  // Start cleanup in the background. Interrupted turns are considered only
+  // after both this sweep and the optional external-session sync finish.
+  const startupGcDone = runStartupGc()
 
   // Then keep sweeping for the lifetime of the (potentially months-long)
   // process: empties every minute, deletes daily, archives every 6 hours.
@@ -776,6 +807,75 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     ...diffStore.getResourceCounts(),
   }))
 
+  let canResumeInterruptedTurns = true
+  let sessionSyncDone: Promise<void>
+  if (options.syncSessions && startupRecoveryIncidents.length > 0) {
+    const message = `${LOG_PREFIX} session sync: skipped because storage started in recovery mode`
+    options.onMigrationProgress?.(message)
+    startupSync.append(message)
+    canResumeInterruptedTurns = false
+    sessionSyncDone = Promise.resolve()
+  } else if (options.syncSessions) {
+    startupSync.begin()
+    try {
+      sessionSyncDone = (options.sessionSync ?? syncExternalSessions)({
+        store,
+        discoveredProjects,
+        homeDir,
+        codexClient: codexManager,
+        onProgress: (message) => {
+          options.onMigrationProgress?.(message)
+          startupSync.append(message)
+        },
+      }).then(() => {
+        startupSync.complete()
+        void router.broadcastSnapshots()
+      }).catch((error) => {
+        canResumeInterruptedTurns = false
+        const message = error instanceof Error ? error.message : String(error)
+        const logMessage = `${LOG_PREFIX} session sync: failed: ${message}`
+        options.onMigrationProgress?.(logMessage)
+        startupSync.append(logMessage)
+        startupSync.fail(error)
+      })
+    } catch (error) {
+      canResumeInterruptedTurns = false
+      const message = error instanceof Error ? error.message : String(error)
+      const logMessage = `${LOG_PREFIX} session sync: failed: ${message}`
+      options.onMigrationProgress?.(logMessage)
+      startupSync.append(logMessage)
+      startupSync.fail(error)
+      sessionSyncDone = Promise.resolve()
+    }
+  } else {
+    options.onMigrationProgress?.(`${LOG_PREFIX} session sync: skipped (enable with --sync-sessions)`)
+    sessionSyncDone = Promise.resolve()
+  }
+
+  // External sessions are reconciled before any persistent shutdown marker
+  // can start an agent. Session sync clears those markers for every imported
+  // or reconciled chat, leaving only genuine Kanna-interrupted turns here.
+  const startupSyncDone = Promise.all([startupGcDone, sessionSyncDone])
+    .then(async () => {
+      if (!canResumeInterruptedTurns) return []
+      return (options.resumeTurns ?? resumeInterruptedTurns)({
+        store,
+        agent,
+        onError: (chatId, error) => {
+          console.warn(`${LOG_PREFIX} could not resume chat ${chatId} after restart:`, error)
+        },
+      })
+    })
+    .then(async (resumedChatIds) => {
+      if (resumedChatIds.length > 0) {
+        console.log(`${LOG_PREFIX} resumed ${resumedChatIds.length} chat(s) interrupted by the last shutdown`)
+        await router.broadcastSnapshots()
+      }
+    })
+    .catch((error) => {
+      console.warn(`${LOG_PREFIX} resuming interrupted chats failed:`, error)
+    })
+
   const shutdown = async () => {
     pairSession?.stop()
     // A runtime handed in by the CLI is stopped by the CLI; one this process
@@ -786,6 +886,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     clearInterval(staleChatDeleteInterval)
     worktreeProbe.stop()
     projectIcons.stop()
+    await startupSyncDone
     // Cancels every in-flight turn *and* marks its chat, so the next boot
     // restarts the work instead of leaving it interrupted (see resume-turns.ts).
     try { await agent.interruptForShutdown() } finally { agent.dispose() }
@@ -807,6 +908,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     diffStore,
     updateManager,
     analytics,
+    startupSyncDone,
     stop: shutdown,
     /** For the single-instance lock's status (instance-socket.ts), which the
      *  Mac app's quit dialog shows. */

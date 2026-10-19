@@ -133,6 +133,10 @@ export interface ChatRecord {
    * never written again.
    */
   touchedPaths?: string[]
+  /** Whether the user explicitly renamed this chat after it was imported. */
+  hasLocalTitleOverride?: boolean
+  /** Last modification time observed in the provider-owned session. */
+  externalUpdatedAt?: number
 }
 
 /** One file a chat changed, and the committed content it changed it from. */
@@ -165,11 +169,18 @@ export interface TouchedFile {
   deletions?: number
 }
 
+export interface HiddenProviderSessionRecord {
+  provider: AgentProvider
+  sessionToken: string
+  hiddenAt: number
+}
+
 export interface StoreState {
   projectsById: Map<string, ProjectRecord>
   projectIdsByPath: Map<string, string>
   chatsById: Map<string, ChatRecord>
   queuedMessagesByChatId: Map<string, QueuedChatMessage[]>
+  hiddenProviderSessionsByKey: Map<string, HiddenProviderSessionRecord>
 }
 
 export interface SnapshotFile {
@@ -180,6 +191,7 @@ export interface SnapshotFile {
   sidebarProjectOrder?: string[]
   queuedMessages?: Array<{ chatId: string; entries: QueuedChatMessage[] }>
   messages?: Array<{ chatId: string; entries: TranscriptEntry[] }>
+  hiddenProviderSessions?: HiddenProviderSessionRecord[]
 }
 
 export type ProjectEvent = {
@@ -232,6 +244,7 @@ export type ChatEvent =
       timestamp: number
       chatId: string
       title: string
+      markTitleOverride?: boolean
     }
   | {
       v: 2
@@ -323,6 +336,35 @@ export type ChatEvent =
       /** Legacy shape: paths with no base blob. Read on replay, never written. */
       paths?: string[]
     }
+  | {
+      v: 2
+      type: "chat_transcript_metadata_set"
+      timestamp: number
+      chatId: string
+      hasMessages: boolean
+      lastMessageAt: number | null
+      lastUserMessagePreview: string | null
+      lastAgentMessagePreview: string | null
+      lastAgentMessageAt?: number | null
+      lastAgentMessagePreviewAt?: number | null
+    }
+  | {
+      v: 2
+      type: "chat_synced"
+      timestamp: number
+      chatId: string
+      provider: AgentProvider
+      sessionToken: string
+      externalUpdatedAt: number
+      title?: string | null
+    }
+  | {
+      v: 2
+      type: "provider_session_hidden"
+      timestamp: number
+      provider: AgentProvider
+      sessionToken: string
+    }
 
 export type MessageEvent = {
   v: 2
@@ -406,6 +448,7 @@ export function createEmptyState(): StoreState {
     projectIdsByPath: new Map(),
     chatsById: new Map(),
     queuedMessagesByChatId: new Map(),
+    hiddenProviderSessionsByKey: new Map(),
   }
 }
 

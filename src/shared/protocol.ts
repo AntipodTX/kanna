@@ -16,6 +16,7 @@ import type {
   SidebarData,
   StandaloneTranscriptAttachmentMode,
   StandaloneTranscriptExportResult,
+  StartupSyncSnapshot,
   UpdateSnapshot,
   UsageLimitsSnapshot,
   EditorPreset,
@@ -59,6 +60,7 @@ export type SubscriptionTopic =
   }
   | { type: "local-projects" }
   | { type: "update" }
+  | { type: "startup-sync" }
   | { type: "keybindings" }
   | { type: "app-settings" }
   | { type: "usage-limits" }
@@ -377,6 +379,7 @@ export type ServerSnapshot =
   | { type: "sidebar-patch"; data: SidebarPatch }
   | { type: "local-projects"; data: LocalProjectsSnapshot }
   | { type: "update"; data: UpdateSnapshot }
+  | { type: "startup-sync"; data: StartupSyncSnapshot }
   | { type: "keybindings"; data: KeybindingsSnapshot }
   | { type: "app-settings"; data: AppSettingsSnapshot }
   | { type: "usage-limits"; data: UsageLimitsSnapshot }
