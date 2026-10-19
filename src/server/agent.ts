@@ -1778,27 +1778,33 @@ export class AgentCoordinator {
   }
 
   private async dequeueAndStartQueuedMessage(chatId: string, queuedMessage: QueuedChatMessage, options?: { steered?: boolean }) {
-    await this.store.removeQueuedMessage(chatId, queuedMessage.id)
     const chat = this.store.requireChat(chatId)
     const provider = this.resolveProvider(queuedMessage, chat.provider)
-    const settings = this.getProviderSettings(provider, queuedMessage)
-    await this.startTurnForChat({
-      chatId,
-      provider,
-      content: queuedMessage.content,
-      attachments: queuedMessage.attachments,
-      model: settings.model,
-      effort: settings.effort,
-      serviceTier: settings.serviceTier,
-      planMode: settings.planMode,
-      autoPlan: settings.autoPlan,
-      appendUserPrompt: true,
-      steered: options?.steered,
-    })
+    const start = async (startupReservation?: symbol) => {
+      if (startupReservation && this.startingClaudeTurns.get(chatId) !== startupReservation) return
+      await this.store.removeQueuedMessage(chatId, queuedMessage.id)
+      const settings = this.getProviderSettings(provider, queuedMessage)
+      await this.startTurnForChat({
+        chatId,
+        provider,
+        content: queuedMessage.content,
+        attachments: queuedMessage.attachments,
+        model: settings.model,
+        effort: settings.effort,
+        serviceTier: settings.serviceTier,
+        planMode: settings.planMode,
+        autoPlan: settings.autoPlan,
+        appendUserPrompt: true,
+        steered: options?.steered,
+        startupReservation,
+      })
+    }
+    if (provider === "claude") await this.withClaudeStartupReservation(chatId, start)
+    else await start()
   }
 
   private async maybeStartNextQueuedMessage(chatId: string) {
-    if (this.activeTurns.has(chatId)) return false
+    if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId)) return false
     const nextQueuedMessage = typeof this.store.getQueuedMessages === "function"
       ? this.store.getQueuedMessages(chatId)[0]
       : undefined
@@ -1971,6 +1977,17 @@ export class AgentCoordinator {
     turn.close()
   }
 
+  private async withClaudeStartupReservation<TResult>(chatId: string, start: (reservation: symbol) => Promise<TResult>): Promise<TResult> {
+    if (this.startingClaudeTurns.has(chatId)) throw new Error("Chat is already starting")
+    const reservation = Symbol(chatId)
+    this.startingClaudeTurns.set(chatId, reservation)
+    try {
+      return await start(reservation)
+    } finally {
+      if (this.startingClaudeTurns.get(chatId) === reservation) this.startingClaudeTurns.delete(chatId)
+    }
+  }
+
   private async startTurnForChat(args: {
     chatId: string
     provider: AgentProvider
@@ -1983,7 +2000,18 @@ export class AgentCoordinator {
     autoPlan: boolean
     appendUserPrompt: boolean
     steered?: boolean
+    startupReservation?: symbol
   }) {
+    if (args.startupReservation) {
+      if (this.startingClaudeTurns.get(args.chatId) !== args.startupReservation) throw new Error("Chat startup reservation was replaced")
+      return await this.startReservedTurnForChat(args)
+    }
+    if (this.startingClaudeTurns.has(args.chatId)) throw new Error("Chat is already starting")
+    if (args.provider !== "claude") return await this.startReservedTurnForChat(args)
+    return await this.withClaudeStartupReservation(args.chatId, () => this.startReservedTurnForChat(args))
+  }
+
+  private async startReservedTurnForChat(args: Parameters<AgentCoordinator["startTurnForChat"]>[0]) {
     this.clearIdleSessionTimer(args.chatId)
 
     // Close any lingering draining stream before starting a new turn.
@@ -1994,9 +2022,7 @@ export class AgentCoordinator {
     }
 
     const chat = this.store.requireChat(args.chatId)
-    if (this.activeTurns.has(args.chatId)) {
-      throw new Error("Chat is already running")
-    }
+    if (this.activeTurns.has(args.chatId)) throw new Error("Chat is already running")
 
     const previousProvider = chat.provider
     if (chat.provider !== args.provider) {
@@ -2024,9 +2050,7 @@ export class AgentCoordinator {
     }
 
     const project = this.store.getProject(chat.projectId)
-    if (!project) {
-      throw new Error("Project not found")
-    }
+    if (!project) throw new Error("Project not found")
 
     // Mid-conversation harness switch: drop the old provider's session (its
     // native context is stale the moment another harness takes a turn — we
@@ -2123,12 +2147,8 @@ export class AgentCoordinator {
     //   cursor         — <system-message> failsafe only (no headless expansion).
     const skills = await this.resolvePromptSkills(args.provider, args.chatId, args.content)
     let wireContent = args.steered ? buildSteeredMessageContent(args.content) : args.content
-    if (args.provider !== "codex" && skills.length > 0) {
-      wireContent = appendSystemMessageBlock(wireContent, buildSkillSystemMessage(skills))
-    }
-    const concurrentAgentsNotice = buildConcurrentAgentsNotice(
-      this.collectConcurrentProjectChats(args.chatId, project.localPath)
-    )
+    if (args.provider !== "codex" && skills.length > 0) wireContent = appendSystemMessageBlock(wireContent, buildSkillSystemMessage(skills))
+    const concurrentAgentsNotice = buildConcurrentAgentsNotice(this.collectConcurrentProjectChats(args.chatId, project.localPath))
     if (concurrentAgentsNotice) {
       wireContent = appendSystemMessageBlock(wireContent, concurrentAgentsNotice)
     }
@@ -2278,6 +2298,12 @@ export class AgentCoordinator {
     if (!active) {
       throw new Error(`Failed to initialize ${args.provider} active turn`)
     }
+
+    this.activeTurns.set(args.chatId, active)
+
+    // The registered active turn now owns exclusivity, including its stream's
+    // queue drain. Release startup's reservation before any result can arrive.
+    this.startingClaudeTurns.delete(args.chatId)
     markToolsReady()
 
     if (turn.getAccountInfo) {
@@ -2301,13 +2327,7 @@ export class AgentCoordinator {
 
     if (args.provider === "claude") {
       const session = this.claudeSessions.get(args.chatId)
-      if (!session) {
-        throw new Error("Claude session was not initialized")
-      }
-      if (active.cancelRequested || this.activeTurns.get(args.chatId) !== active) {
-        await this.interruptAndCloseTurn(turn)
-        return
-      }
+      if (!session) throw new Error("Claude session was not initialized")
       session.suppressResume = false
       const promptSeq = session.nextPromptSeq + 1
       const promptId = crypto.randomUUID()
@@ -2488,7 +2508,7 @@ export class AgentCoordinator {
       this.emitStateChange(chatId)
       return { chatId }
     }
-    if (this.activeTurns.has(chatId)) {
+    if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId)) {
       this.analytics.track("message_sent")
       const queuedMessage = await this.enqueueMessage(chatId, command.content, command.attachments ?? [], {
         provider: command.provider,
@@ -2550,6 +2570,9 @@ export class AgentCoordinator {
     if (!queuedMessage) {
       throw new Error("Queued message not found")
     }
+    // Before native startup registers an active turn there is no turn to
+    // interrupt. Keep the queued message for the owning turn's normal drain.
+    if (this.startingClaudeTurns.has(command.chatId) && !this.activeTurns.has(command.chatId)) return
 
     logClaudeSteer("steer_requested", {
       chatId: command.chatId,
@@ -2829,6 +2852,7 @@ export class AgentCoordinator {
   private async resumeBackgroundTurn(session: ClaudeSessionState) {
     if (this.claudeSessions.get(session.chatId) !== session
       || this.activeTurns.has(session.chatId)) return
+    if (this.startingClaudeTurns.has(session.chatId)) return
     const active: ActiveTurn = {
       chatId: session.chatId,
       provider: "claude",

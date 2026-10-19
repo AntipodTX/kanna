@@ -2795,6 +2795,132 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
     expect(interrupts).toBe(1)
     expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
   })
+
+
+  test("reserves a queued Claude start before removing its queue entry", async () => {
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    const queued = await store.enqueueMessage("chat-1", { content: "queued first", provider: "claude", model: "claude-opus-4-1" })
+    let markRemoval!: () => void
+    const removalStarted = new Promise<void>((resolve) => { markRemoval = resolve })
+    let releaseRemoval!: () => void
+    const removalReady = new Promise<void>((resolve) => { releaseRemoval = resolve })
+    const remove = store.removeQueuedMessage.bind(store)
+    store.removeQueuedMessage = async (chatId, id) => {
+      if (id === queued.id) { markRemoval(); await removalReady }
+      await remove(chatId, id)
+    }
+    const prompts: string[] = []
+    let starts = 0
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      startClaudeSession: async () => {
+        starts++
+        return { provider: "claude", stream: events, interrupt: async () => {}, close: () => events.close(),
+          setModel: async () => {}, setPermissionMode: async () => {},
+          sendPrompt: async (content) => { prompts.push(content) },
+        }
+      },
+    })
+    const first = coordinator.steer({ type: "message.steer", chatId: "chat-1", queuedMessageId: queued.id })
+    try {
+      await removalStarted
+      const second = await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "second", model: "claude-opus-4-1" })
+      expect(second).toMatchObject({ queued: true })
+      expect(starts).toBe(0)
+      releaseRemoval()
+      await first
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]).toContain("queued first")
+      expect(store.queuedMessages.map(entry => entry.content)).toEqual(["second"])
+    } finally {
+      releaseRemoval()
+      await first.catch(() => {})
+      events.close()
+    }
+  })
+
+
+  test("reserves Claude startup before asynchronous chat metadata and queues a concurrent send", async () => {
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    const prompts: string[] = []
+    let markMetadata!: () => void
+    const metadataStarted = new Promise<void>((resolve) => { markMetadata = resolve })
+    let releaseMetadata!: () => void
+    const metadataReady = new Promise<void>((resolve) => { releaseMetadata = resolve })
+    let metadataCalls = 0
+    store.setPlanMode = async (_chatId, planMode) => {
+      if (++metadataCalls === 1) { markMetadata(); await metadataReady }
+      store.chat.planMode = planMode
+    }
+    let starts = 0
+    const coordinator = new AgentCoordinator({
+      store: store as never, onStateChange: () => {},
+      startClaudeSession: async () => {
+        starts += 1
+        return {
+          provider: "claude", stream: events, echoesPromptIds: true,
+          interrupt: async () => {}, close: () => events.close(),
+          setModel: async () => {}, setPermissionMode: async () => {},
+          sendPrompt: async (content, promptId) => {
+            prompts.push(content)
+            events.push({ type: "transcript", promptIds: [promptId], entry: timestamped({
+              kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done",
+            }) })
+          },
+        }
+      },
+    })
+    const send = (content: string) => coordinator.send({
+      type: "chat.send", chatId: "chat-1", provider: "claude", content, model: "claude-opus-4-1",
+    })
+    const first = send("first")
+    try {
+      await metadataStarted
+      const second = await send("second")
+      expect(second).toMatchObject({ queued: true })
+      expect(starts).toBe(0)
+      expect(store.queuedMessages.map((entry) => entry.content)).toEqual(["second"])
+      releaseMetadata()
+      await first
+      await waitFor(() => store.turnFinishedCount === 2)
+      expect(starts).toBe(1)
+      expect(prompts.map((content) => content.split("\n\n")[0])).toEqual(["first", "second"])
+      expect(store.queuedMessages).toHaveLength(0)
+    } finally {
+      releaseMetadata()
+      await first.catch(() => {})
+      events.close()
+    }
+  })
+
+
+  test("releases a Claude startup reservation after startup fails so a retry can run", async () => {
+    const events = new AsyncEventQueue<any>()
+    let starts = 0
+    const prompts: string[] = []
+    const coordinator = new AgentCoordinator({
+      store: createFakeStore() as never, onStateChange: () => {},
+      startClaudeSession: async () => {
+        if (++starts === 1) throw new Error("boot failed")
+        return {
+          provider: "claude", stream: events,
+          interrupt: async () => {}, close: () => events.close(),
+          setModel: async () => {}, setPermissionMode: async () => {},
+          sendPrompt: async (content) => { prompts.push(content) },
+        }
+      },
+    })
+    const command = { type: "chat.send" as const, chatId: "chat-1", provider: "claude" as const, content: "retry", model: "claude-opus-4-1" }
+    try {
+      await expect(coordinator.send(command)).rejects.toThrow("boot failed")
+      await expect(coordinator.send(command)).resolves.toEqual({ chatId: "chat-1" })
+      expect(starts).toBe(2)
+      expect(prompts.map((content) => content.split("\n\n")[0])).toEqual(["retry"])
+    } finally {
+      events.close()
+    }
+  })
 })
 
 describe("buildConcurrentAgentsNotice", () => {
