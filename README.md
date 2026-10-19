@@ -4,6 +4,8 @@
 
 ### Features
 
+- Search chat contents across a project from a standalone floating panel available before selecting a chat, with archived-chat and tool filters, pagination, and exact-message navigation.
+- Search the complete current chat transcript from the widgets sidebar, with result snippets, exact-message navigation, and optional tool call and result matching.
 
 ### Fixes
 

@@ -6,6 +6,7 @@ import {
   getLatestUserPrompt,
   getRowAnchorMessageId,
   isOptimisticMessageId,
+  resolveEntryJump,
   resolveJumpTarget,
   resolveRestoreTarget,
   shouldPinForNewPrompt,
@@ -118,6 +119,45 @@ describe("resolveJumpTarget", () => {
     } as unknown as ResolvedTranscriptRow]
     expect(resolveJumpTarget(withIds, { toolId: "call-2" })).toEqual({ kind: "pin", rowId: withIds[1]!.id })
     expect(resolveJumpTarget(withIds, { toolId: "missing" })).toBeNull()
+  })
+
+  test("a named transcript entry lands on its row, including inside a tool group", () => {
+    expect(resolveJumpTarget(rows, { entryId: "m1" })).toEqual({ kind: "pin", rowId: rows[0]!.id })
+    expect(resolveJumpTarget(rows, { entryId: "t2" })).toEqual({ kind: "pin", rowId: rows[1]!.id })
+    expect(resolveJumpTarget(rows, { entryId: "missing" })).toBeNull()
+  })
+})
+
+describe("resolveEntryJump", () => {
+  const target = { entryId: "older-entry", revealEntryId: "nested-entry" }
+
+  test("asks for the named older entry before giving up on a jump", () => {
+    expect(resolveEntryJump([], target, {
+      hasOlderMessages: true,
+      loadAttempted: false,
+      loadPending: false,
+    })).toEqual({ kind: "load", entryId: "older-entry" })
+  })
+
+  test("waits for an in-flight load and gives up after one unsuccessful attempt", () => {
+    expect(resolveEntryJump([], target, {
+      hasOlderMessages: true,
+      loadAttempted: true,
+      loadPending: true,
+    })).toEqual({ kind: "wait" })
+    expect(resolveEntryJump([], target, {
+      hasOlderMessages: true,
+      loadAttempted: true,
+      loadPending: false,
+    })).toEqual({ kind: "missing" })
+  })
+
+  test("resolves the row as soon as the older slice arrives", () => {
+    expect(resolveEntryJump([toolGroupRow(["older-entry", "nested-entry"])], target, {
+      hasOlderMessages: true,
+      loadAttempted: true,
+      loadPending: true,
+    })).toEqual({ kind: "ready", target: { kind: "pin", rowId: "tool-group:older-entry" } })
   })
 })
 

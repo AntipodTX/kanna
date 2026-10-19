@@ -52,6 +52,16 @@ export function findToolCallRowIndex(rows: ResolvedTranscriptRow[], toolId: stri
   return index === -1 ? null : index
 }
 
+/** Index of the row rendering a concrete transcript entry, or null. */
+export function findEntryRowIndex(rows: ResolvedTranscriptRow[], entryId: string): number | null {
+  const index = rows.findIndex((row) => (
+    row.kind === "single"
+      ? row.message.id === entryId
+      : row.messages.some((message) => message.id === entryId)
+  ))
+  return index === -1 ? null : index
+}
+
 /** Index of the row rendering the most recent user prompt, or null. */
 export function findLatestUserPromptRowIndex(rows: ResolvedTranscriptRow[]): number | null {
   for (let index = rows.length - 1; index >= 0; index -= 1) {
@@ -150,6 +160,35 @@ export interface TranscriptJumpRequest {
   requestId: string
 }
 
+export type EntryJumpResolution =
+  | { kind: "ready"; target: TranscriptScrollTarget }
+  | { kind: "load"; entryId: string }
+  | { kind: "wait" }
+  | { kind: "missing" }
+
+/**
+ * Resolve a concrete-entry jump, including the one backwards load it may need.
+ * Project search can name an entry outside the current transcript window; a
+ * failed or stale id is attempted only once so it cannot create a load loop.
+ */
+export function resolveEntryJump(
+  rows: ResolvedTranscriptRow[],
+  target: Extract<ChatJumpTarget, { entryId: string }>,
+  state: {
+    hasOlderMessages: boolean
+    loadAttempted: boolean
+    loadPending: boolean
+  },
+): EntryJumpResolution {
+  const resolved = resolveJumpTarget(rows, target)
+  if (resolved) return { kind: "ready", target: resolved }
+  if (state.loadPending) return { kind: "wait" }
+  if (state.hasOlderMessages && !state.loadAttempted) {
+    return { kind: "load", entryId: target.entryId }
+  }
+  return { kind: "missing" }
+}
+
 /**
  * Where a jump request should land, or null when the transcript has no such
  * message.
@@ -167,7 +206,9 @@ export function resolveJumpTarget(
   target: ChatJumpTarget,
 ): TranscriptScrollTarget | null {
   const index = typeof target !== "string"
-    ? findToolCallRowIndex(rows, target.toolId)
+    ? "toolId" in target
+      ? findToolCallRowIndex(rows, target.toolId)
+      : findEntryRowIndex(rows, target.entryId)
     : target === "prompt"
       ? findLatestUserPromptRowIndex(rows)
       : findLatestAssistantTextRowIndex(rows)

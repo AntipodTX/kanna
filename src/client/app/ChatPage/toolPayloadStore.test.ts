@@ -123,4 +123,52 @@ describe("createToolPayloadStore", () => {
 
     expect(notified).toBe(0)
   })
+
+  test("load waits for payloads and reuses the cache", async () => {
+    const fetcher = deferredFetcher()
+    const store = createToolPayloadStore(fetcher.fetchEntries)
+
+    const loaded = store.load(["a", "b"])
+    await tick()
+    expect(fetcher.calls).toEqual([["a", "b"]])
+
+    fetcher.resolve([entry("a"), entry("b")])
+    await expect(loaded).resolves.toEqual([entry("a"), entry("b")])
+    await expect(store.load(["b", "a"])).resolves.toEqual([entry("b"), entry("a")])
+    expect(fetcher.calls).toHaveLength(1)
+  })
+
+  test("load shares an in-flight prefetch instead of requesting the id twice", async () => {
+    const fetcher = deferredFetcher()
+    const store = createToolPayloadStore(fetcher.fetchEntries)
+
+    store.prefetch(["a"])
+    const loaded = store.load(["a"])
+    await tick()
+    expect(fetcher.calls).toEqual([["a"]])
+
+    fetcher.resolve([entry("a")])
+    await expect(loaded).resolves.toEqual([entry("a")])
+  })
+
+  test("splits a large load into server-sized batches", async () => {
+    const calls: string[][] = []
+    const store = createToolPayloadStore(async (entryIds) => {
+      calls.push(entryIds)
+      return entryIds.map(entry)
+    }, 2)
+
+    await expect(store.load(["a", "b", "c", "d", "e"])).resolves.toHaveLength(5)
+    expect(calls).toEqual([["a", "b"], ["c", "d"], ["e"]])
+  })
+
+  test("load reports fetch failures while prefetch remains fire-and-forget", async () => {
+    const store = createToolPayloadStore(async () => {
+      throw new Error("socket closed")
+    })
+
+    store.prefetch(["prefetch"])
+    await tick()
+    await expect(store.load(["load"])).rejects.toThrow("socket closed")
+  })
 })

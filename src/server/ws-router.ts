@@ -2,6 +2,7 @@ import type { PerformanceLog } from "./performance-log"
 import type { ServerWebSocket } from "bun"
 import { homedir } from "node:os"
 import { PROTOCOL_VERSION } from "../shared/types"
+import { searchTranscriptEntries, type ProjectChatSearchEntryResult } from "../shared/chatSearch"
 import type { ClientEnvelope, ServerEnvelope, SubscriptionTopic } from "../shared/protocol"
 import { isClientEnvelope } from "../shared/protocol"
 import { diffSidebarIndex, indexSidebarData, type SidebarIndex } from "../shared/sidebar-patch"
@@ -43,6 +44,34 @@ import type {
  * group's members; beyond that something is walking the transcript.
  */
 const MAX_TOOL_ENTRY_REQUEST = 256
+
+const DEFAULT_PROJECT_SEARCH_RESULT_LIMIT = 100
+const MAX_PROJECT_SEARCH_RESULT_LIMIT = 100
+
+interface ProjectSearchCursor {
+  chatIndex: number
+  matchOffset: number
+}
+
+function encodeProjectSearchCursor(cursor: ProjectSearchCursor) {
+  return `${cursor.chatIndex}:${cursor.matchOffset}`
+}
+
+function decodeProjectSearchCursor(value: string | undefined): ProjectSearchCursor {
+  if (!value) return { chatIndex: 0, matchOffset: 0 }
+  const [chatIndexText, matchOffsetText] = value.split(":")
+  const chatIndex = Number(chatIndexText)
+  const matchOffset = Number(matchOffsetText)
+  return {
+    chatIndex: Number.isInteger(chatIndex) && chatIndex >= 0 ? chatIndex : 0,
+    matchOffset: Number.isInteger(matchOffset) && matchOffset >= 0 ? matchOffset : 0,
+  }
+}
+
+function getProjectSearchLimit(limit: number | undefined) {
+  if (!limit || !Number.isFinite(limit)) return DEFAULT_PROJECT_SEARCH_RESULT_LIMIT
+  return Math.min(MAX_PROJECT_SEARCH_RESULT_LIMIT, Math.max(1, Math.floor(limit)))
+}
 
 /** Coalescing window for transcript pushes — roughly one animation frame. */
 const CHAT_BROADCAST_INTERVAL_MS = 16
@@ -1241,6 +1270,70 @@ export function createWsRouter({
           }
           const result = await readProjectQuickActions(project.localPath)
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
+          return
+        }
+        case "project.search": {
+          const project = store.getProject(command.projectId)
+          if (!project) {
+            throw new Error("Project not found")
+          }
+
+          const limit = getProjectSearchLimit(command.limit)
+          const cursor = decodeProjectSearchCursor(command.cursor)
+          const candidateChats = [...store.state.chatsById.values()]
+            .filter((chat) => (
+              chat.projectId === command.projectId
+              && !chat.deletedAt
+              && (command.includeArchived || !chat.archivedAt)
+            ))
+            .sort((left, right) => right.updatedAt - left.updatedAt)
+          const collected: ProjectChatSearchEntryResult[] = []
+          let nextCursor: string | undefined
+
+          searchChats: for (let chatIndex = cursor.chatIndex; chatIndex < candidateChats.length; chatIndex += 1) {
+            const chat = candidateChats[chatIndex]!
+            const matchOffset = chatIndex === cursor.chatIndex ? cursor.matchOffset : 0
+            const remainingWithLookahead = limit + 1 - collected.length
+            const transcript = command.includeToolEntries
+              ? store.getMessages(chat.id)
+              : store.getClientTranscript(chat.id).messages
+            const chatMatches = searchTranscriptEntries(transcript, command.query, {
+              chatId: chat.id,
+              localPath: project.localPath,
+              includeToolEntries: Boolean(command.includeToolEntries),
+              skipMatches: matchOffset,
+              limit: remainingWithLookahead,
+            })
+
+            for (let matchIndex = 0; matchIndex < chatMatches.length; matchIndex += 1) {
+              collected.push({
+                ...chatMatches[matchIndex]!,
+                chatTitle: chat.title,
+                isArchived: Boolean(chat.archivedAt),
+              })
+              if (collected.length === limit) {
+                nextCursor = encodeProjectSearchCursor({
+                  chatIndex,
+                  matchOffset: matchOffset + matchIndex + 1,
+                })
+              }
+              if (collected.length > limit) break searchChats
+            }
+          }
+
+          const hasMore = collected.length > limit
+          send(ws, {
+            v: PROTOCOL_VERSION,
+            type: "ack",
+            id,
+            result: {
+              query: command.query,
+              projectId: command.projectId,
+              matches: collected.slice(0, limit),
+              ...(hasMore && nextCursor ? { nextCursor } : {}),
+              hasMore,
+            },
+          })
           return
         }
         case "project.writeQuickActions": {

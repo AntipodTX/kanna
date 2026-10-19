@@ -3,6 +3,7 @@ import type { AgentProvider, ProviderCatalogEntry, SubagentActivity, TranscriptE
 import type { KannaSocket } from "../../../app/socket"
 import { useComposer } from "../../../hooks/useComposer"
 import { AttachmentsWidget } from "./AttachmentsWidget"
+import { ChatSearchWidget } from "./ChatSearchWidget"
 import { deriveSentAttachments, deriveSubagentToolIds, latestWorkflows, orderTaskLog } from "./derive"
 import { PortsWidget } from "./PortsWidget"
 import { QuickActionsWidget } from "./QuickActionsWidget"
@@ -38,9 +39,14 @@ function WidgetsSidebarImpl({
   socket,
   active,
   entries,
+  localPath,
+  searchReady,
+  hasOlderMessages,
+  onLoadOlderMessages,
   subagents,
   onRunQuickAction,
   onJumpToToolCall,
+  onJumpToEntry,
   gitWidgets,
   isNewChat,
 }: {
@@ -59,10 +65,16 @@ function WidgetsSidebarImpl({
   active: boolean
   /** The loaded transcript window, for the agent and attachment widgets. */
   entries: readonly TranscriptEntry[]
+  localPath?: string | null
+  searchReady: boolean
+  hasOlderMessages: boolean
+  onLoadOlderMessages: (options: { all: true }) => Promise<boolean>
   subagents: readonly SubagentActivity[]
   onRunQuickAction: (command: string) => void
   /** Scrolls the chat to a tool call (the call that started a Tasks row). */
   onJumpToToolCall: (toolId: string) => void
+  /** Scrolls the chat to a concrete entry selected by transcript search. */
+  onJumpToEntry: (entryId: string, revealEntryId?: string) => void
   gitWidgets: ReactNode
 }) {
   // The harness the composer has selected: the chat's own once its session
@@ -102,6 +114,20 @@ function WidgetsSidebarImpl({
         <WidgetPresence show={workflows.length > 0}>
           <WorkflowWidget workflows={workflows} stopControl={stopControl} />
         </WidgetPresence>
+        {chatId ? (
+          <WidgetPresence show>
+            <ChatSearchWidget
+              key={chatId}
+              chatId={chatId}
+              entries={entries}
+              localPath={localPath}
+              ready={searchReady}
+              hasOlderMessages={hasOlderMessages}
+              onLoadOlderMessages={onLoadOlderMessages}
+              onJumpToEntry={onJumpToEntry}
+            />
+          </WidgetPresence>
+        ) : null}
         {gitWidgets}
         <WidgetPresence show={attachments.length > 0}>
           <AttachmentsWidget attachments={attachments} />
