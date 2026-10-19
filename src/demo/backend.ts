@@ -36,6 +36,7 @@ import {
   type QueuedChatMessage,
   type SidebarChatRow,
   type SidebarData,
+  type StartupSyncSnapshot,
   type TranscriptEntry,
   type UpdateSnapshot,
 } from "../shared/types"
@@ -801,6 +802,20 @@ export class DemoBackend {
         return { type: "provider-auth", data: createProviderAuth() }
       case "usage-limits":
         return { type: "usage-limits", data: { providers: [] } }
+      case "startup-sync":
+        // The demo has no native sessions to import.
+        return {
+          type: "startup-sync",
+          data: {
+            enabled: false,
+            mode: "session-sync",
+            status: "idle",
+            messages: [],
+            startedAt: null,
+            completedAt: null,
+            error: null,
+          } satisfies StartupSyncSnapshot,
+        }
       case "terminal":
         return null
     }

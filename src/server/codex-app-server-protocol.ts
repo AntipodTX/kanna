@@ -97,6 +97,7 @@ export interface TurnStartParams {
   model?: string | null
   effort?: ReasoningEffort | null
   serviceTier?: ServiceTier | null
+  outputSchema?: Record<string, unknown> | null
   collaborationMode?: CollaborationMode | null
 }
 
@@ -206,6 +207,72 @@ export interface CodexError {
   message?: string
   codexErrorInfo?: CodexErrorInfo | null
   additionalDetails?: unknown
+}
+
+export type ThreadSortKey = "created_at" | "updated_at"
+
+export type ThreadSourceKind =
+  | "cli"
+  | "vscode"
+  | "exec"
+  | "appServer"
+  | "subAgent"
+  | "subAgentReview"
+  | "subAgentCompact"
+  | "subAgentThreadSpawn"
+  | "subAgentOther"
+  | "unknown"
+
+export interface ThreadListParams {
+  cursor?: string | null
+  limit?: number | null
+  sortKey?: ThreadSortKey | null
+  modelProviders?: string[] | null
+  sourceKinds?: ThreadSourceKind[] | null
+  archived?: boolean | null
+  cwd?: string | null
+  searchTerm?: string | null
+}
+
+export interface ThreadTurn {
+  id: string
+  items: ThreadItem[]
+  status: "inProgress" | "completed" | "failed" | "interrupted"
+  error: {
+    message?: string
+  } | null
+}
+
+export interface Thread {
+  id: string
+  preview: string
+  ephemeral: boolean
+  modelProvider: string
+  createdAt: number
+  updatedAt: number
+  status: string
+  path?: string | null
+  cwd: string
+  cliVersion: string
+  source: string
+  agentNickname?: string | null
+  agentRole?: string | null
+  name?: string | null
+  turns: ThreadTurn[]
+}
+
+export interface ThreadListResponse {
+  data: Thread[]
+  nextCursor?: string | null
+}
+
+export interface ThreadReadParams {
+  threadId: string
+  includeTurns: boolean
+}
+
+export interface ThreadReadResponse {
+  thread: Thread
 }
 
 export interface TurnSummary {
@@ -418,6 +485,19 @@ export interface AgentMessageItem {
   phase?: string
 }
 
+export type RawResponseItem =
+  | {
+      type: "message"
+      role: string
+      content: Array<{
+        type: "input_text" | "input_image" | "output_text"
+        text?: string
+        image_url?: string
+      }>
+      phase?: string | null
+    }
+  | Record<string, unknown>
+
 export interface PlanItem {
   type: "plan"
   id: string
@@ -534,6 +614,19 @@ export interface ItemCompletedNotification {
   turnId: string
 }
 
+export interface AgentMessageDeltaNotification {
+  threadId: string
+  turnId: string
+  itemId: string
+  delta: string
+}
+
+export interface RawResponseItemCompletedNotification {
+  item: RawResponseItem
+  threadId: string
+  turnId: string
+}
+
 export interface ErrorNotification {
   error: CodexError
   /**
@@ -578,6 +671,8 @@ export type ServerNotification =
   | { method: "turn/plan/updated"; params: TurnPlanUpdatedNotification }
   | { method: "item/started"; params: ItemStartedNotification }
   | { method: "item/completed"; params: ItemCompletedNotification }
+  | { method: "item/agentMessage/delta"; params: AgentMessageDeltaNotification }
+  | { method: "rawResponseItem/completed"; params: RawResponseItemCompletedNotification }
   | { method: "item/plan/delta"; params: PlanDeltaNotification }
   | { method: "thread/compacted"; params: ContextCompactedNotification }
   | { method: "account/rateLimits/updated"; params: AccountRateLimitsUpdatedNotification }
@@ -610,6 +705,8 @@ export function isServerNotification(value: unknown): value is ServerNotificatio
     || candidate.method === "turn/plan/updated"
     || candidate.method === "item/started"
     || candidate.method === "item/completed"
+    || candidate.method === "item/agentMessage/delta"
+    || candidate.method === "rawResponseItem/completed"
     || candidate.method === "item/plan/delta"
     || candidate.method === "thread/compacted"
     || candidate.method === "account/rateLimits/updated"
