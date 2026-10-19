@@ -28,6 +28,7 @@ export interface CodexNativeInput {
 export interface CodexHistoryRecords {
   prompts: Record<string, CodexPromptBinding>
   turns: Record<string, { boundaryEntryId: string | null }>
+  redeliveries?: Record<string, { sessionToken: string; boundaryEntryId: string | null }>
 }
 export interface CodexPromptRecovery {
   bindings: Record<string, CodexPromptBinding>
@@ -40,7 +41,7 @@ export class CodexPromptHistory {
   private readonly tails = new Map<string, Promise<void>>()
   constructor(
     private readonly dataDir: string,
-    private readonly preparePromptCommit?: (chatId: string, binding: CodexPromptBinding) => () => Promise<void>,
+    private readonly preparePromptCommit?: (chatId: string, binding: CodexPromptBinding, promptId: string) => () => Promise<void>,
   ) {}
   private file(chatId: string) {
     const key = createHash("sha256").update(chatId).digest("hex")
@@ -52,7 +53,7 @@ export class CodexPromptHistory {
       const value = JSON.parse(await readFile(this.file(chatId), "utf8"))
       if (!value || value.v !== 1 || !value.prompts || !value.turns)
         throw new Error("Invalid Codex prompt history")
-      return { prompts: value.prompts, turns: value.turns }
+      return { prompts: value.prompts, turns: value.turns, ...(value.redeliveries ? { redeliveries: value.redeliveries } : {}) }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT")
         return emptyRecords()
@@ -98,11 +99,20 @@ export class CodexPromptHistory {
   async recordPrompt(chatId: string, promptId: string, binding: CodexPromptBinding) {
     // Capture the caller's generation before asynchronous persistence, then
     // publish its checkpoint only after the binding has reached disk.
-    const commit = this.preparePromptCommit?.(chatId, binding)
+    const commit = this.preparePromptCommit?.(chatId, binding, promptId)
     await this.update(chatId, (records) => {
       records.prompts[promptId] = binding
     })
     await commit?.()
+  }
+  beginRedelivery(chatId: string, promptId: string, sessionToken: string, boundaryEntryId: string | null) {
+    return this.update(chatId, records => {
+      records.redeliveries ??= {}
+      records.redeliveries[promptId] = { sessionToken, boundaryEntryId }
+    })
+  }
+  finishRedelivery(chatId: string, promptId: string) {
+    return this.update(chatId, records => { delete records.redeliveries?.[promptId] })
   }
   remember(chatId: string, bindings: Record<string, CodexPromptBinding>, replacePromptIds?: readonly string[]) {
     return this.update(chatId, (records) => {
@@ -135,7 +145,7 @@ export function codexUserText(text: string) {
   return result
 }
 
-function nativePromptMatches(
+export function nativePromptMatches(
   text: string,
   prompt: Extract<TranscriptEntry, { kind: "user_prompt" }>,
   replayPreamble?: string,
