@@ -2029,11 +2029,15 @@ export class CodexAppServerManager {
 
   private async handleNotification(context: SessionContext, notification: ServerNotification) {
     if (notification.method === "thread/started") {
-      context.sessionToken = notification.params.thread.id
+      const threadId = notification.params.thread.id
+      if (context.sessionToken && threadId !== context.sessionToken) {
+        return
+      }
+      context.sessionToken = threadId
       if (context.pendingTurn) {
         context.pendingTurn.queue.push({
           type: "session_token",
-          sessionToken: notification.params.thread.id,
+          sessionToken: threadId,
         })
       }
       return
@@ -2055,17 +2059,18 @@ export class CodexAppServerManager {
 
     switch (notification.method) {
       case "thread/tokenUsage/updated":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId)) return
         this.handleTokenUsageUpdated(pendingTurn, notification.params)
         return
       case "turn/plan/updated":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turnId)) return
         this.handlePlanUpdated(pendingTurn, notification.params)
         return
       case "item/started":
         this.handleItemStarted(
           pendingTurn,
           notification.params,
-          (!context.sessionToken || notification.params.threadId === context.sessionToken)
-            && (!pendingTurn.turnId || notification.params.turnId === pendingTurn.turnId)
+          isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turnId)
         )
         return
       case "item/completed":
@@ -2099,15 +2104,19 @@ export class CodexAppServerManager {
         this.handleRawResponseItemCompleted(pendingTurn, notification.params)
         return
       case "item/plan/delta":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turnId)) return
         this.handlePlanDelta(pendingTurn, notification.params)
         return
       case "turn/completed":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turn.id)) return
         await this.handleTurnCompleted(context, notification.params)
         return
       case "thread/compacted":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turnId)) return
         this.handleContextCompacted(pendingTurn, notification.params)
         return
       case "error":
+        if (!isActiveTurnNotification(context, pendingTurn, notification.params.threadId, notification.params.turnId)) return
         this.handleErrorNotification(context, notification.params)
         return
       default:
@@ -2126,6 +2135,7 @@ export class CodexAppServerManager {
     }
 
     if (notification.item.type === "plan") {
+      if (!isActiveTurn) return
       pendingTurn.planTextByItemId.set(notification.item.id, notification.item.text)
       pendingTurn.latestPlanText = notification.item.text
       return
@@ -2194,7 +2204,11 @@ export class CodexAppServerManager {
           text: notification.item.text,
         }),
       })
-      if (pendingTurn.pendingWebSearchResultToolId && notification.item.text.trim()) {
+      if (
+        isActiveTurn
+        && pendingTurn.pendingWebSearchResultToolId
+        && notification.item.text.trim()
+      ) {
         pendingTurn.queue.push({
           type: "transcript",
           entry: timestamped({
@@ -2209,6 +2223,7 @@ export class CodexAppServerManager {
     }
 
     if (notification.item.type === "plan") {
+      if (!isActiveTurn) return
       pendingTurn.planTextByItemId.set(notification.item.id, notification.item.text)
       pendingTurn.latestPlanText = notification.item.text
       return
@@ -2233,7 +2248,12 @@ export class CodexAppServerManager {
     const resultEntries = itemToToolResults(notification.item)
     for (const entry of resultEntries) {
       pendingTurn.queue.push({ type: "transcript", entry })
-      if (notification.item.type === "webSearch" && entry.kind === "tool_result" && !entry.isError) {
+      if (
+        isActiveTurn
+        && notification.item.type === "webSearch"
+        && entry.kind === "tool_result"
+        && !entry.isError
+      ) {
         pendingTurn.pendingWebSearchResultToolId = notification.item.id
       }
     }
