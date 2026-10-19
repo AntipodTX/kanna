@@ -19,6 +19,7 @@ import type { KannaToolHost } from "./kanna-tools"
 import { createKannaMcpServer } from "./kanna-mcp"
 import { asNumber, asRecord } from "../shared/json"
 import { timestamped } from "./transcript"
+import { codexAsyncQuestionTool } from "../shared/codex-questions"
 import {
   type AccountRateLimitsUpdatedNotification,
   type CollabAgentToolCallItem,
@@ -1597,9 +1598,10 @@ export class CodexAppServerManager {
     }
 
     if (notification.item.type === "agentMessage") {
+      const question = codexAsyncQuestionTool(notification.item, notification.threadId)
       pendingTurn.queue.push({
         type: "transcript",
-        entry: timestamped({
+        entry: question ? timestamped({ kind: "tool_call", tool: question }) : timestamped({
           kind: "assistant_text",
           text: notification.item.text,
         }),
