@@ -116,6 +116,13 @@ export interface TurnStartParams {
   collaborationMode?: CollaborationMode | null
 }
 
+export interface TurnSteerParams {
+  threadId: string
+  input: CodexUserInput[]
+  expectedTurnId: string
+  clientUserMessageId: string
+}
+
 export interface TurnInterruptParams {
   threadId: string
   turnId: string
@@ -232,6 +239,10 @@ export interface TurnSummary {
 
 export interface TurnStartResponse {
   turn: TurnSummary
+}
+
+export interface TurnSteerResponse {
+  turnId: string
 }
 
 export interface ThreadStartedNotification {
@@ -576,6 +587,7 @@ export type ServerRequest =
 export interface UserMessageItem {
   type: "userMessage"
   id: string
+  clientId?: string | null
   content: Array<{
     type: "text"
     text: string
@@ -596,6 +608,7 @@ export interface AgentMessageItem {
   text: string
   phase?: string
   delivery?: "async" | null
+  questions?: import("../shared/codex-questions").CodexAsyncQuestion[] | null
 }
 
 export interface PlanItem {

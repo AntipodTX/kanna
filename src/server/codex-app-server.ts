@@ -21,6 +21,7 @@ import type { KannaToolHost } from "./kanna-tools"
 import { createKannaMcpServer } from "./kanna-mcp"
 import { asNumber, asRecord } from "../shared/json"
 import { timestamped } from "./transcript"
+import { codexAsyncQuestionTool } from "../shared/codex-questions"
 import {
   type AccountRateLimitsUpdatedNotification,
   type CollabAgentToolCallItem,
@@ -81,6 +82,8 @@ import {
   type TurnInterruptParams,
   type TurnStartParams,
   type TurnStartResponse,
+  type TurnSteerParams,
+  type TurnSteerResponse,
   isJsonRpcResponse,
   isServerNotification,
   isServerRequest,
@@ -108,6 +111,17 @@ interface PendingRequest<TResult> {
   reject: (error: Error) => void
 }
 
+type UserPromptTranscriptEntry = Extract<TranscriptEntry, { kind: "user_prompt" }>
+
+interface PendingSteeredEntry {
+  entry: UserPromptTranscriptEntry
+  echoReceived: boolean
+  settled: boolean
+  persisted: Promise<void>
+  resolvePersisted: () => void
+  rejectPersisted: (error: Error) => void
+}
+
 interface PendingTurn {
   turnId: string | null
   model: string
@@ -128,6 +142,7 @@ interface PendingTurn {
    * notification that follows can be empty.
    */
   retryCause: CodexError | null
+  pendingSteeredEntries: Map<string, PendingSteeredEntry>
   resolved: boolean
   onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
   onApprovalRequest?: (
@@ -190,6 +205,22 @@ export interface StartCodexTurnArgs {
   planMode: boolean
   onToolRequest: (request: HarnessToolRequest) => Promise<unknown>
   onApprovalRequest?: PendingTurn["onApprovalRequest"]
+}
+
+export interface SteerCodexTurnArgs {
+  chatId: string
+  expectedTurnId: string
+  content: string
+  selectedSkills?: { name: string; path: string }[]
+  clientUserMessageId: string
+  transcriptEntry: UserPromptTranscriptEntry
+}
+
+export interface CodexSteerHandle {
+  /** Resolves when Codex accepts the turn/steer request. */
+  accepted: Promise<void>
+  /** Resolves only after the correlated userMessage has been persisted. */
+  settled: Promise<void>
 }
 
 export interface GenerateStructuredArgs {
@@ -1206,6 +1237,7 @@ export class CodexAppServerManager {
       todoSequence: 0,
       pendingWebSearchResultToolId: null,
       retryCause: null,
+      pendingSteeredEntries: new Map(),
       resolved: false,
       onToolRequest: args.onToolRequest,
       onApprovalRequest: args.onApprovalRequest,
@@ -1257,6 +1289,7 @@ export class CodexAppServerManager {
 
     return {
       provider: "codex",
+      providerTurnId: pendingTurn.turnId ?? undefined,
       stream: queue,
       interrupt: async () => {
         const pendingTurn = context.pendingTurn
@@ -1264,6 +1297,7 @@ export class CodexAppServerManager {
 
         context.pendingTurn = null
         pendingTurn.resolved = true
+        this.failPendingSteers(pendingTurn, "Codex turn was interrupted", { includeEchoed: true })
         pendingTurn.queue.finish()
 
         if (!pendingTurn.turnId || !context.sessionToken) return
@@ -1297,6 +1331,86 @@ export class CodexAppServerManager {
     } catch {
       return null
     }
+  }
+
+  startSteerTurn(args: SteerCodexTurnArgs): CodexSteerHandle {
+    const context = this.requireSession(args.chatId)
+    const pendingTurn = context.pendingTurn
+    if (!pendingTurn || pendingTurn.resolved || !pendingTurn.turnId || !context.sessionToken) {
+      throw new Error("Codex turn is not ready for steering")
+    }
+    if (pendingTurn.turnId !== args.expectedTurnId) {
+      throw new Error("Codex turn changed before steering")
+    }
+    if (pendingTurn.pendingSteeredEntries.has(args.clientUserMessageId)) {
+      throw new Error("Codex queued message is already being steered")
+    }
+
+    const expectedTurnId = args.expectedTurnId
+    let resolvePersisted!: () => void
+    let rejectPersisted!: (error: Error) => void
+    const persisted = new Promise<void>((resolve, reject) => {
+      resolvePersisted = resolve
+      rejectPersisted = reject
+    })
+    // A turn notification can reject the record before the settlement consumer
+    // attaches. Keep that short handoff window handled.
+    void persisted.catch(() => undefined)
+    const pendingEntry: PendingSteeredEntry = {
+      entry: args.transcriptEntry,
+      echoReceived: false,
+      settled: false,
+      persisted,
+      resolvePersisted,
+      rejectPersisted,
+    }
+    pendingTurn.pendingSteeredEntries.set(args.clientUserMessageId, pendingEntry)
+
+    const accepted = this.sendRequest<TurnSteerResponse>(context, "turn/steer", {
+      threadId: context.sessionToken,
+      input: [{
+        type: "text",
+        text: args.selectedSkills?.length
+          ? appendSystemMessageBlock(args.content, buildSkillSystemMessage(args.selectedSkills))
+          : args.content,
+        text_elements: [],
+      }, ...(args.selectedSkills ?? []).map((skill) => ({
+        type: "skill" as const,
+        name: skill.name,
+        path: skill.path,
+      }))],
+      expectedTurnId,
+      clientUserMessageId: args.clientUserMessageId,
+    } satisfies TurnSteerParams).then((response) => {
+      if (response.turnId !== expectedTurnId) {
+        throw new Error(`Codex steered unexpected turn ${response.turnId}`)
+      }
+    }).catch((error) => {
+      const failure = error instanceof Error ? error : new Error(String(error))
+      this.rejectPendingSteeredEntry(
+        pendingTurn,
+        args.clientUserMessageId,
+        pendingEntry,
+        failure,
+      )
+      throw error
+    })
+    void accepted.catch(() => undefined)
+
+    const settled = Promise.all([accepted, pendingEntry.persisted]).then(() => {
+      if (!pendingEntry.echoReceived || !pendingEntry.settled) {
+        throw new Error("Codex turn ended before steering was acknowledged")
+      }
+    })
+    // A turn notification may reject persistence before the caller attaches
+    // its lifecycle handler. Keep that short handoff window handled.
+    void settled.catch(() => undefined)
+    return { accepted, settled }
+  }
+
+  async steerTurn(args: SteerCodexTurnArgs): Promise<void> {
+    const steer = this.startSteerTurn(args)
+    await steer.settled
   }
 
   async generateStructured(args: GenerateStructuredArgs): Promise<string | null> {
@@ -1703,7 +1817,12 @@ export class CodexAppServerManager {
         this.handlePlanUpdated(pendingTurn, notification.params)
         return
       case "item/started":
-        this.handleItemStarted(pendingTurn, notification.params)
+        this.handleItemStarted(
+          pendingTurn,
+          notification.params,
+          (!context.sessionToken || notification.params.threadId === context.sessionToken)
+            && (!pendingTurn.turnId || notification.params.turnId === pendingTurn.turnId)
+        )
         return
       case "item/completed":
         this.handleItemCompleted(
@@ -1730,7 +1849,16 @@ export class CodexAppServerManager {
     }
   }
 
-  private handleItemStarted(pendingTurn: PendingTurn, notification: ItemStartedNotification) {
+  private handleItemStarted(
+    pendingTurn: PendingTurn,
+    notification: ItemStartedNotification,
+    isActiveTurn: boolean
+  ) {
+    if (notification.item.type === "userMessage") {
+      this.handleSteeredUserMessage(pendingTurn, notification.item.clientId, isActiveTurn)
+      return
+    }
+
     if (notification.item.type === "plan") {
       pendingTurn.planTextByItemId.set(notification.item.id, notification.item.text)
       pendingTurn.latestPlanText = notification.item.text
@@ -1766,8 +1894,13 @@ export class CodexAppServerManager {
   private handleItemCompleted(
     pendingTurn: PendingTurn,
     notification: ItemCompletedNotification,
-    isActiveTurn: boolean,
+    isActiveTurn: boolean
   ) {
+    if (notification.item.type === "userMessage") {
+      this.handleSteeredUserMessage(pendingTurn, notification.item.clientId, isActiveTurn)
+      return
+    }
+
     if (notification.item.type === "agentMessage") {
       if (
         isActiveTurn
@@ -1785,9 +1918,10 @@ export class CodexAppServerManager {
           ),
         })
       }
+      const question = codexAsyncQuestionTool(notification.item, notification.threadId)
       pendingTurn.queue.push({
         type: "transcript",
-        entry: timestamped({
+        entry: question ? timestamped({ kind: "tool_call", tool: question }) : timestamped({
           kind: "assistant_text",
           text: notification.item.text,
         }),
@@ -1834,6 +1968,63 @@ export class CodexAppServerManager {
       if (notification.item.type === "webSearch" && entry.kind === "tool_result" && !entry.isError) {
         pendingTurn.pendingWebSearchResultToolId = notification.item.id
       }
+    }
+  }
+
+  private handleSteeredUserMessage(
+    pendingTurn: PendingTurn,
+    clientId: string | null | undefined,
+    isActiveTurn: boolean
+  ) {
+    if (!isActiveTurn || !clientId) return
+    const pendingEntry = pendingTurn.pendingSteeredEntries.get(clientId)
+    if (!pendingEntry || pendingEntry.echoReceived) return
+    pendingEntry.echoReceived = true
+    pendingTurn.queue.push({
+      type: "transcript",
+      entry: pendingEntry.entry,
+      onPersisted: (error) => {
+        if (error) {
+          this.rejectPendingSteeredEntry(pendingTurn, clientId, pendingEntry, error)
+          return
+        }
+        if (pendingEntry.settled) return
+        pendingEntry.settled = true
+        if (pendingTurn.pendingSteeredEntries.get(clientId) === pendingEntry) {
+          pendingTurn.pendingSteeredEntries.delete(clientId)
+        }
+        pendingEntry.resolvePersisted()
+      },
+    })
+  }
+
+  private rejectPendingSteeredEntry(
+    pendingTurn: PendingTurn,
+    clientId: string,
+    pendingEntry: PendingSteeredEntry,
+    error: Error,
+  ) {
+    if (pendingEntry.settled) return
+    pendingEntry.settled = true
+    if (pendingTurn.pendingSteeredEntries.get(clientId) === pendingEntry) {
+      pendingTurn.pendingSteeredEntries.delete(clientId)
+    }
+    pendingEntry.rejectPersisted(error)
+  }
+
+  private failPendingSteers(
+    pendingTurn: PendingTurn,
+    message: string,
+    options?: { includeEchoed?: boolean },
+  ) {
+    for (const [clientId, pendingEntry] of pendingTurn.pendingSteeredEntries) {
+      if (pendingEntry.echoReceived && !options?.includeEchoed) continue
+      this.rejectPendingSteeredEntry(
+        pendingTurn,
+        clientId,
+        pendingEntry,
+        new Error(message),
+      )
     }
   }
 
@@ -1892,6 +2083,7 @@ export class CodexAppServerManager {
     const isCancelled = status === "interrupted"
     const isError = status === "failed"
     pendingTurn.pendingWebSearchResultToolId = null
+    this.failPendingSteers(pendingTurn, "Codex turn ended before steering was acknowledged")
 
     if (!isCancelled && !isError && pendingTurn.planMode) {
       const planText = pendingTurn.latestPlanText?.trim()
@@ -1977,6 +2169,7 @@ export class CodexAppServerManager {
     context.customTools?.close()
     const pendingTurn = context.pendingTurn
     if (pendingTurn && !pendingTurn.resolved) {
+      this.failPendingSteers(pendingTurn, message, { includeEchoed: true })
       pendingTurn.queue.push({
         type: "transcript",
         entry: timestamped({

@@ -351,10 +351,14 @@ describe("read models", () => {
       new Map(),
       new Set(),
       "chat-1",
-      () => ({ messages: [], startIndex: 0, readAnchor: null })
+      () => ({ messages: [], startIndex: 0, readAnchor: null }),
+      undefined,
+      new Set(["queued-1"]),
     )
     expect(chat?.runtime.provider).toBe("claude")
     expect(chat?.queuedMessages.map((message) => message.content)).toEqual(["follow up"])
+    expect(chat?.queuedMessages[0]).toMatchObject({ id: "queued-1", steering: true })
+    expect(state.queuedMessagesByChatId.get("chat-1")?.[0]).not.toHaveProperty("steering")
     expect(chat?.availableProviders.length).toBeGreaterThan(1)
     expect(chat?.availableProviders.find((provider) => provider.id === "codex")?.models.map((model) => model.id)).toEqual([
       "gpt-5.6-sol",
