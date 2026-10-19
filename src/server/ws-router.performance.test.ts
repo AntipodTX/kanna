@@ -16,7 +16,11 @@ test("stream updates read only the new tail and release subscription maps", asyn
   const chat = await store.createChat(project.id)
   const router = createWsRouter({
     store,
-    agent: { getActiveStatuses: () => new Map(), getDrainingChatIds: () => new Set() },
+    agent: {
+      getActiveStatuses: () => new Map(),
+      getDrainingChatIds: () => new Set(),
+      getPendingCodexSteerIds: () => new Set(),
+    },
     diffStore: {}, worktreeProbe: {}, terminals: { onEvent: onChange },
     keybindings: { onChange }, appSettings: { onChange, getSnapshot: () => ({ transcript: { windowAssistantMessages: 5 } }) },
     llmProvider: {}, refreshDiscovery: async () => [], getDiscoveredProjects: () => [],
