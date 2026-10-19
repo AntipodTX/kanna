@@ -1,13 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { PROVIDERS, supportsClaudeMaxReasoningEffort } from "../../shared/types"
 import { createDefaultProviderDefaults, type ComposerState } from "../stores/chatPreferencesStore"
-import {
-  applyModelToComposerState,
-  deriveComposerOptionControls,
-  deriveComposerView,
-  getEffectiveComposerState,
-  isModelSelectable,
-} from "./composer"
+import { applyModelToComposerState, deriveComposerOptionControls, deriveComposerView, getEffectiveComposerState, isModelSelectable } from "./composer"
 
 const providerDefaults = createDefaultProviderDefaults()
 
