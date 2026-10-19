@@ -320,16 +320,19 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, [contextWindowSnapshot, providerPrefs.model, providerPrefs.modelOptions, providerPrefs.provider])
   // "/" skill menu derivations. The mention is non-null only while the caret
   // is inside a "/token" anywhere in the prompt ("$token" also opens it on
-  // codex, whose native sigil is "$" — accepting still completes to the
-  // canonical "/" form); menu items render in ascending match quality so the
+  // codex, whose native sigil is "$" and stays distinct from slash commands);
+  // menu items render in ascending match quality so the
   // best match sits at the bottom, next to the input.
   const skillMenuTriggers = selectedProvider === "codex" ? CODEX_SKILL_MENU_TRIGGERS : DEFAULT_SKILL_MENU_TRIGGERS
   const skillMention = onListSkills && !disabled ? getActiveSkillMention(value, caretPosition, skillMenuTriggers) : null
+  const skillMenuTrigger = skillMention ? value[skillMention.start] ?? "/" : "/"
   const slashQuery = skillMention?.query ?? null
   const slashActive = slashQuery !== null
   const skillMenuItems = useMemo(
-    () => (slashQuery !== null && availableSkills ? filterSkillMenuItems(availableSkills, slashQuery) : []),
-    [slashQuery, availableSkills]
+    () => (slashQuery !== null && availableSkills
+      ? filterSkillMenuItems(availableSkills, slashQuery, { provider: selectedProvider, trigger: skillMenuTrigger })
+      : []),
+    [slashQuery, availableSkills, selectedProvider, skillMenuTrigger]
   )
   const skillMenuOpen = slashActive && !skillMenuDismissed && skillMenuItems.length > 0
   const selectedSkillIndex = skillMenuItems.length > 0
@@ -1038,7 +1041,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     acceptSkill(skill)
                   }}
                 >
-                  <span className="shrink-0 font-mono text-[13px]">/{skill.name}</span>
+                  <span className="shrink-0 font-mono text-[13px]">{skillMenuTrigger}{skill.name}</span>
                   {skill.argumentHint ? (
                     <span className="shrink-0 font-mono text-[12px] text-muted-foreground">{skill.argumentHint}</span>
                   ) : null}

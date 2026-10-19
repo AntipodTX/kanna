@@ -24,6 +24,7 @@ export type SubmitWhileRunning = "queue" | "steer"
  */
 export type PaneVisibilityScope = "chat" | "project"
 export type EditorPreset = "cursor" | "vscode" | "zed" | "xcode" | "windsurf" | "custom"
+export type IdleSessionTimeoutPreference = "never" | "15m" | "30m" | "1h"
 export const DEFAULT_OPENAI_SDK_MODEL = "gpt-5.4-mini"
 export const DEFAULT_OPENROUTER_SDK_MODEL = "moonshotai/kimi-k2.5:nitro"
 
@@ -132,6 +133,9 @@ export interface ChatSkillsSnapshot {
   /** "live" = enumerated from the running harness; "filesystem" = Kanna's own disk scan (cold start / fallback). */
   origin: "live" | "filesystem"
 }
+
+/** Slash commands Kanna can execute through the Codex app-server protocol. */
+export const CODEX_SLASH_COMMANDS = ["/compact"] as const
 
 export interface ChatAttachment {
   id: string
@@ -1254,6 +1258,7 @@ export interface AppSettingsSnapshot {
   chatSoundPreference: ChatSoundPreference
   chatSoundId: ChatSoundId
   chatBrowserNotificationPreference: ChatBrowserNotificationPreference
+  idleSessionTimeout: IdleSessionTimeoutPreference
   terminal: {
     scrollbackLines: number
     minColumnWidth: number
@@ -1358,6 +1363,7 @@ export interface AppSettingsPatch {
   setupShown?: boolean
   setupCompleted?: boolean
   setupDismissed?: boolean
+  idleSessionTimeout?: IdleSessionTimeoutPreference
   terminal?: Partial<AppSettingsSnapshot["terminal"]>
   editor?: Partial<AppSettingsSnapshot["editor"]>
   transcript?: Partial<AppSettingsSnapshot["transcript"]>

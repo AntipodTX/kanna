@@ -4,22 +4,7 @@ import { afterAll, describe, expect, test } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import {
-  AgentCoordinator,
-  startClaudeSession,
-  buildAttachmentHintText,
-  buildConcurrentAgentsNotice,
-  buildClaudeSdkUserMessage,
-  buildPromptText,
-  buildSteeredMessageContent,
-  claudeToolset,
-  formatQuestionAnswersFollowUp,
-  maxClaudeContextWindowFromModelUsage,
-  normalizeClaudeContextUsage,
-  normalizeClaudeStreamMessage,
-  normalizeClaudeUsageSnapshot,
-  RESUME_AFTER_RESTART_MESSAGE,
-} from "./agent"
+import { AgentCoordinator, startClaudeSession, buildAttachmentHintText, buildConcurrentAgentsNotice, buildClaudeSdkUserMessage, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, classifyClaudeBackgroundWorkState, createClaudeStopHook, type ClaudeBackgroundWorkState } from "./agent"
 import type { HarnessTurn } from "./harness-types"
 import type { ContextRestoration } from "./events"
 import type { SubagentActivityUpdate } from "./background-tasks"
@@ -2266,11 +2251,449 @@ describe("AgentCoordinator codex integration", () => {
     expect(sessionCalls).toEqual([{ chatId: "chat-1", sessionToken: null, serviceTier: "fast" }])
     expect(turnCalls).toEqual([{ effort: "xhigh", serviceTier: "fast" }])
   })
+
+
+  test("lists and executes /compact without sending prompt text", async () => {
+    const slashCommandCalls: Array<{ chatId?: string; cwd: string; threadId: string; command: string }> = []
+    const startedTurns: string[] = []
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async listSkills() {
+          return []
+        },
+        async runSlashCommand(args: { chatId?: string; cwd: string; threadId: string; command: string }) {
+          slashCommandCalls.push(args)
+        },
+        async startTurn(args: { content: string }): Promise<HarnessTurn> {
+          startedTurns.push(args.content)
+          async function* stream() {}
+          return { provider: "codex", stream: stream(), interrupt: async () => {}, close: () => {} }
+        },
+      } as never,
+    })
+
+    const listed = await coordinator.listSkills({ type: "chat.listSkills", provider: "codex", chatId: "chat-1" })
+    expect(listed.skills).toContainEqual({
+      name: "compact",
+      description: "Compact the current Codex thread",
+      source: "command",
+    })
+
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact", model: "gpt-5.4" })
+
+    expect(slashCommandCalls).toEqual([{
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      threadId: "thread-1",
+      command: "/compact",
+    }])
+    expect(startedTurns).toEqual([])
+    expect(store.messages.at(-1)?.kind).toBe("compact_boundary")
+  })
+
+
+  test.each(["success", "failure"])("publishes a manual Codex compaction boundary only after successful completion (%s)", async (outcome) => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    let finish!: () => void
+    let fail!: (error: Error) => void
+    const completion = new Promise<void>((resolve, reject) => { finish = resolve; fail = reject })
+    let started = false
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      codexManager: { async runSlashCommand() { started = true; await completion } } as never,
+    })
+    const result = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+      .catch((error: Error) => error)
+    await waitFor(() => started)
+    expect(store.messages).toEqual([])
+    if (outcome === "success") finish()
+    else fail(new Error("compaction process lost"))
+    const response = await result
+    if (outcome === "success") {
+      expect(response).toEqual({ chatId: "chat-1" })
+      expect(store.messages.map((entry) => entry.kind)).toEqual(["compact_boundary"])
+    } else {
+      expect(response).toMatchObject({ message: "compaction process lost" })
+      expect(store.messages).toEqual([])
+    }
+  })
+
+
+  test("closes Codex sessions when a chat is closed", async () => {
+    const stoppedChatIds: string[] = []
+    const coordinator = new AgentCoordinator({
+      store: createFakeStore() as never,
+      onStateChange: () => {},
+      codexManager: {
+        stopSession(chatId: string) {
+          stoppedChatIds.push(chatId)
+        },
+      } as never,
+    })
+
+    await coordinator.closeChat("chat-1")
+
+    expect(stoppedChatIds).toEqual(["chat-1"])
+  })
+
+
+  test("closes inactive Codex sessions after the configured idle timeout", async () => {
+    const stoppedChatIds: string[] = []
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async startSession() {},
+        hasSession: () => true,
+        getSessionChatIds: () => [],
+        async startTurn(): Promise<HarnessTurn> {
+          async function* stream() {
+            yield {
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            }
+          }
+
+          return {
+            provider: "codex",
+            stream: stream(),
+            interrupt: async () => {},
+            close: () => {},
+          }
+        },
+        stopSession(chatId: string) {
+          stoppedChatIds.push(chatId)
+        },
+      } as never,
+    })
+    coordinator.setIdleSessionTimeoutMs(20)
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "codex",
+      content: "first message",
+      model: "gpt-5.4",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+    await waitFor(() => stoppedChatIds.includes("chat-1"))
+
+    expect(stoppedChatIds).toEqual(["chat-1"])
+  })
+
+
+  test("keeps an awaited Codex command alive until completion before starting a new idle timeout", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    let started = false
+    let release!: () => void
+    const commandReady = new Promise<void>((resolve) => { release = resolve })
+    const stopped: string[] = []
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        hasSession: () => true,
+        getSessionChatIds: () => ["chat-1"],
+        async runSlashCommand() { started = true; await commandReady },
+        stopSession(chatId: string) { stopped.push(chatId) },
+      } as never,
+    })
+    coordinator.setIdleSessionTimeoutMs(20)
+    const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+    try {
+      await waitFor(() => started)
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      expect(stopped).toEqual([])
+      // Updating the setting while the command is active must not arm a timer.
+      coordinator.setIdleSessionTimeoutMs(20)
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      expect(stopped).toEqual([])
+      release()
+      await command
+      expect(store.messages.at(-1)?.kind).toBe("compact_boundary")
+      await waitFor(() => stopped.length > 0)
+      expect(stopped).toEqual(["chat-1"])
+    } finally {
+      release()
+      await command
+      coordinator.setIdleSessionTimeoutMs(null)
+    }
+  })
+
+
+  for (const provider of ["codex", "claude"] as const) {
+    test(`preserves the chat when a ${provider} send arrives during an awaited Codex command`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "codex"
+      store.chat.sessionToken = "thread-1"
+      let started = false
+      let release!: () => void
+      const commandReady = new Promise<void>((resolve) => { release = resolve })
+      const nativeCalls: string[] = []
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => {},
+        startClaudeSession: () => { nativeCalls.push("startClaudeSession"); throw new Error("Unexpected native start") },
+        codexManager: {
+          hasSession: () => true,
+          async runSlashCommand() { started = true; await commandReady },
+          async startSession() { nativeCalls.push("startSession"); throw new Error("Unexpected native start") },
+          async startTurn() { nativeCalls.push("startTurn"); throw new Error("Unexpected native turn") },
+          stopSession() { nativeCalls.push("stopSession") },
+        } as never,
+      })
+      const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+      try {
+        await waitFor(() => started)
+        await expect(coordinator.send({ type: "chat.send", chatId: "chat-1", provider, content: "new request" }))
+          .rejects.toThrow("A Codex command is already running")
+        await expect((coordinator as any).startTurnForChat({
+          chatId: "chat-1", provider, content: "direct request", attachments: [], model: "test-model",
+          planMode: true, autoPlan: true, appendUserPrompt: true,
+        })).rejects.toThrow("A Codex command is already running")
+        expect(store.messages).toEqual([])
+        expect(store.chat.provider).toBe("codex")
+        expect(store.chat.sessionToken).toBe("thread-1")
+        expect(store.chat.planMode).toBe(false)
+        expect(store.chat.autoPlan).toBe(false)
+        expect(nativeCalls).toEqual([])
+      } finally {
+        release()
+        await command
+      }
+    })
+  }
+
+
+  test("keeps queued requests intact while an awaited Codex command owns the chat", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    const queued = await store.enqueueMessage("chat-1", { content: "queued request", provider: "codex" })
+    let started = false
+    let release!: () => void
+    const commandReady = new Promise<void>((resolve) => { release = resolve })
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        hasSession: () => true,
+        async runSlashCommand() { started = true; await commandReady },
+        async startSession() { throw new Error("Unexpected native start") },
+      } as never,
+    })
+    const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+    try {
+      await waitFor(() => started)
+      await expect((coordinator as any).maybeStartNextQueuedMessage("chat-1")).resolves.toBe(false)
+      await expect(coordinator.steer({ type: "message.steer", chatId: "chat-1", queuedMessageId: queued.id }))
+        .rejects.toThrow("A Codex command is already running")
+      expect(store.getQueuedMessages()).toEqual([queued])
+      expect(store.messages).toEqual([])
+    } finally {
+      release()
+      await command
+    }
+  })
+
+
+  test("does not fork a source chat while its native Codex compaction is pending", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    let started = false
+    let release!: () => void
+    const commandReady = new Promise<void>((resolve) => { release = resolve })
+    let forkCalls = 0
+    const forkChat = store.forkChat.bind(store)
+    store.forkChat = async () => { forkCalls += 1; return forkChat() }
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        hasSession: () => true,
+        async runSlashCommand() { started = true; await commandReady },
+      } as never,
+    })
+    const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+    try {
+      await waitFor(() => started)
+      await expect(coordinator.forkChat("chat-1")).rejects.toThrow("A Codex command is already running")
+      expect(forkCalls).toBe(0)
+    } finally {
+      release()
+      await command
+    }
+  })
+
+
+  for (const retirement of ["close", "dispose"] as const) {
+    test(`does not notify after ${retirement} while a completed Codex command boundary is being saved`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "codex"
+      store.chat.sessionToken = "thread-1"
+      let saving = false
+      let release!: () => void
+      const saved = new Promise<void>((resolve) => { release = resolve })
+      const appendMessage = store.appendMessage.bind(store)
+      store.appendMessage = async (chatId, entry) => {
+        await appendMessage(chatId, entry)
+        if (entry.kind === "compact_boundary") { saving = true; await saved }
+      }
+      const notifications: string[] = []
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => { notifications.push("state") },
+        codexManager: {
+          hasSession: () => true,
+          async runSlashCommand() {},
+          stopSession() {},
+          stopAll() {},
+        } as never,
+      })
+      const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+      try {
+        await waitFor(() => saving)
+        if (retirement === "close") await coordinator.closeChat("chat-1")
+        else coordinator.dispose()
+        const notificationCount = notifications.length
+        release()
+        await command
+        expect(notifications).toHaveLength(notificationCount)
+        expect(store.messages.filter((entry) => entry.kind === "compact_boundary")).toHaveLength(1)
+      } finally {
+        release()
+        await command
+      }
+    })
+  }
+
+
+  for (const outcome of ["failure", "explicit close", "dispose"] as const) {
+    test(`releases Codex command ownership after ${outcome}`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "codex"
+      store.chat.sessionToken = "thread-1"
+      let started = false
+      let sessionAlive = true
+      let release!: () => void
+      const commandReady = new Promise<void>((resolve) => { release = resolve })
+      const stopped: string[] = []
+      const notifications: string[] = []
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => { notifications.push("state") },
+        codexManager: {
+          hasSession: () => sessionAlive,
+          getSessionChatIds: () => ["chat-1"],
+          async runSlashCommand() {
+            started = true
+            await commandReady
+            if (outcome === "failure") throw new Error("compaction failed")
+          },
+          stopSession(chatId: string) { sessionAlive = false; stopped.push(chatId) },
+          stopAll() { sessionAlive = false; stopped.push("chat-1") },
+        } as never,
+      })
+      coordinator.setIdleSessionTimeoutMs(20)
+      const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+        .then(() => null, (error: unknown) => error)
+      try {
+        await waitFor(() => started)
+        await expect(coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" }))
+          .rejects.toThrow("A Codex command is already running")
+        if (outcome === "explicit close") await coordinator.closeChat("chat-1")
+        if (outcome === "dispose") coordinator.dispose()
+        const notificationCount = notifications.length
+        release()
+        const result = await command
+        if (outcome === "failure") {
+          expect(String(result)).toContain("compaction failed")
+          await waitFor(() => stopped.length > 0)
+        } else {
+          expect(result).toBeNull()
+          await new Promise((resolve) => setTimeout(resolve, 60))
+          expect(notifications).toHaveLength(notificationCount)
+        }
+        expect(stopped).toEqual(["chat-1"])
+        expect(store.messages.some((entry) => entry.kind === "compact_boundary")).toBe(false)
+      } finally {
+        release()
+        await command
+        coordinator.setIdleSessionTimeoutMs(null)
+      }
+    })
+  }
 })
 
 describe("AgentCoordinator claude integration", () => {
   
-  const readinessGate = () => {
+  function createIdleAwareClaudeHarness(timeoutMs = 40) {
+    const closeCalls: number[] = []
+    const backgroundStateCallbacks: Array<(state: ClaudeBackgroundWorkState) => void> = []
+    const eventStreams: Array<AsyncEventQueue<any>> = []
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        const stream = new AsyncEventQueue<any>()
+        const sessionIndex = eventStreams.push(stream) - 1
+        backgroundStateCallbacks.push(args.onBackgroundWorkStateChange)
+        return {
+          provider: "claude",
+          stream,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {
+            closeCalls.push(sessionIndex)
+            stream.close()
+          },
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async () => {
+            stream.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+    coordinator.setIdleSessionTimeoutMs(timeoutMs)
+
+    return {
+      coordinator,
+      store,
+      closeCalls,
+      backgroundStateCallbacks,
+      eventStreams,
+    }
+  }
+
+const readinessGate = () => {
     let release!: () => void
     const ready = new Promise<void>((resolve) => { release = resolve })
     return { ready, release }
@@ -4723,6 +5146,306 @@ describe("AgentCoordinator claude integration", () => {
       events.close()
     }
   })
+
+
+  test("closes Claude sessions when a chat is closed", async () => {
+    const closeCalls: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => ({
+        provider: "claude",
+        stream: events,
+        getAccountInfo: async () => null,
+        interrupt: async () => {},
+        close: () => {
+          closeCalls.push("close")
+          events.close()
+        },
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        sendPrompt: async () => {},
+      }),
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await coordinator.closeChat("chat-1")
+
+    expect(closeCalls.length).toBeGreaterThan(0)
+  })
+
+
+  test("keeps unknown and active Claude background sessions out of idle cleanup", async () => {
+    const harness = createIdleAwareClaudeHarness(20)
+
+    await harness.coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await waitFor(() => harness.store.turnFinishedCount === 1)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(harness.closeCalls).toEqual([])
+    expect(harness.backgroundStateCallbacks).toHaveLength(1)
+
+    harness.coordinator.setIdleSessionTimeoutMs(25)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(harness.closeCalls).toEqual([])
+
+    harness.backgroundStateCallbacks[0]?.("active")
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(harness.closeCalls).toEqual([])
+
+    await harness.coordinator.closeChat("chat-1")
+    expect(harness.closeCalls).toEqual([0])
+  })
+
+
+  test("starts the Claude idle timeout when background work becomes inactive", async () => {
+    const harness = createIdleAwareClaudeHarness(50)
+
+    await harness.coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await waitFor(() => harness.store.turnFinishedCount === 1)
+    harness.backgroundStateCallbacks[0]?.("active")
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(harness.closeCalls).toEqual([])
+
+    harness.backgroundStateCallbacks[0]?.("inactive")
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    expect(harness.closeCalls).toEqual([])
+    await waitFor(() => harness.closeCalls.length > 0, 500)
+    expect(harness.closeCalls).toEqual([0])
+  })
+
+
+  test("cancels a pending Claude idle close when background work becomes active", async () => {
+    const harness = createIdleAwareClaudeHarness(50)
+
+    await harness.coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await waitFor(() => harness.store.turnFinishedCount === 1)
+    harness.backgroundStateCallbacks[0]?.("inactive")
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    harness.backgroundStateCallbacks[0]?.("active")
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(harness.closeCalls).toEqual([])
+
+    await harness.coordinator.closeChat("chat-1")
+    expect(harness.closeCalls).toEqual([0])
+  })
+
+
+  test("ignores background work callbacks from a replaced Claude session", async () => {
+    const harness = createIdleAwareClaudeHarness(30)
+
+    await harness.coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-8",
+      modelOptions: {
+        claude: { reasoningEffort: "low", contextWindow: "200k" },
+      },
+    })
+    await waitFor(() => harness.store.turnFinishedCount === 1)
+    harness.backgroundStateCallbacks[0]?.("active")
+
+    await harness.coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "second message",
+      model: "claude-opus-4-8",
+      modelOptions: {
+        claude: { reasoningEffort: "high", contextWindow: "200k" },
+      },
+    })
+    await waitFor(() => harness.backgroundStateCallbacks.length === 2)
+    harness.backgroundStateCallbacks[1]?.("active")
+    await waitFor(() => harness.store.turnFinishedCount === 2)
+
+    const closeCountAfterReplacement = harness.closeCalls.length
+    harness.backgroundStateCallbacks[0]?.("inactive")
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(harness.closeCalls).toHaveLength(closeCountAfterReplacement)
+
+    harness.backgroundStateCallbacks[1]?.("inactive")
+    await waitFor(() => harness.closeCalls.includes(1), 500)
+    expect(harness.closeCalls).toContain(1)
+  })
+
+
+  test("closes an idle Claude session while queue preparation is still pending", async () => {
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    let closes = 0
+    let release!: () => void
+    const preparation = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const preparing = new Promise<void>(resolve => { entered = resolve })
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      startClaudeSession: async args => ({ provider: "claude", stream: events,
+        interrupt: async () => {}, close: () => { closes++; events.close() },
+        setModel: async () => {}, setPermissionMode: async () => {},
+        sendPrompt: async () => { args.onBackgroundWorkStateChange("inactive") },
+      }),
+    })
+    // Hold the asynchronous preparation boundary after completion releases the turn.
+    ;(coordinator as any).maybeStartNextQueuedMessage = async () => { entered(); await preparation; return false }
+    coordinator.setIdleSessionTimeoutMs(20)
+    try {
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "request" })
+      events.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success",
+        isError: false, durationMs: 0, result: "done" }) })
+      await preparing
+      expect(store.turnFinishedCount).toBe(1)
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(closes).toBe(1)
+    } finally {
+      release()
+      events.close()
+      coordinator.dispose()
+    }
+  })
+
+
+  test("closes inactive Claude sessions after the configured idle timeout", async () => {
+    const closeCalls: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => ({
+        provider: "claude",
+        stream: events,
+        getAccountInfo: async () => null,
+        interrupt: async () => {},
+        close: () => {
+          closeCalls.push("close")
+          events.close()
+        },
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        sendPrompt: async () => {
+          args.onBackgroundWorkStateChange("inactive")
+          events.push({
+            type: "transcript" as const,
+            entry: timestamped({
+              kind: "result",
+              subtype: "success",
+              isError: false,
+              durationMs: 0,
+              result: "done",
+            }),
+          })
+        },
+      }),
+    })
+    coordinator.setIdleSessionTimeoutMs(20)
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+    await waitFor(() => closeCalls.length > 0)
+
+    expect(closeCalls.length).toBeGreaterThan(0)
+  })
+
+
+  test("resets the Claude idle timeout when a persistent session emits after the result", async () => {
+    const closeCalls: string[] = []
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => ({
+        provider: "claude",
+        stream: events,
+        getAccountInfo: async () => null,
+        interrupt: async () => {},
+        close: () => {
+          closeCalls.push("close")
+          events.close()
+        },
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        sendPrompt: async () => {
+          args.onBackgroundWorkStateChange("inactive")
+          events.push({
+            type: "transcript" as const,
+            entry: timestamped({
+              kind: "result",
+              subtype: "success",
+              isError: false,
+              durationMs: 0,
+              result: "done",
+            }),
+          })
+        },
+      }),
+    })
+    coordinator.setIdleSessionTimeoutMs(50)
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first message",
+      model: "claude-opus-4-7",
+    })
+
+    await waitFor(() => store.turnFinishedCount === 1)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    events.push({
+      type: "transcript" as const,
+      entry: timestamped({
+        kind: "account_info",
+        accountInfo: {
+          accountId: "acct-1",
+          email: "dev@example.com",
+        },
+      }),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 35))
+
+    expect(closeCalls).toEqual([])
+
+    await waitFor(() => closeCalls.length > 0)
+  })
 })
 
 describe("buildConcurrentAgentsNotice", () => {
@@ -4871,6 +5594,50 @@ describe("skill mentions", () => {
 
     queues.forEach((queue) => queue.close())
     rmSync(projectDir, { recursive: true, force: true })
+  })
+
+
+  test("codex sends every $skill as a structured item and keeps slash commands separate", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    const turns: Array<{ content: string; skills?: Array<{ name: string; path: string }> }> = []
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async startSession() {
+          return { sessionToken: "thread-1", resumeFellBack: false }
+        },
+        async listSkills() {
+          return [
+            { name: "review", description: "Review", path: "/skills/review/SKILL.md", scope: "user", enabled: true },
+            { name: "template-bridge:verify", description: "Verify", path: "/plugins/template-bridge/verify/SKILL.md", scope: "user", enabled: true },
+          ]
+        },
+        async startTurn(args: { content: string; skills?: Array<{ name: string; path: string }> }): Promise<HarnessTurn> {
+          turns.push({ content: args.content, skills: args.skills })
+          async function* stream() {
+            yield {
+              type: "transcript" as const,
+              entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "done" }),
+            }
+          }
+          return { provider: "codex", stream: stream(), interrupt: async () => {}, close: () => {} }
+        },
+      } as never,
+    })
+
+    const content = "Use $review and $template-bridge:verify, then mention $review again; do not run /compact"
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content, model: "gpt-5.4" })
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(turns).toHaveLength(1)
+    expect(turns[0]?.content.startsWith(content)).toBe(true)
+    expect(turns[0]?.skills).toEqual([
+      { name: "review", path: "/skills/review/SKILL.md" },
+      { name: "template-bridge:verify", path: "/plugins/template-bridge/verify/SKILL.md" },
+    ])
   })
 })
 
@@ -6969,3 +7736,89 @@ describe("main integration review of early preparation ownership", () => {
     } finally { events.close(); coordinator.dispose() }
   })
 })
+
+
+describe("Claude background work snapshots", () => {
+  test("classifies complete Stop snapshots as active or inactive", () => {
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: [],
+      session_crons: [],
+    })).toBe("inactive")
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: [{} as never],
+      session_crons: [],
+    })).toBe("active")
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: [],
+      session_crons: [{} as never],
+    })).toBe("active")
+  })
+
+  test("classifies incomplete or malformed Stop snapshots as unknown", () => {
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: [],
+    })).toBe("unknown")
+    expect(classifyClaudeBackgroundWorkState({
+      session_crons: [],
+    })).toBe("unknown")
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: null as never,
+      session_crons: [],
+    })).toBe("unknown")
+    expect(classifyClaudeBackgroundWorkState({
+      background_tasks: [],
+      session_crons: {} as never,
+    })).toBe("unknown")
+  })
+
+  test("reports Stop state without propagating observer failures", async () => {
+    const states: ClaudeBackgroundWorkState[] = []
+    const hook = createClaudeStopHook((state) => states.push(state))
+    const stopInput = {
+      hook_event_name: "Stop",
+      background_tasks: [],
+      session_crons: [],
+    } as never
+    const hookOptions = { signal: new AbortController().signal }
+
+    await expect(hook(stopInput, undefined, hookOptions)).resolves.toEqual({})
+    expect(states).toEqual(["inactive"])
+
+    const failingHook = createClaudeStopHook(() => {
+      throw new Error("observer failed")
+    })
+    await expect(failingHook(stopInput, undefined, hookOptions)).resolves.toEqual({})
+
+    let firstObservation = true
+    const recoveredStates: ClaudeBackgroundWorkState[] = []
+    const recoveringHook = createClaudeStopHook((state) => {
+      if (firstObservation) {
+        firstObservation = false
+        throw new Error("first observation failed")
+      }
+      recoveredStates.push(state)
+    })
+    await expect(recoveringHook(stopInput, undefined, hookOptions)).resolves.toEqual({})
+    expect(recoveredStates).toEqual(["unknown"])
+  })
+})
+
+
+  for (const busyState of ["Claude startup", "pending Codex steer"] as const)
+test(`does not start a Codex command during ${busyState}`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "codex"
+      store.chat.sessionToken = "thread-1"
+      let commandCalls = 0
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => {},
+        codexManager: { async runSlashCommand() { commandCalls += 1 } } as never,
+      })
+      if (busyState === "Claude startup") (coordinator as any).startingClaudeTurns.set("chat-1", Symbol("startup"))
+      else (coordinator as any).pendingCodexSteers.set("chat-1", new Set(["queued-1"]))
+      await expect(coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" }))
+        .rejects.toThrow("/compact cannot run while a turn is active")
+      expect(commandCalls).toBe(0)
+      expect(store.messages).toEqual([])
+    })

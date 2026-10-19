@@ -12,6 +12,7 @@ import type {
   TranscriptEntry,
 } from "../shared/types"
 import type { HarnessEvent, HarnessStartupOutcome, HarnessToolRequest, HarnessTurn } from "./harness-types"
+import { CODEX_SLASH_COMMANDS } from "../shared/types"
 import { appendSystemMessageBlock, buildSkillSystemMessage } from "./harness-skills"
 import { buildKannaAgentId } from "./attribution"
 import { buildKannaSystemInstructions } from "./harness-instructions"
@@ -65,6 +66,8 @@ import {
   type ThreadResumeResponse,
   type ThreadForkParams,
   type ThreadForkResponse,
+  type ThreadCompactStartParams,
+  type ThreadCompactStartResponse,
   type ThreadStartParams,
   type ThreadStartResponse,
   type ThreadTokenUsageUpdatedNotification,
@@ -139,6 +142,14 @@ interface PendingTurn {
   ) => Promise<CommandExecutionApprovalDecision | FileChangeApprovalDecision>
 }
 
+interface PendingCompaction {
+  threadId: string
+  turnId: string | null
+  compacted: boolean
+  resolve: () => void
+  reject: (error: Error) => void
+}
+
 interface SessionContext {
   customTools?: ReturnType<typeof createKannaMcpServer>
   chatId: string
@@ -146,6 +157,7 @@ interface SessionContext {
   child: CodexAppServerProcess
   pendingRequests: Map<CodexRequestId, PendingRequest<unknown>>
   pendingTurn: PendingTurn | null
+  pendingCompaction?: PendingCompaction | null
   sessionToken: string | null
   stderrLines: string[]
   closed: boolean
@@ -208,7 +220,7 @@ function codexSystemInitEntry(model: string): TranscriptEntry {
     model,
     tools: ["Bash", "Write", "Edit", "WebSearch", "TodoWrite", "AskUserQuestion", "ExitPlanMode"],
     agents: ["spawnAgent", "sendInput", "resumeAgent", "wait", "closeAgent"],
-    slashCommands: [],
+    slashCommands: [...CODEX_SLASH_COMMANDS],
     mcpServers: [],
   })
 }
@@ -797,9 +809,11 @@ export class CodexAppServerManager {
     Promise<{ sessionToken: string; resumeFellBack: boolean; startupOutcome: HarnessStartupOutcome }>
   >()
   private readonly spawnProcess: SpawnCodexAppServer
+  private readonly compactionTimeoutMs: number
   private onRateLimits: ((snapshot: CodexRateLimitSnapshot) => void) | null = null
 
-  constructor(args: { spawnProcess?: SpawnCodexAppServer } = {}) {
+  constructor(args: { spawnProcess?: SpawnCodexAppServer; compactionTimeoutMs?: number } = {}) {
+    this.compactionTimeoutMs = args.compactionTimeoutMs ?? 300_000
     this.spawnProcess = args.spawnProcess ?? ((cwd) =>
       spawn("codex", ["app-server"], {
         cwd,
@@ -878,6 +892,7 @@ export class CodexAppServerManager {
       child,
       pendingRequests: new Map(),
       pendingTurn: null,
+      pendingCompaction: null,
       sessionToken: null,
       stderrLines: [],
       closed: false,
@@ -1244,6 +1259,7 @@ export class CodexAppServerManager {
       child,
       pendingRequests: new Map(),
       pendingTurn: null,
+      pendingCompaction: null,
       sessionToken: null,
       stderrLines: [],
       closed: false,
@@ -1373,7 +1389,7 @@ export class CodexAppServerManager {
       }
     }
     assertCurrent()
-    if (context.pendingTurn) {
+    if (context.pendingTurn || context.pendingCompaction) {
       throw new Error("Codex turn is already running")
     }
 
@@ -1499,6 +1515,62 @@ export class CodexAppServerManager {
     }
   }
 
+  async runSlashCommand(args: { chatId?: string; cwd: string; threadId: string; command: string }): Promise<void> {
+    const activeContext = args.chatId ? this.sessions.get(args.chatId) : undefined
+    if (activeContext && !activeContext.closed && activeContext.cwd === args.cwd && activeContext.sessionToken === args.threadId) {
+      if (activeContext.pendingTurn) throw new Error("Cannot run a Codex slash command while a turn is active")
+      await this.sendCodexSlashCommand(activeContext, args.command, args.threadId)
+      return
+    }
+
+    const completed = await this.withProbe(args.cwd, async (context) => {
+      await this.sendRequest<ThreadResumeResponse>(context, "thread/resume", {
+        threadId: args.threadId,
+        cwd: args.cwd,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+        persistExtendedHistory: false,
+      } satisfies ThreadResumeParams)
+      await this.sendCodexSlashCommand(context, args.command, args.threadId)
+      return true
+    })
+    if (!completed) throw new Error("Codex app-server unavailable")
+  }
+
+  private async sendCodexSlashCommand(context: SessionContext, command: string, threadId: string): Promise<void> {
+    if (command !== "/compact") {
+      throw new Error(`${command} is not supported by the Codex app-server protocol`)
+    }
+    if (context.pendingCompaction) throw new Error("Codex compaction is already running")
+    let operation!: PendingCompaction
+    const completion = new Promise<void>((resolve, reject) => {
+      operation = { threadId, turnId: null, compacted: false, resolve, reject }
+    })
+    // Register before sending: lifecycle notifications may precede the ACK.
+    context.pendingCompaction = operation
+    const requestId = randomUUID()
+    const timeout = setTimeout(() => {
+      this.failContext(context, "Codex compaction timed out before completion")
+      try { context.child.kill("SIGKILL") } catch { /* ignore kill failures */ }
+    }, this.compactionTimeoutMs)
+    try {
+      await Promise.all([
+        this.sendRequest<ThreadCompactStartResponse>(context, "thread/compact/start", {
+          threadId,
+        } satisfies ThreadCompactStartParams, requestId),
+        completion,
+      ])
+    } finally {
+      clearTimeout(timeout)
+      const request = context.pendingRequests.get(requestId)
+      if (request) {
+        context.pendingRequests.delete(requestId)
+        request.reject(new Error("Codex compaction ended before the start acknowledgement"))
+      }
+      if (context.pendingCompaction === operation) context.pendingCompaction = null
+    }
+  }
+
   async generateStructured(args: GenerateStructuredArgs): Promise<string | null> {
     const chatId = `quick-${randomUUID()}`
     let turn: HarnessTurn | null = null
@@ -1600,6 +1672,17 @@ export class CodexAppServerManager {
         // ignore kill failures
       }
     }
+  }
+
+  hasSession(chatId: string) {
+    const context = this.sessions.get(chatId)
+    return Boolean(context && !context.closed)
+  }
+
+  getSessionChatIds() {
+    return [...this.sessions.entries()]
+      .filter(([, context]) => !context.closed)
+      .map(([chatId]) => chatId)
   }
 
   private requireSession(chatId: string) {
@@ -1831,6 +1914,10 @@ export class CodexAppServerManager {
       return
     }
 
+    if (context.pendingCompaction) {
+      this.handleCompactionNotification(context, notification)
+    }
+
     const pendingTurn = context.pendingTurn
     if (!pendingTurn) return
 
@@ -1859,6 +1946,55 @@ export class CodexAppServerManager {
       case "error":
         this.handleErrorNotification(context, notification.params)
         return
+      default:
+        return
+    }
+  }
+
+  private handleCompactionNotification(context: SessionContext, notification: ServerNotification) {
+    const operation = context.pendingCompaction
+    if (!operation) return
+    switch (notification.method) {
+      case "turn/started":
+        if (notification.params.threadId === operation.threadId && !operation.turnId) {
+          operation.turnId = notification.params.turn.id
+        }
+        return
+      case "item/started":
+      case "item/completed": {
+        const { threadId, turnId, item } = notification.params
+        if (threadId !== operation.threadId || item.type !== "contextCompaction") return
+        if (operation.turnId && operation.turnId !== turnId) return
+        operation.turnId = turnId
+        if (notification.method === "item/completed") operation.compacted = true
+        return
+      }
+      case "thread/compacted": {
+        const { threadId, turnId } = notification.params
+        if (threadId !== operation.threadId || (operation.turnId && operation.turnId !== turnId)) return
+        operation.turnId = turnId
+        operation.compacted = true
+        return
+      }
+      case "turn/completed": {
+        const { threadId, turn } = notification.params
+        if (threadId !== operation.threadId || turn.id !== operation.turnId) return
+        if (turn.status !== "completed") {
+          operation.reject(new Error(formatCodexError(turn.error) || `Codex compaction ${turn.status}`))
+        } else if (!operation.compacted) {
+          operation.reject(new Error("Codex turn completed without a compaction result"))
+        } else {
+          operation.resolve()
+        }
+        return
+      }
+      case "error": {
+        const { threadId, turnId, willRetry, error } = notification.params
+        if (threadId && threadId !== operation.threadId) return
+        if (turnId && operation.turnId && turnId !== operation.turnId) return
+        if (!willRetry) this.failContext(context, formatCodexError(error) || "Codex compaction failed")
+        return
+      }
       default:
         return
     }
@@ -2089,6 +2225,8 @@ export class CodexAppServerManager {
 
   private failContext(context: SessionContext, message: string) {
     context.customTools?.close()
+    context.pendingCompaction?.reject(new Error(message))
+    context.pendingCompaction = null
     const pendingTurn = context.pendingTurn
     if (pendingTurn && !pendingTurn.resolved) {
       pendingTurn.queue.push({
@@ -2132,8 +2270,7 @@ export class CodexAppServerManager {
     }
   }
 
-  private async sendRequest<TResult>(context: SessionContext, method: string, params: unknown): Promise<TResult> {
-    const id = randomUUID()
+  private async sendRequest<TResult>(context: SessionContext, method: string, params: unknown, id: CodexRequestId = randomUUID()): Promise<TResult> {
     const promise = new Promise<TResult>((resolve, reject) => {
       context.pendingRequests.set(id, {
         method,

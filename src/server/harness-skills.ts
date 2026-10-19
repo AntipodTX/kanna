@@ -19,7 +19,8 @@ import type { AgentProvider, GlobalSkillSummary, HarnessSkill, HarnessSkillSourc
  * the user's typed text verbatim):
  *   - claude/grok/pi: a message that *starts* with "/name" expands natively, so
  *     that one passes through; every other "/name" gets the failsafe block.
- *   - codex: structured `{type:"skill", name, path}` input item per skill + failsafe block.
+ *   - codex: every `$name` becomes a structured `{type:"skill", name, path}`
+ *     input item plus a failsafe block; `/name` remains a distinct command.
  *   - cursor: failsafe block only (no headless expansion exists).
  */
 
@@ -30,16 +31,19 @@ export interface SkillMention {
 }
 
 /**
- * Every `/name` token in the prompt that could be a skill: the "/" opens the
+ * Every trigger-prefixed token in the prompt that could be a skill: the trigger opens the
  * message or follows whitespace, so paths like `src/foo` never count. These
  * are candidates only; `resolveSkillMentions` keeps the ones the harness
  * actually lists, which is what stops `/etc/hosts` from reading as a skill.
  */
-export function findSkillMentions(content: string): SkillMention[] {
+export function findSkillMentions(content: string, trigger: "/" | "$" = "/"): SkillMention[] {
   const trimmed = content.trimStart()
   const mentions: SkillMention[] = []
   // The lookahead keeps `/etc/hosts` whole instead of yielding "etc".
-  for (const match of trimmed.matchAll(/(^|\s)\/([\w:.-]+)(?![\w:./-])/g)) {
+  const pattern = trigger === "/"
+    ? /(^|\s)\/([\w:.-]+)(?![\w:./-])/g
+    : /(^|\s)\$([\w:.-]+)(?![\w:./-])/g
+  for (const match of trimmed.matchAll(pattern)) {
     // "run /review." ends a sentence; the period is not part of the name.
     const name = match[2]!.replace(/[.:-]+$/, "")
     if (!name) continue

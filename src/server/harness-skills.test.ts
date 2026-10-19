@@ -50,6 +50,13 @@ describe("findSkillMentions", () => {
     expect(findSkillMentions("/")).toEqual([])
     expect(findSkillMentions("")).toEqual([])
   })
+
+  test("finds multiple Codex $skill mentions without treating slash commands as skills", () => {
+    expect(findSkillMentions("use $review then $template-bridge:verify and /compact", "$")).toEqual([
+      { name: "review", leading: false },
+      { name: "template-bridge:verify", leading: false },
+    ])
+  })
 })
 
 describe("resolveSkillMentions", () => {

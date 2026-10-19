@@ -75,6 +75,23 @@ describe("filterSkillMenuItems", () => {
   test("empty query keeps every skill", () => {
     expect(filterSkillMenuItems([skill("a"), skill("b")], "")).toHaveLength(2)
   })
+
+  test("Codex keeps slash commands and dollar-prefixed skills in separate menus", () => {
+    const items: HarnessSkill[] = [
+      { name: "compact", description: "Compact the thread", source: "command" },
+      { name: "deploy-helper", description: "Deploys things", source: "skill" },
+      { name: "template-bridge:review", description: "Reviews changes", source: "plugin" },
+    ]
+
+    expect(filterSkillMenuItems(items, "", { provider: "codex", trigger: "/" }).map((item) => item.name)).toEqual([
+      "compact",
+    ])
+    expect(filterSkillMenuItems(items, "", { provider: "codex", trigger: "$" }).map((item) => item.name).sort()).toEqual([
+      "deploy-helper",
+      "template-bridge:review",
+    ])
+    expect(filterSkillMenuItems(items, "", { provider: "claude", trigger: "/" })).toHaveLength(3)
+  })
 })
 
 function complete(value: string, caret: number, name: string, triggers = CODEX_SKILL_MENU_TRIGGERS) {
@@ -94,9 +111,9 @@ describe("applySkillCompletion", () => {
     expect(complete("/", 1, "skill:brave-search").value).toBe("/skill:brave-search ")
   })
 
-  test("normalizes a $ trigger to the canonical / form", () => {
-    expect(complete("$dep", 4, "deploy-helper").value).toBe("/deploy-helper ")
-    expect(complete("$dep to prod", 4, "deploy-helper").value).toBe("/deploy-helper to prod")
+  test("preserves Codex's $ trigger for skills", () => {
+    expect(complete("$dep", 4, "deploy-helper").value).toBe("$deploy-helper ")
+    expect(complete("$dep to prod", 4, "deploy-helper").value).toBe("$deploy-helper to prod")
   })
 
   test("completes the token under the caret, leaving other skills alone", () => {
