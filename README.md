@@ -7,6 +7,7 @@
 
 ### Fixes
 
+- Route Codex subagent completion notifications to the correct turn.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
