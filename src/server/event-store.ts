@@ -1195,6 +1195,10 @@ export class EventStore {
     return Math.max(currentStart, start)
   }
 
+  hasUserPrompt(chatId: string, messageId: string) {
+    return this.getTranscriptEntries(chatId).some(entry => entry._id === messageId && entry.kind === "user_prompt")
+  }
+
   getTranscriptLength(chatId: string) {
     return this.getTranscriptEntries(chatId).length
   }
@@ -2419,11 +2423,6 @@ export class EventStore {
       v: STORE_VERSION, type: "context_restoration_acknowledged", timestamp: Date.now(), chatId, restorationId,
     }
     await this.append(this.turnsLogPath, event)
-  }
-
-  /** Exact queue/steer identity without loading any transcript payloads. */
-  hasUserPrompt(chatId: string, messageId: string) {
-    return this.getTranscriptEntries(chatId).some(entry => entry._id === messageId && entry.kind === "user_prompt")
   }
 
   /** Header-only probe. Explicit clear starts a new recoverable context epoch. */
