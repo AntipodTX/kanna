@@ -2773,13 +2773,22 @@ export class AgentCoordinator {
           },
         } : undefined,
         onRateLimitEvent: (info) => this.onClaudeRateLimit?.(info),
-        onSubagentActivity: (update) => this.applySubagentActivity(args.chatId, update),
+        onSubagentActivity: (update) => {
+          if (args.isCurrentTurn() || this.claudeSessions.get(args.chatId)?.id === sessionInstanceId) {
+            this.applySubagentActivity(args.chatId, update)
+          }
+        },
         onBackgroundWorkStateChange: (state) => {
           reportedBackgroundWorkState = state
           this.updateClaudeBackgroundWorkState(args.chatId, sessionInstanceId, state)
         },
       })
-      if (args.isCurrentTurn && !args.isCurrentTurn()) { started.close(); return null }
+      // A cancelled startup owns this handle, not the chat's next session.
+      // Close it before registering its stream or persisting any session token.
+      if (!args.isCurrentTurn()) {
+        await this.interruptAndCloseTurn(started)
+        return null
+      }
       try {
         if (started.waitForStartupOutcome) startupOutcome = await started.waitForStartupOutcome()
         else {
@@ -2791,8 +2800,17 @@ export class AgentCoordinator {
         if (!args.isCurrentTurn()) return null
         throw error
       }
-      if (args.isCurrentTurn && !args.isCurrentTurn()) { started.close(); return null }
+      // A cancelled startup owns this handle, not the chat's next session.
+      // Close it before registering its stream or persisting any session token.
+      if (!args.isCurrentTurn()) {
+        await this.interruptAndCloseTurn(started)
+        return null
+      }
       this.refreshClaudeModelCatalog(started)
+      if (!args.isCurrentTurn()) {
+        await this.interruptAndCloseTurn(started)
+        return null
+      }
 
       let releasePublication!: () => void
       const publicationReady = new Promise<void>((resolve) => { releasePublication = resolve })
