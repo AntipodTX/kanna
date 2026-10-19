@@ -16,6 +16,7 @@
 ### Fixes
 
 - Correct Claude chat lifecycle state after agent activity.
+- Preserve Claude plan transcript adjustments during rendering.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
