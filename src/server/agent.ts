@@ -309,6 +309,8 @@ interface ClaudeSessionState {
   serviceTier?: "fast"
   planMode: boolean
   autoPlan: boolean
+  /** Finish an earlier setter before a replacement turn configures this session. */
+  configurationTail: Promise<void>
   sessionToken: string | null
   accountInfoLoaded: boolean
   forceClosed: boolean
@@ -2826,6 +2828,7 @@ export class AgentCoordinator {
         serviceTier: args.serviceTier,
         planMode: args.planMode,
         autoPlan: args.autoPlan,
+        configurationTail: Promise.resolve(),
         publicationReady,
         releasePublication,
         sessionToken: args.sessionToken,
@@ -2841,17 +2844,36 @@ export class AgentCoordinator {
       createdSession = true
       void this.runClaudeSession(session)
     } else {
-      if (session.model !== args.model) {
-        await session.session.setModel(args.model)
-        session.model = args.model
-      }
-      if (session.planMode !== args.planMode) {
-        await session.session.setPermissionMode(args.planMode)
-        session.planMode = args.planMode
-      }
-      if (session.serviceTier !== args.serviceTier) {
-        await session.session.setFastMode?.(args.serviceTier === "fast")
-        session.serviceTier = args.serviceTier
+      const previousConfiguration = session.configurationTail
+      let releaseConfiguration!: () => void
+      session.configurationTail = new Promise<void>((resolve) => { releaseConfiguration = resolve })
+      const isCurrentConfiguration = () => args.isCurrentTurn() && this.claudeSessions.get(args.chatId) === session
+      await previousConfiguration
+      try {
+        if (!isCurrentConfiguration()) return null
+        if (session.model !== args.model) {
+          await session.session.setModel(args.model)
+          // The SDK has already changed even when this turn was cancelled
+          // during the await. Record its actual value so its replacement can
+          // restore the requested settings after this operation settles.
+          session.model = args.model
+          if (!isCurrentConfiguration()) return null
+        }
+        if (session.planMode !== args.planMode) {
+          await session.session.setPermissionMode(args.planMode)
+          session.planMode = args.planMode
+          if (!isCurrentConfiguration()) return null
+        }
+        if (session.serviceTier !== args.serviceTier) {
+          await session.session.setFastMode?.(args.serviceTier === "fast")
+          session.serviceTier = args.serviceTier
+          if (!isCurrentConfiguration()) return null
+        }
+      } catch (error) {
+        if (!isCurrentConfiguration()) return null
+        throw error
+      } finally {
+        releaseConfiguration()
       }
     }
 
