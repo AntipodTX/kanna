@@ -4894,7 +4894,7 @@ describe("CodexAppServerManager", () => {
         child.writeServerMessage({ id: message.id, result: { turn: { id: "turn-1", status: "inProgress" } } })
         child.writeServerMessage({ method: "turn/plan/updated", params: {
           threadId: "thread-1", turnId: "turn-1", explanation: null,
-          plan: [{ step: "Finish work", status: "inProgress" }],
+          plan: [{ step: "Finish work", status: "in_progress" }],
         } })
         child.writeServerMessage({ method: "item/completed", params: {
           threadId: "thread-1", turnId: "turn-1",
