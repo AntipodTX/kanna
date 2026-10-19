@@ -3413,7 +3413,6 @@ export class AgentCoordinator {
     if (!queuedMessage) {
       throw new Error("Queued message not found")
     }
-
     // Before native startup registers an active turn there is no turn to
     // interrupt. Keep the queued message for the owning turn's normal drain.
     if (this.startingClaudeTurns.has(command.chatId) && !this.activeTurns.has(command.chatId)) return
@@ -3432,13 +3431,16 @@ export class AgentCoordinator {
       const provider = this.resolveProvider(queuedMessage, chat.provider)
       if (provider === "codex") {
         const endSteer = this.beginCodexSteer(command.chatId, queuedMessage.id)
+        let historyFailed = false
         let settlementStarted = false
         let lifecycleFinished = false
         const finishSteerLifecycle = async () => {
           if (lifecycleFinished) return
           lifecycleFinished = true
           const cancellationInProgress = this.cancelingChats.has(command.chatId) || active.cancelRequested
-          endSteer(cancellationInProgress ? "Codex turn was cancelled" : undefined)
+          endSteer(historyFailed ? "Codex history needs recovery before the next message can run"
+            : cancellationInProgress ? "Codex turn was cancelled" : undefined)
+          if (historyFailed) return
           if (cancellationInProgress) {
             if (!this.hasPendingCodexSteer(command.chatId)) {
               this.cancelingChats.delete(command.chatId)
@@ -3449,6 +3451,13 @@ export class AgentCoordinator {
         }
 
         try {
+          try {
+            await this.assertCodexHistoryReady(command.chatId, active)
+          } catch (error) {
+            historyFailed = true
+            await this.failCodexHistoryTurn(command.chatId, active, error)
+            throw error
+          }
           const isQuestionReply = parseCodexQuestionReplies(queuedMessage.content).length > 0
           const content = isQuestionReply ? queuedMessage.content : buildSteeredMessageContent(queuedMessage.content)
           const selectedSkills = isQuestionReply ? [] : await this.resolvePromptSkills("codex", command.chatId, queuedMessage.content)
@@ -3469,6 +3478,15 @@ export class AgentCoordinator {
             // exits after transcript persistence but before queue removal.
             _id: queuedMessage.id,
           } as Extract<TranscriptEntry, { kind: "user_prompt" }>
+          try {
+            await this.store.appendMessage(command.chatId, transcriptEntry)
+            this.emitStateChange(command.chatId)
+          } catch (error) {
+            historyFailed = true
+            await this.failCodexHistoryTurn(command.chatId, active, error)
+            throw error
+          }
+          if (this.activeTurns.get(command.chatId) !== active || active.cancelRequested) return
           let steer: ReturnType<CodexAppServerManager["startSteerTurn"]>
           try {
             steer = this.codexManager.startSteerTurn({
@@ -3482,33 +3500,40 @@ export class AgentCoordinator {
               transcriptEntry,
             })
           } catch (error) {
-            // If the original turn ended while the native request was in flight,
-            // leave the durable queue intact and promote it once the gate closes.
-            if (this.activeTurns.get(command.chatId) === active) {
-              throw error
-            }
-            return
+            historyFailed = true
+            await this.failCodexHistoryTurn(command.chatId, active, error)
+            throw error
           }
           settlementStarted = true
           void (async () => {
+            let accepted = false
+            let transcriptPersisted = false
             try {
-              try {
-                await steer.settled
-              } catch (error) {
-                // If the original turn ended while the native request was in
-                // flight, leave the durable queue intact for promotion.
-                if (this.activeTurns.get(command.chatId) === active) {
-                  const message = error instanceof Error ? error.message : String(error)
-                  this.reportBackgroundError?.(
-                    `[codex-steer] chat ${command.chatId} failed to settle message ${queuedMessage.id}: ${message}`
-                  )
-                }
-                return
-              }
+              await steer.accepted
+              accepted = true
+              await steer.settled
+              transcriptPersisted = true
+              if (!chat.sessionToken) throw new Error("Accepted Codex input has no session token")
+              await this.codexPromptHistory.recordPrompt(command.chatId, queuedMessage.id, {
+                sessionToken: chat.sessionToken, turnId: expectedTurnId, mergeTurn: true,
+              })
               if (this.store.getQueuedMessage(command.chatId, queuedMessage.id)) {
                 await this.store.removeQueuedMessage(command.chatId, queuedMessage.id)
                 this.emitStateChange(command.chatId)
               }
+            } catch (error) {
+              historyFailed = true
+              await this.failCodexHistoryTurn(command.chatId, active, error)
+              if (accepted) {
+                // A failed transcript write leaves the only durable copy in the
+                // queue. A persisted prompt is recovered by its stable queue ID.
+                if (transcriptPersisted && this.store.getQueuedMessage(command.chatId, queuedMessage.id))
+                  await this.store.removeQueuedMessage(command.chatId, queuedMessage.id)
+              }
+              const message = error instanceof Error ? error.message : String(error)
+              this.reportBackgroundError?.(
+                `[codex-steer] chat ${command.chatId} failed to settle message ${queuedMessage.id}: ${message}`
+              )
             } finally {
               await finishSteerLifecycle()
             }
@@ -4238,6 +4263,12 @@ export class AgentCoordinator {
         }
 
         if (!event.entry || customToolEvents.skip(event.entry)) continue
+        if (active.provider === "codex" && event.entry.kind === "user_prompt" && event.onPersisted
+          && this.store.hasUserPrompt(active.chatId, event.entry._id)) {
+          // The correlated steer echo confirms the prompt saved before input.
+          try { event.onPersisted() } catch { /* Observer failures do not change the saved prompt. */ }
+          continue
+        }
         try {
           await this.store.appendMessage(active.chatId, event.entry)
         } catch (error) {
@@ -4254,6 +4285,7 @@ export class AgentCoordinator {
         } catch {
           // The transcript is already durable; observer failures are isolated.
         }
+        if (active.cancelRequested) break
         this.trackSubagentFromEntry(active.chatId, event.entry)
 
         if (event.entry.kind === "system_init") {
@@ -4648,6 +4680,23 @@ export class AgentCoordinator {
   }
 
   private async recordCodexHistoryFailure(chatId: string, error: unknown) {
+    const message = `Codex history could not be saved or recovered: ${error instanceof Error ? error.message : String(error)}`
+    await this.store.appendMessage(chatId, timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: message }))
+    await this.store.recordTurnFailed(chatId, message)
+    this.emitStateChange(chatId)
+  }
+
+  private async failCodexHistoryTurn(chatId: string, active: ActiveTurn, error: unknown) {
+    if (active.cancelRequested) return
+    if (this.activeTurns.has(chatId) && this.activeTurns.get(chatId) !== active) return
+    active.cancelRequested = true
+    active.cancelRecorded = true
+    active.customTools?.abort()
+    void active.turn?.interrupt().catch(() => {})
+    active.turn?.close()
+    this.codexManager.stopSession(chatId)
+    if (this.activeTurns.get(chatId) === active) this.activeTurns.delete(chatId)
+    if (this.drainingStreams.get(chatId)?.turn === active.turn) this.drainingStreams.delete(chatId)
     const message = `Codex history could not be saved or recovered: ${error instanceof Error ? error.message : String(error)}`
     await this.store.appendMessage(chatId, timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: message }))
     await this.store.recordTurnFailed(chatId, message)
