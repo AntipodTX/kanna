@@ -33,10 +33,12 @@ function renderSection(
     expandedGroups = new Set<string>(),
     collapsedSections = new Set<string>(),
     onNewLocalChat,
+    onOpenProjectSearch,
   }: {
     expandedGroups?: Set<string>
     collapsedSections?: Set<string>
     onNewLocalChat?: (localPath: string) => void
+    onOpenProjectSearch?: (projectId: string) => void
   } = {}
 ) {
   return renderToStaticMarkup(createElement(
@@ -51,6 +53,7 @@ function renderSection(
       onToggleExpandedGroup: () => undefined,
       renderChatRow: (chat: SidebarChatRow) => createElement("div", { key: chat.chatId }, chat.title),
       onNewLocalChat,
+      onOpenProjectSearch,
       isConnected: true,
     })
   ))
@@ -180,6 +183,67 @@ describe("LocalProjectsSection", () => {
     })
 
     expect(html).not.toContain("New Chat")
+  })
+
+  test("offers the project's content search next to its chat controls", () => {
+    const projectGroups: SidebarProjectGroup[] = [{
+      groupKey: "project-a",
+      title: "Project A",
+      realTitle: "Project A",
+      localPath: "/tmp/project-a",
+      chats: [createChat("chat-1", nowMs)],
+      previewChats: [createChat("chat-1", nowMs)],
+      olderChats: [],
+      defaultCollapsed: false,
+    }]
+
+    const html = renderSection(projectGroups, {
+      onNewLocalChat: () => undefined,
+      onOpenProjectSearch: () => undefined,
+    })
+
+    expect(html).toContain("Search Project")
+    expect(html.indexOf("New Chat")).toBeLessThan(html.indexOf("Search Project"))
+  })
+
+  test("does not offer project search when the project has no chats", () => {
+    const projectGroups: SidebarProjectGroup[] = [{
+      groupKey: "project-a",
+      title: "Project A",
+      realTitle: "Project A",
+      localPath: "/tmp/project-a",
+      chats: [],
+      previewChats: [],
+      olderChats: [],
+      defaultCollapsed: false,
+    }]
+
+    const html = renderSection(projectGroups, {
+      onNewLocalChat: () => undefined,
+      onOpenProjectSearch: () => undefined,
+    })
+
+    expect(html).not.toContain("Search Project")
+  })
+
+  test("offers project search when only archived chats remain", () => {
+    const projectGroups: SidebarProjectGroup[] = [{
+      groupKey: "project-a",
+      title: "Project A",
+      realTitle: "Project A",
+      localPath: "/tmp/project-a",
+      chats: [],
+      previewChats: [],
+      olderChats: [],
+      archivedChats: [createChat("archived-chat", nowMs)],
+      defaultCollapsed: false,
+    }]
+
+    const html = renderSection(projectGroups, {
+      onOpenProjectSearch: () => undefined,
+    })
+
+    expect(html).toContain("Search Project")
   })
 
   test("starts the downward reorder preview when dragged top plus 20px crosses the target center", () => {

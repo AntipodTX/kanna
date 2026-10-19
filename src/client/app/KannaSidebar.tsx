@@ -99,6 +99,7 @@ interface KannaSidebarProps {
   onOpenArchivedChat: (chatId: string) => void
   onRestoreChat: (chatId: string) => void
   onDeleteChat: (chat: SidebarChatRow) => void
+  onOpenProjectSearch: (projectId: string) => void
   onCopyPath: (localPath: string) => void
   onOpenExternalPath: (action: "open_finder" | "open_editor", localPath: string) => void
   /** Fetches what a chat changed, for the hover card's file list. */
@@ -340,6 +341,7 @@ function KannaSidebarImpl({
   onOpenArchivedChat,
   onRestoreChat,
   onDeleteChat,
+  onOpenProjectSearch,
   onCopyPath,
   onOpenExternalPath,
   onLoadTouchedFiles,
@@ -1350,6 +1352,7 @@ function KannaSidebarImpl({
                     onCreateChat(projectId)
                   }
                 }}
+                onOpenProjectSearch={onOpenProjectSearch}
                 onCopyPath={onCopyPath}
                 onOpenExternalPath={onOpenExternalPath}
                 onRenameProject={onRenameProject}

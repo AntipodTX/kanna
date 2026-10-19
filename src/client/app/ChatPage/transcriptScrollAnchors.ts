@@ -160,6 +160,35 @@ export interface TranscriptJumpRequest {
   requestId: string
 }
 
+export type EntryJumpResolution =
+  | { kind: "ready"; target: TranscriptScrollTarget }
+  | { kind: "load"; entryId: string }
+  | { kind: "wait" }
+  | { kind: "missing" }
+
+/**
+ * Resolve a concrete-entry jump, including the one backwards load it may need.
+ * Project search can name an entry outside the current transcript window; a
+ * failed or stale id is attempted only once so it cannot create a load loop.
+ */
+export function resolveEntryJump(
+  rows: ResolvedTranscriptRow[],
+  target: Extract<ChatJumpTarget, { entryId: string }>,
+  state: {
+    hasOlderMessages: boolean
+    loadAttempted: boolean
+    loadPending: boolean
+  },
+): EntryJumpResolution {
+  const resolved = resolveJumpTarget(rows, target)
+  if (resolved) return { kind: "ready", target: resolved }
+  if (state.loadPending) return { kind: "wait" }
+  if (state.hasOlderMessages && !state.loadAttempted) {
+    return { kind: "load", entryId: target.entryId }
+  }
+  return { kind: "missing" }
+}
+
 /**
  * Where a jump request should land, or null when the transcript has no such
  * message.

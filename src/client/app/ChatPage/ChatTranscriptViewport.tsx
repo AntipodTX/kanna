@@ -34,6 +34,7 @@ import {
   getLatestUserPrompt,
   getRowAnchorMessageId,
   isOptimisticMessageId,
+  resolveEntryJump,
   resolveJumpTarget,
   resolveRestoreTarget,
   shouldPinForNewPrompt,
@@ -788,6 +789,8 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
 
   /** Jump requests already spent, so each one lands exactly once. */
   const handledJumpRequestIdRef = useRef<string | null>(null)
+  const attemptedEntryJumpLoadRequestIdRef = useRef<string | null>(null)
+  const pendingEntryJumpLoadRequestIdRef = useRef<string | null>(null)
 
   /**
    * Take the pending jump, if there is one and its message is loaded.
@@ -799,12 +802,36 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
    */
   const consumeJumpTarget = useCallback((): TranscriptScrollTarget | null => {
     if (!jumpRequest || handledJumpRequestIdRef.current === jumpRequest.requestId) return null
-    handledJumpRequestIdRef.current = jumpRequest.requestId
-    onJumpRequestHandled?.(jumpRequest.requestId)
     let revealEntryId: string | undefined
     if (typeof jumpRequest.target !== "string" && "entryId" in jumpRequest.target) {
       const entryId = jumpRequest.target.entryId
       revealEntryId = jumpRequest.target.revealEntryId ?? entryId
+      const resolution = resolveEntryJump(resolvedRows, jumpRequest.target, {
+        hasOlderMessages,
+        loadAttempted: attemptedEntryJumpLoadRequestIdRef.current === jumpRequest.requestId,
+        loadPending: pendingEntryJumpLoadRequestIdRef.current === jumpRequest.requestId || isLoadingOlderMessages,
+      })
+      if (resolution.kind === "load") {
+        if (!onLoadOlderMessages) {
+          handledJumpRequestIdRef.current = jumpRequest.requestId
+          onJumpRequestHandled?.(jumpRequest.requestId)
+          return null
+        }
+        attemptedEntryJumpLoadRequestIdRef.current = jumpRequest.requestId
+        pendingEntryJumpLoadRequestIdRef.current = jumpRequest.requestId
+        void onLoadOlderMessages({ untilMessageId: resolution.entryId }).finally(() => {
+          if (pendingEntryJumpLoadRequestIdRef.current === jumpRequest.requestId) {
+            pendingEntryJumpLoadRequestIdRef.current = null
+          }
+        })
+        return null
+      }
+      if (resolution.kind === "wait") return null
+      if (resolution.kind === "missing") {
+        handledJumpRequestIdRef.current = jumpRequest.requestId
+        onJumpRequestHandled?.(jumpRequest.requestId)
+        return null
+      }
       const rowIndex = findEntryRowIndex(resolvedRows, entryId)
       const row = rowIndex === null ? undefined : resolvedRows[rowIndex]
       if (row?.kind === "tool-group") {
@@ -819,10 +846,25 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
           requestId: jumpRequest.requestId,
         })
       }
+      handledJumpRequestIdRef.current = jumpRequest.requestId
+      onJumpRequestHandled?.(jumpRequest.requestId)
+      return resolution.target.kind === "pin"
+        ? prepareJumpToRow(resolution.target.rowId, revealEntryId)
+        : resolution.target
     }
+    handledJumpRequestIdRef.current = jumpRequest.requestId
+    onJumpRequestHandled?.(jumpRequest.requestId)
     const target = resolveJumpTarget(resolvedRows, jumpRequest.target)
     return target?.kind === "pin" ? prepareJumpToRow(target.rowId, revealEntryId) : target
-  }, [jumpRequest, onJumpRequestHandled, prepareJumpToRow, resolvedRows])
+  }, [
+    hasOlderMessages,
+    isLoadingOlderMessages,
+    jumpRequest,
+    onJumpRequestHandled,
+    onLoadOlderMessages,
+    prepareJumpToRow,
+    resolvedRows,
+  ])
 
   // Restore once per chat open: wait until rows exist *and* the stored anchor
   // has resolved, otherwise we'd land on the fallback and visibly jump when the
