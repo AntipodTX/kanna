@@ -93,6 +93,7 @@ const DEFAULT_APP_SETTINGS_SNAPSHOT: AppSettingsSnapshot = {
   chatBrowserNotificationPreference: "never",
   submitWhileRunning: "queue",
   paneVisibility: { widgets: "chat", terminal: "chat" },
+  idleSessionTimeout: "1h",
   terminal: {
     scrollbackLines: 1_000,
     minColumnWidth: 450,
@@ -849,6 +850,44 @@ describe("ws-router", () => {
       "analytics_disabled",
       "analytics_enabled",
     ])
+  })
+
+  test("cancels and closes agent sessions before archiving chats", async () => {
+    const calls: string[] = []
+    const router = createTestRouter({
+      store: createFakeStore({
+        getChat: () => ({ hasMessages: true, lastMessageAt: Date.now() }),
+        archiveChat: async (chatId: string) => {
+          calls.push(`archive:${chatId}`)
+        },
+      }),
+      agent: {
+        getActiveStatuses: () => new Map(),
+        getDrainingChatIds: () => new Set(),
+        cancel: async (chatId: string) => {
+          calls.push(`cancel:${chatId}`)
+        },
+        closeChat: async (chatId: string) => {
+          calls.push(`close:${chatId}`)
+        },
+      } as never,
+    })
+    const ws = new FakeWebSocket()
+
+    await router.handleMessage(
+      ws as never,
+      JSON.stringify({
+        v: 1,
+        type: "command",
+        id: "archive-chat",
+        command: {
+          type: "chat.archive",
+          chatId: "chat-1",
+        },
+      })
+    )
+
+    expect(calls).toEqual(["cancel:chat-1", "close:chat-1", "archive:chat-1"])
   })
 
   test("tracks project lifecycle analytics", async () => {

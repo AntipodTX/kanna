@@ -917,6 +917,7 @@ export function createDemoAppSettings(theme: AppThemePreference): AppSettingsSna
     chatSoundPreference: "never",
     chatSoundId: "funk",
     chatBrowserNotificationPreference: "never",
+    idleSessionTimeout: "1h",
     terminal: { scrollbackLines: 1000, minColumnWidth: 450, webglRenderer: false },
     editor: { preset: "cursor", commandTemplate: getDefaultEditorCommandTemplate("cursor") },
     transcript: { windowAssistantMessages: DEFAULT_TRANSCRIPT_WINDOW_ASSISTANT_MESSAGES },
