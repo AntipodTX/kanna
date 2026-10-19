@@ -2098,7 +2098,7 @@ export class EventStore {
       if (isAgentAuthoredEntry(entry)) lastAgentMessageAt = Math.max(lastAgentMessageAt ?? 0, entry.createdAt)
       if (entry.kind === "user_prompt") {
         lastMessageAt = Math.max(lastMessageAt ?? 0, entry.createdAt)
-        if (!entry.hidden) {
+        if (!entry.hidden && !entry.parentToolUseId) {
           const preview = buildChatUserMessagePreview(entry.content)
           if (preview) lastUserMessagePreview = preview
         }
