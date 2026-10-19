@@ -104,7 +104,7 @@ describe("CodexAppServerManager", () => {
     expect((process.messages[1] as any).method).toBe("initialized")
     expect((process.messages[2] as any).method).toBe("thread/start")
     expect((process.messages[2] as any).params.experimentalRawEvents).toBe(false)
-    expect((process.messages[2] as any).params).not.toHaveProperty("persistExtendedHistory")
+    expect((process.messages[2] as any).params.persistExtendedHistory).toBe(true)
   })
 
   test("falls back to thread/start when thread/resume is recoverably missing", async () => {
@@ -142,8 +142,8 @@ describe("CodexAppServerManager", () => {
       "thread/resume",
       "thread/start",
     ])
-    expect((process.messages[2] as any).params).not.toHaveProperty("persistExtendedHistory")
-    expect((process.messages[3] as any).params).not.toHaveProperty("persistExtendedHistory")
+    expect((process.messages[2] as any).params.persistExtendedHistory).toBe(true)
+    expect((process.messages[3] as any).params.persistExtendedHistory).toBe(true)
   })
 
   // Regression coverage for the real-world "thread/resume failed: thread X
