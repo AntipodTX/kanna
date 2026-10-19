@@ -24,6 +24,7 @@ export type PrepareHarnessContent = (outcome: HarnessStartupOutcome) => Promise<
 
 export interface HarnessTurn {
   startupOutcome?: HarnessStartupOutcome
+  providerTurnId?: string
   provider: AgentProvider
   stream: AsyncIterable<HarnessEvent>
   getAccountInfo?: () => Promise<AccountInfo | null>
