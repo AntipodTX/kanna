@@ -2107,88 +2107,7 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
     events.close()
   })
 
-  test("reuses a persistent Claude session across turns", async () => {
-    const events = new AsyncEventQueue<any>()
-    const startSessionCalls: Array<{ model: string; planMode: boolean; sessionToken: string | null }> = []
-    const prompts: string[] = []
-
-    const store = createFakeStore()
-    const coordinator = new AgentCoordinator({
-      store: store as never,
-      onStateChange: () => {},
-      startClaudeSession: async (args) => {
-        startSessionCalls.push({
-          model: args.model,
-          planMode: args.planMode,
-          sessionToken: args.sessionToken,
-        })
-
-        return {
-          provider: "claude",
-          stream: events,
-          getAccountInfo: async () => null,
-          interrupt: async () => {},
-          close: () => {},
-          setModel: async () => {},
-          setPermissionMode: async () => {},
-          sendPrompt: async (content: string) => {
-            prompts.push(content)
-            if (prompts.length === 1) {
-              events.push({ type: "session_token" as const, sessionToken: "claude-session-1" })
-              events.push({
-                type: "transcript" as const,
-                entry: timestamped({
-                  kind: "system_init",
-                  provider: "claude",
-                  model: "claude-opus-4-1",
-                  tools: [],
-                  agents: [],
-                  slashCommands: [],
-                  mcpServers: [],
-                }),
-              })
-            }
-            events.push({
-              type: "transcript" as const,
-              entry: timestamped({
-                kind: "result",
-                subtype: "success",
-                isError: false,
-                durationMs: 0,
-                result: "done",
-              }),
-            })
-          },
-        }
-      },
-    })
-
-    await coordinator.send({
-      type: "chat.send",
-      chatId: "chat-1",
-      provider: "claude",
-      content: "start background task",
-      model: "claude-opus-4-1",
-    })
-    await waitFor(() => store.turnFinishedCount === 1)
-
-    await coordinator.send({
-      type: "chat.send",
-      chatId: "chat-1",
-      provider: "claude",
-      content: "check task output",
-      model: "claude-opus-4-1",
-    })
-    await waitFor(() => store.turnFinishedCount === 2)
-
-    expect(startSessionCalls).toHaveLength(1)
-    expect(startSessionCalls[0]?.planMode).toBe(false)
-    expect(startSessionCalls[0]?.sessionToken).toBeNull()
-    expect(prompts).toEqual(["start background task", "check task output"])
-    expect(store.chat.sessionToken).toBe("claude-session-1")
-
-    events.close()
-  })
+  
 
   test("a Claude turn the CLI started on its own does not end the user's turn", async () => {
     const events = new AsyncEventQueue<any>()
@@ -3614,6 +3533,91 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
       queues[1]!.close()
     })
   }
+
+
+  test("reuses a persistent Claude session without altering user text after a model change", async () => {
+    const events = new AsyncEventQueue<any>()
+    const startSessionCalls: Array<{ model: string; planMode: boolean; sessionToken: string | null }> = []
+    const prompts: string[] = []
+
+    const store = createFakeStore()
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async (args) => {
+        startSessionCalls.push({
+          model: args.model,
+          planMode: args.planMode,
+          sessionToken: args.sessionToken,
+        })
+
+        return {
+          provider: "claude",
+          stream: events,
+          getAccountInfo: async () => null,
+          interrupt: async () => {},
+          close: () => {},
+          setModel: async () => {},
+          setPermissionMode: async () => {},
+          sendPrompt: async (content: string) => {
+            prompts.push(content)
+            if (prompts.length === 1) {
+              events.push({ type: "session_token" as const, sessionToken: "claude-session-1" })
+              events.push({
+                type: "transcript" as const,
+                entry: timestamped({
+                  kind: "system_init",
+                  provider: "claude",
+                  model: "claude-opus-4-1",
+                  tools: [],
+                  agents: [],
+                  slashCommands: [],
+                  mcpServers: [],
+                }),
+              })
+            }
+            events.push({
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "done",
+              }),
+            })
+          },
+        }
+      },
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "start background task",
+      model: "claude-opus-4-1",
+    })
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "check task output",
+      model: "claude-sonnet-4-5",
+    })
+    await waitFor(() => store.turnFinishedCount === 2)
+
+    expect(startSessionCalls).toHaveLength(1)
+    expect(startSessionCalls[0]?.planMode).toBe(false)
+    expect(startSessionCalls[0]?.sessionToken).toBeNull()
+    expect(prompts).toEqual(["start background task", "check task output"])
+    expect(store.chat.sessionToken).toBe("claude-session-1")
+
+    events.close()
+  })
+
 })
 
 describe("buildConcurrentAgentsNotice", () => {
@@ -5536,4 +5540,47 @@ describe("main integration review of early preparation ownership", () => {
       expect(executed).toBe(0)
     } finally { release(); for (const queue of queues) queue.close(); await successor; await oldCallback; coordinator.dispose() }
   })
+})
+
+
+describe("ordinary user prompt delivery", () => {
+  for (const provider of ["claude", "codex", "cursor", "grok", "pi"] as const) {
+    test(`${provider} receives the user's text without automatic Kanna instructions`, async () => {
+      const events = new AsyncEventQueue<any>()
+      const prompts: string[] = []
+      const content = "  Explain this change.\nKeep my formatting.  "
+      const manager = {
+        async startSession() { return { sessionToken: "native-session", resumeFellBack: false } },
+        async listModels() { return [] },
+        async startTurn(args: { content: string }): Promise<HarnessTurn> {
+          prompts.push(args.content)
+          return { provider, stream: events, interrupt: async () => {}, close: () => {} }
+        },
+      }
+      const store = createFakeStore()
+      store.chat.provider = provider
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => {},
+        codexManager: manager as never,
+        cursorManager: manager as never,
+        grokManager: manager as never,
+        piManager: manager as never,
+        resolvePiConnection: async () => ({ provider: "openai", baseUrl: "https://example.invalid", apiKey: "test" }),
+        startClaudeSession: async () => ({
+          provider: "claude", stream: events,
+          interrupt: async () => {}, close: () => {},
+          sendPrompt: async (text: string) => { prompts.push(text) },
+          setModel: async () => {}, setPermissionMode: async () => {},
+        }),
+      })
+      try {
+        await coordinator.send({ type: "chat.send", chatId: "chat-1", provider, content, model: "test-model" })
+        expect(prompts).toEqual(["Explain this change.\nKeep my formatting."])
+      } finally {
+        await coordinator.cancel("chat-1")
+        events.close()
+      }
+    })
+  }
 })
