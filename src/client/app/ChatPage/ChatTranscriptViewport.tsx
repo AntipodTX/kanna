@@ -132,7 +132,15 @@ function rowLightsItself(row: ResolvedTranscriptRow): boolean {
 
 type TranscriptRowItemProps = Pick<
   ComponentProps<typeof KannaTranscriptRow>,
-  "row" | "toolGroupExpanded" | "onToolGroupExpandedChange" | "onAskUserQuestionSubmit" | "onExitPlanModeConfirm"
+  | "row"
+  | "toolGroupExpanded"
+  | "onToolGroupExpandedChange"
+  | "onAskUserQuestionSubmit"
+  | "onExitPlanModeConfirm"
+  | "onEditUserPrompt"
+  | "isEditUserPromptDisabled"
+  | "onForkUserPrompt"
+  | "isForkUserPromptDisabled"
 > & { flashBox: boolean; flashRow: boolean }
 
 /**
@@ -156,6 +164,10 @@ const TranscriptRowItem = memo(function TranscriptRowItem({
   onToolGroupExpandedChange,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  onEditUserPrompt,
+  isEditUserPromptDisabled,
+  onForkUserPrompt,
+  isForkUserPromptDisabled,
 }: TranscriptRowItemProps) {
   return (
     <MessageScrollerItem
@@ -187,6 +199,10 @@ const TranscriptRowItem = memo(function TranscriptRowItem({
           onToolGroupExpandedChange={onToolGroupExpandedChange}
           onAskUserQuestionSubmit={onAskUserQuestionSubmit}
           onExitPlanModeConfirm={onExitPlanModeConfirm}
+          onEditUserPrompt={onEditUserPrompt}
+          isEditUserPromptDisabled={isEditUserPromptDisabled}
+          onForkUserPrompt={onForkUserPrompt}
+          isForkUserPromptDisabled={isForkUserPromptDisabled}
         />
       </div>
     </MessageScrollerItem>
@@ -261,6 +277,10 @@ interface ChatTranscriptViewportProps {
   onOpenLocalLink: KannaState["handleOpenLocalLink"]
   onAskUserQuestionSubmit: KannaState["handleAskUserQuestion"]
   onExitPlanModeConfirm: KannaState["handleExitPlanMode"]
+  onEditUserPrompt?: KannaState["handleEditUserPrompt"]
+  isEditUserPromptDisabled?: boolean
+  onForkUserPrompt?: KannaState["handleForkUserPrompt"]
+  isForkUserPromptDisabled?: boolean
   showScrollButton: boolean
   onIsAtEndChange: (isAtEnd: boolean) => void
   scrollToBottom: () => void
@@ -471,6 +491,10 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
   onOpenLocalLink,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  onEditUserPrompt,
+  isEditUserPromptDisabled = false,
+  onForkUserPrompt,
+  isForkUserPromptDisabled = false,
   showScrollButton,
   onIsAtEndChange,
   scrollToBottom,
@@ -1133,6 +1157,10 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
                   onToolGroupExpandedChange={handleToolGroupExpandedChange}
                   onAskUserQuestionSubmit={onAskUserQuestionSubmit}
                   onExitPlanModeConfirm={onExitPlanModeConfirm}
+                  onEditUserPrompt={onEditUserPrompt}
+                  isEditUserPromptDisabled={isEditUserPromptDisabled}
+                  onForkUserPrompt={onForkUserPrompt}
+                  isForkUserPromptDisabled={isForkUserPromptDisabled}
                 />
               ))}
               {listFooter}

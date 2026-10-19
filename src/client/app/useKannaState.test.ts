@@ -3,6 +3,8 @@ import {
   applySidebarProjectOrder,
   countMatchingUserPrompts,
   getActiveChatSnapshot,
+  getEditUserPromptSendOptions,
+  getForkUserPromptSendOptions,
   getMostRecentlyActiveProjectId,
   getNextMeasuredInputHeight,
   getNewestRemainingChatId,
@@ -17,7 +19,7 @@ import {
   shouldMarkActiveChatRead,
   shouldAutoFollowTranscript,
 } from "./useKannaState"
-import type { ChatAttachment, ChatSnapshot, SidebarData, UserPromptEntry } from "../../shared/types"
+import type { ChatAttachment, ChatProviderPreferences, ChatSnapshot, SidebarData, UserPromptEntry } from "../../shared/types"
 
 function createSidebarData(): SidebarData {
   return {
@@ -322,6 +324,8 @@ describe("getActiveChatSnapshot", () => {
         status: "idle",
         isDraining: false,
         provider: "codex",
+        model: null,
+        modelOptions: null,
         planMode: false,
         autoPlan: false,
         sessionToken: null,
@@ -346,6 +350,8 @@ describe("getActiveChatSnapshot", () => {
         status: "idle",
         isDraining: false,
         provider: "claude",
+        model: null,
+        modelOptions: null,
         planMode: false,
         autoPlan: false,
         sessionToken: null,
@@ -358,6 +364,246 @@ describe("getActiveChatSnapshot", () => {
     }
 
     expect(getActiveChatSnapshot(snapshot, "chat-new")).toBeNull()
+  })
+})
+
+describe("getEditUserPromptSendOptions", () => {
+  test("uses the current chat composer model settings instead of provider defaults", () => {
+    const providerDefaults: ChatProviderPreferences = {
+      claude: {
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "high", contextWindow: "200k", fastMode: false },
+        planMode: false,
+        autoPlan: false,
+      },
+      codex: {
+        model: "gpt-5.5",
+        modelOptions: { reasoningEffort: "high", fastMode: false },
+        planMode: false,
+        autoPlan: false,
+      },
+      cursor: {
+        model: "composer-2.5",
+        modelOptions: { fastMode: false },
+        planMode: false,
+        autoPlan: false,
+      },
+      grok: {
+        model: "grok-4.6",
+        modelOptions: { reasoningEffort: "high" },
+        planMode: false,
+        autoPlan: false,
+      },
+      pi: {
+        model: "openai/gpt-5.4",
+        modelOptions: { reasoningEffort: "medium" },
+        planMode: false,
+        autoPlan: false,
+      },
+    }
+
+    expect(getEditUserPromptSendOptions(
+      {
+        provider: "claude",
+        model: "claude-haiku-4-5-20251001",
+        modelOptions: { reasoningEffort: "low", contextWindow: "200k", fastMode: false },
+        planMode: true,
+        autoPlan: false,
+      },
+      "claude",
+      providerDefaults,
+      true
+    )).toEqual({
+      model: "claude-haiku-4-5-20251001",
+      modelOptions: { claude: { reasoningEffort: "low", contextWindow: "200k", fastMode: false } },
+      planMode: true,
+    })
+  })
+
+  test("uses current composer settings for edits even when runtime has older settings", () => {
+    const providerDefaults: ChatProviderPreferences = {
+      claude: {
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "high", contextWindow: "200k", fastMode: false },
+        planMode: false,
+        autoPlan: false,
+      },
+      codex: {
+        model: "gpt-5.6-sol",
+        modelOptions: { reasoningEffort: "high", fastMode: false },
+        planMode: false,
+        autoPlan: false,
+      },
+      cursor: {
+        model: "composer-2.5",
+        modelOptions: { fastMode: false },
+        planMode: false,
+        autoPlan: false,
+      },
+      grok: {
+        model: "grok-4.6",
+        modelOptions: { reasoningEffort: "high" },
+        planMode: false,
+        autoPlan: false,
+      },
+      pi: {
+        model: "openai/gpt-5.4",
+        modelOptions: { reasoningEffort: "medium" },
+        planMode: false,
+        autoPlan: false,
+      },
+    }
+
+    expect(getEditUserPromptSendOptions(
+      {
+        provider: "codex",
+        model: "gpt-5.5",
+        modelOptions: { reasoningEffort: "low", fastMode: true },
+        planMode: false,
+        autoPlan: false,
+      },
+      "codex",
+      providerDefaults,
+      true,
+      {
+        chatId: "chat-1",
+        projectId: "project-1",
+        localPath: "/tmp/project",
+        title: "Chat",
+        status: "idle",
+        isDraining: false,
+        provider: "codex",
+        model: "gpt-5.6-sol",
+        modelOptions: { codex: { reasoningEffort: "high", fastMode: false } },
+        planMode: true,
+        autoPlan: false,
+        sessionToken: "codex-session-1",
+      },
+    )).toEqual({
+      model: "gpt-5.5",
+      modelOptions: { codex: { reasoningEffort: "low", fastMode: true } },
+      planMode: false,
+    })
+  })
+
+  test("uses Cursor defaults when an existing Cursor chat has no local composer state", () => {
+    const providerDefaults: ChatProviderPreferences = {
+      claude: {
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "high", contextWindow: "200k", fastMode: false },
+        planMode: false,
+        autoPlan: false,
+      },
+      codex: {
+        model: "gpt-5.5",
+        modelOptions: { reasoningEffort: "high", fastMode: false },
+        planMode: false,
+        autoPlan: false,
+      },
+      cursor: {
+        model: "composer-2.5",
+        modelOptions: { fastMode: true },
+        planMode: false,
+        autoPlan: false,
+      },
+      grok: {
+        model: "grok-4.6",
+        modelOptions: { reasoningEffort: "high" },
+        planMode: false,
+        autoPlan: false,
+      },
+      pi: {
+        model: "openai/gpt-5.4",
+        modelOptions: { reasoningEffort: "medium" },
+        planMode: false,
+        autoPlan: false,
+      },
+    }
+
+    expect(getEditUserPromptSendOptions(
+      {
+        provider: "claude",
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "high", contextWindow: "200k", fastMode: false },
+        planMode: true,
+        autoPlan: false,
+      },
+      "cursor",
+      providerDefaults,
+      false,
+    )).toEqual({
+      model: "composer-2.5",
+      modelOptions: { cursor: { fastMode: true } },
+      planMode: false,
+    })
+  })
+})
+
+describe("getForkUserPromptSendOptions", () => {
+  test("uses persisted runtime model settings from the original chat", () => {
+    const providerDefaults: ChatProviderPreferences = {
+      claude: {
+        model: "claude-sonnet-4-6",
+        modelOptions: { reasoningEffort: "high", contextWindow: "200k", fastMode: false },
+        planMode: false,
+        autoPlan: false,
+      },
+      codex: {
+        model: "gpt-5.5",
+        modelOptions: { reasoningEffort: "high", fastMode: false },
+        planMode: false,
+        autoPlan: false,
+      },
+      cursor: {
+        model: "composer-2.5",
+        modelOptions: { fastMode: false },
+        planMode: false,
+        autoPlan: false,
+      },
+      grok: {
+        model: "grok-4.6",
+        modelOptions: { reasoningEffort: "high" },
+        planMode: false,
+        autoPlan: false,
+      },
+      pi: {
+        model: "openai/gpt-5.4",
+        modelOptions: { reasoningEffort: "medium" },
+        planMode: false,
+        autoPlan: false,
+      },
+    }
+
+    expect(getForkUserPromptSendOptions(
+      {
+        provider: "codex",
+        model: "gpt-5.5",
+        modelOptions: { reasoningEffort: "low", fastMode: true },
+        planMode: false,
+        autoPlan: false,
+      },
+      "codex",
+      providerDefaults,
+      true,
+      {
+        chatId: "chat-1",
+        projectId: "project-1",
+        localPath: "/tmp/project",
+        title: "Chat",
+        status: "idle",
+        isDraining: false,
+        provider: "codex",
+        model: "gpt-5.6-sol",
+        modelOptions: { codex: { reasoningEffort: "high", fastMode: false } },
+        planMode: true,
+        autoPlan: false,
+        sessionToken: "codex-session-1",
+      },
+    )).toEqual({
+      model: "gpt-5.6-sol",
+      modelOptions: { codex: { reasoningEffort: "high", fastMode: false } },
+      planMode: true,
+    })
   })
 })
 

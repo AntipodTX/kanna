@@ -509,6 +509,10 @@ interface TranscriptSingleRowProps {
     answers: AskUserQuestionAnswerMap
   ) => void
   onExitPlanModeConfirm: (toolUseId: string, confirmed: boolean, clearContext?: boolean, message?: string) => void
+  onEditUserPrompt?: (messageId: string, content: string) => void | Promise<void>
+  isEditUserPromptDisabled?: boolean
+  onForkUserPrompt?: (messageId: string) => void | Promise<void>
+  isForkUserPromptDisabled?: boolean
 }
 
 const TranscriptSingleRow = memo(function TranscriptSingleRow({
@@ -530,11 +534,28 @@ const TranscriptSingleRow = memo(function TranscriptSingleRow({
   nextPromptTimestamp,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  onEditUserPrompt,
+  isEditUserPromptDisabled = false,
+  onForkUserPrompt,
+  isForkUserPromptDisabled = false,
 }: TranscriptSingleRowProps) {
   let rendered: React.ReactNode = null
 
   if (message.kind === "user_prompt") {
-    rendered = <UserMessage key={message.id} content={message.content} attachments={message.attachments} steered={message.steered} flash={flash} />
+    rendered = (
+      <UserMessage
+        key={message.id}
+        messageId={message.id}
+        content={message.content}
+        attachments={message.attachments}
+        steered={message.steered}
+        flash={flash}
+        editDisabled={isEditUserPromptDisabled}
+        forkDisabled={isForkUserPromptDisabled}
+        onEdit={onEditUserPrompt}
+        onFork={onForkUserPrompt}
+      />
+    )
   } else {
     switch (message.kind) {
       case "unknown":
@@ -644,6 +665,10 @@ const TranscriptSingleRow = memo(function TranscriptSingleRow({
   && prev.nextPromptTimestamp === next.nextPromptTimestamp
   && prev.onAskUserQuestionSubmit === next.onAskUserQuestionSubmit
   && prev.onExitPlanModeConfirm === next.onExitPlanModeConfirm
+  && prev.onEditUserPrompt === next.onEditUserPrompt
+  && prev.isEditUserPromptDisabled === next.isEditUserPromptDisabled
+  && prev.onForkUserPrompt === next.onForkUserPrompt
+  && prev.isForkUserPromptDisabled === next.isForkUserPromptDisabled
   && sameMessage(prev.message, next.message)
 ))
 
@@ -768,6 +793,10 @@ interface KannaTranscriptRowProps {
     answers: AskUserQuestionAnswerMap
   ) => void
   onExitPlanModeConfirm: (toolUseId: string, confirmed: boolean, clearContext?: boolean, message?: string) => void
+  onEditUserPrompt?: (messageId: string, content: string) => void | Promise<void>
+  isEditUserPromptDisabled?: boolean
+  onForkUserPrompt?: (messageId: string) => void | Promise<void>
+  isForkUserPromptDisabled?: boolean
 }
 
 export const KannaTranscriptRow = memo(function KannaTranscriptRow({
@@ -777,6 +806,10 @@ export const KannaTranscriptRow = memo(function KannaTranscriptRow({
   onToolGroupExpandedChange,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  onEditUserPrompt,
+  isEditUserPromptDisabled = false,
+  onForkUserPrompt,
+  isForkUserPromptDisabled = false,
 }: KannaTranscriptRowProps) {
   if (row.kind === "tool-group") {
     return (
@@ -812,6 +845,10 @@ export const KannaTranscriptRow = memo(function KannaTranscriptRow({
       nextPromptTimestamp={row.nextPromptTimestamp}
       onAskUserQuestionSubmit={onAskUserQuestionSubmit}
       onExitPlanModeConfirm={onExitPlanModeConfirm}
+      onEditUserPrompt={onEditUserPrompt}
+      isEditUserPromptDisabled={isEditUserPromptDisabled}
+      onForkUserPrompt={onForkUserPrompt}
+      isForkUserPromptDisabled={isForkUserPromptDisabled}
     />
   )
 }, (prev, next) => {
@@ -822,6 +859,10 @@ export const KannaTranscriptRow = memo(function KannaTranscriptRow({
   if (prev.onToolGroupExpandedChange !== next.onToolGroupExpandedChange) return false
   if (prev.onAskUserQuestionSubmit !== next.onAskUserQuestionSubmit) return false
   if (prev.onExitPlanModeConfirm !== next.onExitPlanModeConfirm) return false
+  if (prev.onEditUserPrompt !== next.onEditUserPrompt) return false
+  if (prev.isEditUserPromptDisabled !== next.isEditUserPromptDisabled) return false
+  if (prev.onForkUserPrompt !== next.onForkUserPrompt) return false
+  if (prev.isForkUserPromptDisabled !== next.isForkUserPromptDisabled) return false
   if (prev.row.kind !== next.row.kind) return false
   if (prev.row.id !== next.row.id) return false
 
