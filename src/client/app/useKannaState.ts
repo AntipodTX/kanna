@@ -2,7 +2,7 @@ import { recordClientPerformance, startClientPerformance } from "./clientPerform
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router-dom"
 import { useShallow } from "zustand/react/shallow"
-import { PROVIDERS, withPiFaveModels, type AgentProvider, type AppSettingsPatch, type AskUserQuestionAnswerMap, type AppSettingsSnapshot, type ChatDiffSnapshot, type CodexApprovalDecision, type FaveModel, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type TranscriptEntry, type UpdateSnapshot } from "../../shared/types"
+import { PROVIDERS, withPiFaveModels, type AgentProvider, type AppSettingsPatch, type AskUserQuestionAnswerMap, type AppSettingsSnapshot, type ChatDiffSnapshot, type CodexApprovalDecision, type FaveModel, type KeybindingsSnapshot, type LlmProviderSnapshot, type LlmProviderValidationResult, type ModelOptions, type ProviderCatalogEntry, type QueuedChatMessage, type StandaloneTranscriptExportCommandResult, type TranscriptEntry, type UpdateSnapshot, type StartupSyncSnapshot } from "../../shared/types"
 import { NEW_CHAT_COMPOSER_ID, useChatPreferencesStore } from "../stores/chatPreferencesStore"
 import { useRightSidebarStore } from "../stores/rightSidebarStore"
 import { useTerminalLayoutStore } from "../stores/terminalLayoutStore"
@@ -166,6 +166,7 @@ export interface KannaState {
   activeProjectId: string | null
   localProjects: LocalProjectsSnapshot | null
   updateSnapshot: UpdateSnapshot | null
+  startupSync: StartupSyncSnapshot | null
   chatSnapshot: ChatSnapshot | null
   /** Server-stored read position for the active chat; drives restore on open. */
   readAnchorState: ChatReadAnchorState
@@ -274,6 +275,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
   const { resolvedTheme } = useTheme()
 
   const [localProjects, setLocalProjects] = useState<LocalProjectsSnapshot | null>(null)
+  const [startupSync, setStartupSync] = useState<StartupSyncSnapshot | null>(null)
   const [chatSnapshot, setChatSnapshot] = useState<ChatSnapshot | null>(null)
   const [cachedTranscript, setCachedTranscript] = useState<CachedTranscriptWindow | null>(null)
   const openTiming = useRef({ chatId: activeChatId, started: performance.now(), displayed: false })
@@ -378,6 +380,12 @@ export function useKannaState(activeChatId: string | null): KannaState {
     dialog,
     setCommandError,
   })
+
+  useEffect(() => {
+    return socket.subscribe<StartupSyncSnapshot>({ type: "startup-sync" }, (snapshot) => {
+      setStartupSync(snapshot)
+    })
+  }, [socket])
 
   const {
     keybindings,
@@ -1124,6 +1132,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
     activeProjectId,
     localProjects,
     updateSnapshot,
+    startupSync,
     chatSnapshot,
     readAnchorState,
     reportReadAnchor,

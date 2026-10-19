@@ -1641,6 +1641,19 @@ export interface UpdateSnapshot {
   }
 }
 
+export type StartupSyncStatus = "idle" | "running" | "completed" | "failed"
+export type StartupSyncMode = "session-sync" | "storage-recovery"
+
+export interface StartupSyncSnapshot {
+  enabled: boolean
+  mode: StartupSyncMode
+  status: StartupSyncStatus
+  messages: string[]
+  startedAt: number | null
+  completedAt: number | null
+  error: string | null
+}
+
 export type UpdateInstallErrorCode =
   | "version_not_live_yet"
   | "install_failed"
@@ -1725,6 +1738,8 @@ export interface TodoItem {
 interface TranscriptEntryBase {
   _id: string
   messageId?: string
+  /** Native Claude session containing messageId; updated with its UUID on a fork. */
+  claudeSessionToken?: string
   createdAt: number
   hidden?: boolean
   debugRaw?: string
@@ -1742,6 +1757,8 @@ interface TranscriptEntryBase {
    * previews, handoff, the transcript window count).
    */
   parentToolUseId?: string
+  /** Claude child provenance when historical rows have no parent tool ID. */
+  claudeSidechain?: boolean
   /**
    * Set when this entry is in header form: its unbounded tool payload fields
    * are in the server's payload sidecar (`server/transcript-payloads.ts`), to

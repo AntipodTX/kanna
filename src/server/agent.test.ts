@@ -446,6 +446,7 @@ describe("AgentCoordinator codex integration", () => {
     const titleGate = new Promise<void>((resolve) => {
       releaseTitle = resolve
     })
+    const titleCalls: Array<{ messageContent: string; cwd: string; preferredProvider?: "claude" | "codex" }> = []
     const fakeCodexManager = {
       async startSession() {},
       async startTurn(): Promise<HarnessTurn> {
@@ -488,7 +489,8 @@ describe("AgentCoordinator codex integration", () => {
       store: store as never,
       onStateChange: () => {},
       codexManager: fakeCodexManager as never,
-      generateTitle: async () => {
+      generateTitle: async (messageContent, cwd, preferredProvider) => {
+        titleCalls.push({ messageContent, cwd, preferredProvider })
         await titleGate
         return {
           title: "Generated title",
@@ -507,6 +509,11 @@ describe("AgentCoordinator codex integration", () => {
     })
 
     expect(store.chat.title).toBe("first message")
+    expect(titleCalls).toEqual([{
+      messageContent: "first message",
+      cwd: "/tmp/project",
+      preferredProvider: "codex",
+    }])
     releaseTitle()
     await waitFor(() => store.chat.title === "Generated title")
     expect(store.messages[0]?.kind).toBe("user_prompt")
