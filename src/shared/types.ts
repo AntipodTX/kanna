@@ -191,6 +191,8 @@ export interface QueuedChatMessage {
   content: string
   attachments: ChatAttachment[]
   createdAt: number
+  /** Transient server-derived state; never persisted in queue events. */
+  steering?: boolean
   provider?: AgentProvider
   model?: string
   modelOptions?: ModelOptions
@@ -1726,7 +1728,11 @@ interface ToolCallBase<TKind extends string, TInput> {
 }
 
 export interface AskUserQuestionToolCall
-  extends ToolCallBase<"ask_user_question", { questions: AskUserQuestionItem[] }> { }
+  extends ToolCallBase<"ask_user_question", {
+    questions: AskUserQuestionItem[]
+    /** A non-blocking Codex message, answered by ordinary user input. */
+    codexAsync?: { threadId: string }
+  }> { }
 
 export interface ExitPlanModeToolCall
   extends ToolCallBase<"exit_plan_mode", { plan?: string; summary?: string }> { }

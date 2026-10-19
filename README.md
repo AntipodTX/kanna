@@ -8,6 +8,8 @@
 
 ### Fixes
 
+- Show Codex asynchronous questions as interactive choice cards, with custom answers and retryable submission. Cards remain answerable after the turn ends; replies use native same-turn delivery while Codex is working and survive transcript reloads without duplicate sends.
+- Support reliable native Codex same-turn steering across the chat lifecycle.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />

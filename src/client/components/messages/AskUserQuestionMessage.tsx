@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useRef, useState } from "react"
 import { Check, ChevronLeft, MessageCircleQuestion } from "lucide-react"
 import type { ProcessedToolCall, AskUserQuestionItem, AskUserQuestionOption } from "./types"
 import type { AskUserQuestionAnswerMap } from "../../../shared/types"
@@ -8,7 +8,7 @@ import { useTranscriptRenderOptions } from "./render-context"
 
 interface Props {
   message: Extract<ProcessedToolCall, { toolKind: "ask_user_question" }>
-  onSubmit: (toolUseId: string, questions: AskUserQuestionItem[], answers: AskUserQuestionAnswerMap) => void
+  onSubmit: (toolUseId: string, questions: AskUserQuestionItem[], answers: AskUserQuestionAnswerMap) => void | Promise<void>
   isLatest: boolean
 }
 
@@ -149,9 +149,14 @@ function getQuestionKey(question: AskUserQuestionItem): string {
 
 export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
   const renderOptions = useTranscriptRenderOptions()
-  const questions = message.input.questions
-  const isComplete = !!message.result
+  const allQuestions = message.input.questions
   const savedAnswers = parseAnswersFromResult(message.result)
+  const questions = message.input.codexAsync
+    ? allQuestions.filter(question => !savedAnswers?.[getQuestionKey(question)]?.length)
+    : allQuestions
+  const isComplete = message.input.codexAsync
+    ? questions.length === 0
+    : !!message.result
   const isDiscarded = message.result?.discarded === true
 
   const [currentIndex, setCurrentIndex] = useState(0)
@@ -159,6 +164,9 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
   const [customInputs, setCustomInputs] = useState<Record<string, string>>({})
   const [submittedAnswers, setSubmittedAnswers] = useState<AskUserQuestionAnswerMap | null>(savedAnswers ?? null)
   const [isSubmitted, setIsSubmitted] = useState(isComplete)
+  const submitting = useRef(false)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [submitError, setSubmitError] = useState<string | null>(null)
 
   const getEffectiveAnswers = (questionKey: string, question?: AskUserQuestionItem) => {
     const rawCustom = customInputs[questionKey]
@@ -172,7 +180,7 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
         .flatMap((value) => value.split(", ").filter(Boolean))
     }
 
-    const value = custom || selectedAnswer
+    const value = custom || selectedAnswer || savedAnswers?.[questionKey]?.[0]
     return value ? [value] : []
   }
 
@@ -218,8 +226,9 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
   }
 
   const allQuestionsAnswered = questions.every((question) => getEffectiveAnswers(getQuestionKey(question), question).length > 0)
-  const currentQuestion = questions[currentIndex]
-  const isLastQuestion = currentIndex === questions.length - 1
+  const effectiveIndex = Math.min(currentIndex, Math.max(0, questions.length - 1))
+  const currentQuestion = questions[effectiveIndex]
+  const isLastQuestion = effectiveIndex === questions.length - 1
   const currentHasAnswer = currentQuestion
     && getEffectiveAnswers(getQuestionKey(currentQuestion), currentQuestion).length > 0
 
@@ -235,17 +244,27 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
     }
   }
 
-  const handleSubmit = () => {
-    if (!allQuestionsAnswered) return
+  const handleSubmit = async () => {
+    if (!allQuestionsAnswered || submitting.current || isSubmitted || isComplete) return
 
     const finalAnswers: AskUserQuestionAnswerMap = {}
     for (const q of questions) {
       const key = getQuestionKey(q)
       finalAnswers[key] = getEffectiveAnswers(key, q)
     }
-    setSubmittedAnswers(finalAnswers)
-    setIsSubmitted(true)
-    onSubmit(message.toolId, questions, finalAnswers)
+    submitting.current = true
+    setIsSubmitting(true)
+    setSubmitError(null)
+    try {
+      await onSubmit(message.toolId, questions, finalAnswers)
+      setSubmittedAnswers({ ...savedAnswers, ...finalAnswers })
+      setIsSubmitted(true)
+    } catch (error) {
+      setSubmitError(error instanceof Error ? error.message : String(error))
+    } finally {
+      submitting.current = false
+      setIsSubmitting(false)
+    }
   }
 
   const handleCustomInputEnter = (event: React.KeyboardEvent<HTMLInputElement>) => {
@@ -264,18 +283,18 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
 
   // Completed state
   if (isSubmitted || isComplete) {
-    const displayAnswers = savedAnswers || submittedAnswers || {}
+    const displayAnswers = { ...submittedAnswers, ...savedAnswers }
 
     return (
       <div className="w-full">
         <div className="rounded-2xl border border-border overflow-hidden">
           <div className="font-medium text-sm p-3 px-4 pr-5 bg-muted  border-b border-border flex flex-row items-center justify-between">
-            <p>Question{questions.length !== 1 ? "s" : ""}</p>
+            <p>Question{allQuestions.length !== 1 ? "s" : ""}</p>
             <p className="">{isDiscarded ? "Discarded" : "Answers"}</p>
           </div>
-          {questions.map((question, index) => {
+          {allQuestions.map((question, index) => {
             const answerValue = displayAnswers[getQuestionKey(question)] || displayAnswers[question.question] || []
-            const isLast = index === questions.length - 1
+            const isLast = index === allQuestions.length - 1
 
             return (
               <div
@@ -328,7 +347,7 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
   }
 
   // Pending state (not latest)
-  if (!isLatest) {
+  if (!isLatest && !message.input.codexAsync) {
     return (
       <div className="w-full py-2">
         <div className="flex items-center gap-2">
@@ -346,10 +365,10 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
   const customInput = customInputs[getQuestionKey(currentQuestion)] || ""
 
   return (
-    <div className="w-full space-y-3">
+    <div className="w-full flex flex-col gap-3">
       <QuestionCard
         question={currentQuestion.question}
-        currentIndex={currentIndex}
+        currentIndex={effectiveIndex}
         totalQuestions={questions.length}
         onBack={currentIndex > 0 ? handleBack : undefined}
       >
@@ -394,13 +413,14 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
           <Button
             size="sm"
             onClick={handleSubmit}
-            disabled={!allQuestionsAnswered}
+            disabled={!allQuestionsAnswered || isSubmitting}
             className={cn(!allQuestionsAnswered && "opacity-50 cursor-not-allowed", "rounded-full")}
           >
-            Submit
+            {isSubmitting ? "Sending…" : "Submit"}
           </Button>
         )}
       </div>
+      {submitError && <p role="alert" className="text-sm text-destructive">{submitError}</p>}
     </div>
   )
 }

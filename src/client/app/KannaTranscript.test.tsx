@@ -4,12 +4,7 @@ import { CollapsedToolGroup } from "../components/messages/CollapsedToolGroup"
 import { OpenLocalLinkProvider } from "../components/messages/shared"
 import { formatPromptTimestamp } from "../components/messages/ResultMessage"
 import type { HydratedTranscriptMessage } from "../../shared/types"
-import {
-  buildResolvedTranscriptRows,
-  computeStableResolvedTranscriptRows,
-  KannaTranscriptRow,
-  type StableResolvedTranscriptRowsState,
-} from "./KannaTranscript"
+import { buildResolvedTranscriptRows, computeStableResolvedTranscriptRows, KannaTranscriptRow, type StableResolvedTranscriptRowsState } from "./KannaTranscript"
 
 const ROW_WRAPPER_CLASS = "mx-auto max-w-[800px] pb-5"
 
@@ -1035,5 +1030,35 @@ Please check the latest error first.`,
     const stableState = computeStableResolvedTranscriptRows(nextRows, previousState)
 
     expect(stableState.result[0]).toBe(previousRows[0])
+  })
+
+
+  test("keeps older async question cards interactive after the turn ends", () => {
+    const html = renderTranscript([
+      { id: "q1", kind: "tool", toolKind: "ask_user_question", toolName: "AskUserQuestion", toolId: "q1",
+        input: { codexAsync: { threadId: "thread" }, questions: [{ id: "q", question: "Cleanup?", options: [{ label: "All" }, { label: "Empty" }] }] },
+        timestamp: new Date().toISOString() },
+      { id: "r", kind: "result", success: true, result: "Done", durationMs: 1, timestamp: new Date().toISOString() },
+    ])
+    expect(html).toContain("Cleanup?")
+    expect(html).toContain("Submit")
+    expect(html).not.toContain("newer question active")
+  })
+
+
+  test("renders native async replies as readable answers, not their transport envelope", () => {
+    const html = renderTranscript([{ id: "a", kind: "user_prompt", content: '<send_user_message_question_reply>{"questionItemId":"q","question":"Cleanup?","answer":"All"}</send_user_message_question_reply>', timestamp: new Date().toISOString() }])
+    expect(html).toContain("Cleanup?")
+    expect(html).toContain("All")
+    expect(html).not.toContain("questionItemId")
+  })
+
+
+  test("a partially answered async group opens its remaining question", () => {
+    const html = renderTranscript([{ id: "q1", kind: "tool", toolKind: "ask_user_question", toolName: "AskUserQuestion", toolId: "q1",
+      input: { codexAsync: { threadId: "thread" }, questions: [{ id: "a", question: "Already answered?" }, { id: "b", question: "Still open?" }] },
+      result: { answers: { a: ["Yes"] } }, timestamp: new Date().toISOString() }])
+    expect(html).toContain('aria-label="Still open?"')
+    expect(html).not.toContain('aria-label="Already answered?"')
   })
 })
