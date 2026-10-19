@@ -7,6 +7,7 @@
 
 ### Fixes
 
+- Preserve chat history when local storage is corrupt.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
