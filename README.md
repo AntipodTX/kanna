@@ -9,6 +9,7 @@
 
 ### Fixes
 
+- Emit Codex system initialization only once per session.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
