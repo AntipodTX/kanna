@@ -166,7 +166,6 @@ function createWorld(options?: { projectPath?: string }) {
     setSidebarProjectOrder: async (projectIds: string[]) => {
       sidebarProjectOrder = [...projectIds]
     },
-    pruneStaleEmptyChats: async () => [],
     getProject: (projectId: string) => {
       const project = state.projectsById.get(projectId)
       // Mirrors EventStore.getProject: tombstoned projects read as absent.

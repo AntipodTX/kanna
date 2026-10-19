@@ -324,7 +324,6 @@ function createFakeStore(overrides: Record<string, unknown> = {}) {
   return {
     state: createEmptyState(),
     getSidebarProjectOrder: () => [],
-    pruneStaleEmptyChats: async () => [],
     // Whole transcript by default; the window tests override these.
     getInitialTranscriptWindowStart: () => 0,
     getEntryIdAt: () => null,
@@ -1929,143 +1928,9 @@ describe("ws-router", () => {
     })
   })
 
-  test("prunes stale empty chats during explicit maintenance runs", async () => {
-    const state = createEmptyState()
-    state.projectsById.set("project-1", {
-      id: "project-1",
-      localPath: "/tmp/project",
-      title: "Project",
-      createdAt: 1,
-      updatedAt: 1,
-    })
-    state.projectIdsByPath.set("/tmp/project", "project-1")
-    state.chatsById.set("chat-stale", {
-      id: "chat-stale",
-      projectId: "project-1",
-      title: "New Chat",
-      createdAt: 1,
-      updatedAt: 1,
-      unread: false,
-      provider: null,
-      planMode: false,
-      autoPlan: false,
-      sessionToken: null,
-      lastTurnOutcome: null,
-    })
+  
 
-    let pruneCalls = 0
-    const router = createTestRouter({
-      store: createFakeStore({
-        state,
-        async pruneStaleEmptyChats() {
-          pruneCalls += 1
-          state.chatsById.delete("chat-stale")
-          return ["chat-stale"]
-        },
-      }),
-    })
-    const ws = new FakeWebSocket()
-
-    await router.pruneStaleEmptyChats()
-    await router.handleMessage(
-      ws as never,
-      JSON.stringify({
-        v: 1,
-        type: "subscribe",
-        id: "sidebar-sub-1",
-        topic: { type: "sidebar" },
-      })
-    )
-
-    expect(pruneCalls).toBe(1)
-    expect(ws.sent[0]).toEqual({
-      v: PROTOCOL_VERSION,
-      type: "snapshot",
-      id: "sidebar-sub-1",
-      snapshot: {
-        type: "sidebar",
-        data: {
-          projectGroups: [{
-            ...withSidebarGroupDefaults({
-              groupKey: "project-1",
-              title: "Project",
-              localPath: "/tmp/project",
-              chats: [],
-            }),
-          }],
-        },
-      },
-    })
-  })
-
-  test("protects draft-bearing chats during explicit maintenance runs", async () => {
-    const state = createEmptyState()
-    state.projectsById.set("project-1", {
-      id: "project-1",
-      localPath: "/tmp/project",
-      title: "Project",
-      createdAt: 1,
-      updatedAt: 1,
-    })
-    state.projectIdsByPath.set("/tmp/project", "project-1")
-    state.chatsById.set("chat-stale", {
-      id: "chat-stale",
-      projectId: "project-1",
-      title: "New Chat",
-      createdAt: 1,
-      updatedAt: 1,
-      unread: false,
-      provider: null,
-      planMode: false,
-      autoPlan: false,
-      sessionToken: null,
-      lastTurnOutcome: null,
-    })
-
-    let capturedProtectedChatIds: string[] = []
-    const router = createTestRouter({
-      store: createFakeStore({
-        state,
-        async pruneStaleEmptyChats(args?: { protectedChatIds?: Iterable<string> }) {
-          capturedProtectedChatIds = [...(args?.protectedChatIds ?? [])]
-          return []
-        },
-      }),
-    })
-    const ws = new FakeWebSocket()
-    router.handleOpen(ws as never)
-
-    await router.handleMessage(
-      ws as never,
-      JSON.stringify({
-        v: 1,
-        type: "command",
-        id: "draft-protection-1",
-        command: {
-          type: "chat.setDraftProtection",
-          chatIds: ["chat-stale"],
-        },
-      })
-    )
-
-    await router.pruneStaleEmptyChats()
-    await router.handleMessage(
-      ws as never,
-      JSON.stringify({
-        v: 1,
-        type: "subscribe",
-        id: "sidebar-sub-1",
-        topic: { type: "sidebar" },
-      })
-    )
-
-    expect(capturedProtectedChatIds).toEqual(["chat-stale"])
-    expect(ws.sent[0]).toEqual({
-      v: PROTOCOL_VERSION,
-      type: "ack",
-      id: "draft-protection-1",
-    })
-  })
+  
 
   test("broadcasts background title-generation errors to connected clients", () => {
     let reportBackgroundError: ((message: string) => void) | null | undefined
@@ -2485,6 +2350,36 @@ describe("ws-router", () => {
     })
 
     router.dispose()
+  })
+
+
+  test("keeps an old empty chat when a sidebar subscribes or reconnects", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "kanna-retain-draft-"))
+    const store = new EventStore(dataDir)
+    await store.initialize()
+    const project = await store.openProject(path.join(dataDir, "project"))
+    const chat = await store.createChat(project.id)
+    store.requireChat(chat.id).createdAt = Date.now() - 10 * 60 * 1000
+    const router = createTestRouter({ store })
+    try {
+      for (let connection = 0; connection < 2; connection++) {
+        const ws = new FakeWebSocket()
+        router.handleOpen(ws as never)
+        await router.handleMessage(ws as never, JSON.stringify({
+          v: 1, type: "subscribe", id: "sidebar", topic: { type: "sidebar" },
+        }))
+        expect(store.getChat(chat.id)?.id).toBe(chat.id)
+        expect(store.getChat(chat.id)?.archivedAt).toBeUndefined()
+        expect(JSON.stringify(ws.sent)).toContain(chat.id)
+        await router.handleMessage(ws as never, JSON.stringify({
+          v: 1, type: "command", id: "drafts", command: { type: "chat.setDraftProtection", chatIds: [] },
+        }))
+        router.handleClose(ws as never)
+      }
+    } finally {
+      router.dispose()
+      await rm(dataDir, { recursive: true, force: true })
+    }
   })
 })
 

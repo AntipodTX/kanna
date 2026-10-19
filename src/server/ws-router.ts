@@ -88,7 +88,6 @@ export interface ClientState {
   chatProvidersSent?: Map<string, string>
   chatFollowing?: Map<string, boolean>
   chatWindowChecks?: Map<string, number>
-  protectedDraftChatIds?: Set<string>
   /**
    * The sidebar snapshot each patch subscription last received, which the
    * next patch is diffed against. Absent means the next push is a reset.
@@ -259,61 +258,6 @@ export function createWsRouter({
   const pendingBroadcastChatIds = new Set<string>()
   const resolvedAnalytics = analytics ?? NoopAnalyticsReporter
 
-  function getProtectedChatIds() {
-    const activeStatuses = agent.getActiveStatuses()
-    const drainingChatIds = typeof agent.getDrainingChatIds === "function"
-      ? agent.getDrainingChatIds()
-      : new Set<string>()
-    return new Set([
-      ...activeStatuses.keys(),
-      ...drainingChatIds.values(),
-    ])
-  }
-
-  function getProtectedDraftChatIds(extraSockets?: Iterable<ServerWebSocket<ClientState>>) {
-    const protectedChatIds = new Set<string>()
-
-    for (const socket of sockets) {
-      for (const chatId of socket.data.protectedDraftChatIds ?? []) {
-        protectedChatIds.add(chatId)
-      }
-    }
-
-    for (const socket of extraSockets ?? []) {
-      for (const chatId of socket.data.protectedDraftChatIds ?? []) {
-        protectedChatIds.add(chatId)
-      }
-    }
-
-    return protectedChatIds
-  }
-
-  async function maybePruneStaleEmptyChats(extraSockets?: Iterable<ServerWebSocket<ClientState>>) {
-    const activeChatIds = getProtectedChatIds()
-    const protectedDraftChatIds = getProtectedDraftChatIds(extraSockets)
-    return await store.pruneStaleEmptyChats({
-      activeChatIds,
-      protectedChatIds: protectedDraftChatIds,
-    })
-  }
-
-  async function maybeAutoArchiveStaleChats(extraSockets?: Iterable<ServerWebSocket<ClientState>>) {
-    const activeChatIds = getProtectedChatIds()
-    const protectedDraftChatIds = getProtectedDraftChatIds(extraSockets)
-    return await store.autoArchiveStaleChats({
-      activeChatIds,
-      protectedChatIds: protectedDraftChatIds,
-    })
-  }
-
-  async function maybeDeleteStaleChats(extraSockets?: Iterable<ServerWebSocket<ClientState>>) {
-    const activeChatIds = getProtectedChatIds()
-    const protectedDraftChatIds = getProtectedDraftChatIds(extraSockets)
-    return await store.deleteStaleChats({
-      activeChatIds,
-      protectedChatIds: protectedDraftChatIds,
-    })
-  }
 
   function shouldIncludeTopic(topic: SubscriptionTopic, filter?: SnapshotBroadcastFilter) {
     if (!filter) {
@@ -789,7 +733,7 @@ export function createWsRouter({
     if (topic.type !== "chat") return
     const span = topic.cachedSpan
     if (!span || span.end <= 0 || span.start < 0 || span.start > span.end) return
-    // A client can hold a cache for a chat this machine has since pruned.
+    // A client can hold a cache for a chat that has since been deleted.
     // Reading it would throw, and this runs outside the command try/catch on a
     // handler nobody awaits — so an unhandled rejection rather than the empty
     // snapshot the client is meant to get.
@@ -830,7 +774,7 @@ export function createWsRouter({
     entry.timer = setTimeout(() => {
       entry.timer = null
       if (pushes.get(subscriptionId) !== entry || !ws.data.subscriptions.has(subscriptionId)) return
-      void pushSnapshots(ws, { skipPrune: true, onlySubscriptionId: subscriptionId })
+      void pushSnapshots(ws, { onlySubscriptionId: subscriptionId })
     }, wait)
     return false
   }
@@ -844,16 +788,12 @@ export function createWsRouter({
   async function pushSnapshots(
     ws: ServerWebSocket<ClientState>,
     options?: {
-      skipPrune?: boolean
       filter?: SnapshotBroadcastFilter
       cache?: SnapshotComputationCache
       /** Answer exactly one subscription — see the `subscribe` handler. */
       onlySubscriptionId?: string
     }
   ) {
-    if (!options?.skipPrune) {
-      await maybePruneStaleEmptyChats([ws])
-    }
     const snapshotSignatures = ensureSnapshotSignatures(ws)
     for (const [id, topic] of ws.data.subscriptions.entries()) {
       if (options?.onlySubscriptionId !== undefined && id !== options.onlySubscriptionId) {
@@ -970,14 +910,14 @@ export function createWsRouter({
   async function broadcastSnapshots() {
     const cache: SnapshotComputationCache = {}
     for (const ws of sockets) {
-      await pushSnapshots(ws, { skipPrune: true, cache })
+      await pushSnapshots(ws, { cache })
     }
   }
 
   async function broadcastFilteredSnapshots(filter: SnapshotBroadcastFilter) {
     const cache: SnapshotComputationCache = {}
     for (const ws of sockets) {
-      await pushSnapshots(ws, { skipPrune: true, filter, cache })
+      await pushSnapshots(ws, { filter, cache })
     }
   }
 
@@ -1795,14 +1735,14 @@ export function createWsRouter({
             setChatWindowStart(ws, subscriptionId, command.chatId, next)
             ws.data.chatFollowing?.set(subscriptionId, false)
             startIndex = next
-            await pushSnapshots(ws, { skipPrune: true, onlySubscriptionId: subscriptionId })
+            await pushSnapshots(ws, { onlySubscriptionId: subscriptionId })
           }
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result: { startIndex } })
           return
         }
         case "chat.setDraftProtection": {
-          // Only adjusts this socket's prune protection — no snapshot changes.
-          ws.data.protectedDraftChatIds = new Set(command.chatIds)
+          // Compatibility with clients that still report draft protection.
+          // All chats are retained, regardless of connected clients or drafts.
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id })
           return
         }
@@ -2109,16 +2049,13 @@ export function createWsRouter({
     broadcastSnapshots,
     broadcastChatStateImmediately,
     broadcastSidebar: () => {
-      // Called by the worktree probe and the prune sweep, whose inputs the
+      // Called by the worktree probe, whose inputs the
       // store version does not see; the bump invalidates the sidebar memo.
       sidebarInputsVersion += 1
       return broadcastFilteredSnapshots({ includeSidebar: true })
     },
     scheduleBroadcast,
     scheduleChatStateBroadcast,
-    pruneStaleEmptyChats: () => maybePruneStaleEmptyChats(),
-    autoArchiveStaleChats: () => maybeAutoArchiveStaleChats(),
-    deleteStaleChats: () => maybeDeleteStaleChats(),
     async handleMessage(ws: ServerWebSocket<ClientState>, raw: string | Buffer | ArrayBuffer | Uint8Array) {
       let parsed: unknown
       try {
@@ -2160,7 +2097,7 @@ export function createWsRouter({
         if (parsed.topic.type === "local-projects") {
           void refreshDiscovery().then(() => {
             if (ws.data.subscriptions.has(parsed.id)) {
-              void pushSnapshots(ws, { skipPrune: true, onlySubscriptionId: parsed.id })
+              void pushSnapshots(ws, { onlySubscriptionId: parsed.id })
             }
           })
           return
@@ -2170,7 +2107,7 @@ export function createWsRouter({
         // derive and re-serialization — and the sidebar is iterated first,
         // because the new subscription is appended last. Nothing else asked for
         // an update, and anything that changes meanwhile is broadcast anyway.
-        await pushSnapshots(ws, { skipPrune: true, onlySubscriptionId: parsed.id })
+        await pushSnapshots(ws, { onlySubscriptionId: parsed.id })
         // Kick a fresh usage read on subscribe so the page opens accurate;
         // the onChange fanout delivers the result to all subscribers.
         if (parsed.topic.type === "usage-limits" && usageLimits) {
