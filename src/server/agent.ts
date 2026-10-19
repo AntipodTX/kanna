@@ -1392,17 +1392,17 @@ export class AgentCoordinator {
       active.customTools?.abort()
       this.activeTurns.delete(chatId)
     }
+    for (const chatId of [...this.idleSessionTimers.keys()]) {
+      this.clearIdleSessionTimer(chatId)
+    }
     for (const session of this.claudeSessions.values()) {
       session.forceClosed = true
       session.releasePublication()
       session.session.close()
     }
     this.claudeSessions.clear()
-    for (const stream of this.drainingStreams.values()) stream.turn.close()
     this.claudeSessions.clear()
-    for (const chatId of [...this.idleSessionTimers.keys()]) {
-      this.clearIdleSessionTimer(chatId)
-    }
+    for (const stream of this.drainingStreams.values()) stream.turn.close()
     this.drainingStreams.clear()
     this.codexManager.stopAll()
     this.piManager.dispose()
@@ -1735,8 +1735,8 @@ export class AgentCoordinator {
       claudeSession.releasePublication()
       claudeSession.session.close()
     }
-    this.piManager.closeChat(chatId)
     this.codexManager.stopSession(chatId)
+    this.piManager.closeChat(chatId)
     this.emitStateChange(chatId)
   }
 
@@ -2034,12 +2034,16 @@ export class AgentCoordinator {
     if (this.startingClaudeTurns.has(chatId)) throw new Error("Chat is already starting")
     const reservation = Symbol(chatId)
     this.startingClaudeTurns.set(chatId, reservation)
+    this.clearIdleSessionTimer(chatId)
     try {
       const pendingCommit = this.claudeReadinessCommits.get(chatId)
       if (pendingCommit) await pendingCommit
       return await start(reservation)
     } finally {
-      if (this.startingClaudeTurns.get(chatId) === reservation) this.startingClaudeTurns.delete(chatId)
+      if (this.startingClaudeTurns.get(chatId) === reservation) {
+        this.startingClaudeTurns.delete(chatId)
+        this.scheduleIdleSessionClose(chatId)
+      }
     }
   }
 
@@ -2082,12 +2086,12 @@ export class AgentCoordinator {
   }
 
   private async startReservedTurnForChat(args: Parameters<AgentCoordinator["startTurnForChat"]>[0]) {
-    this.clearIdleSessionTimer(args.chatId)
     const pendingCommit = this.claudeReadinessCommits.get(args.chatId)
     if (pendingCommit) await pendingCommit
     if (args.startupReservation && this.startingClaudeTurns.get(args.chatId) !== args.startupReservation) return
     const chat = this.store.requireChat(args.chatId)
     if (this.activeTurns.has(args.chatId)) throw new Error("Chat is already running")
+    this.clearIdleSessionTimer(args.chatId)
     const draining = this.drainingStreams.get(args.chatId)
     if (draining) {
       draining.turn.close()
@@ -2569,6 +2573,7 @@ export class AgentCoordinator {
           this.emitStateChange(args.chatId)
         }
         await stopStaleStartup()
+        this.scheduleIdleSessionClose(args.chatId)
       }
       if (!stillCurrent || error === staleStartup) return
       throw error
@@ -2613,7 +2618,6 @@ export class AgentCoordinator {
     ) {
       if (session) {
         session.forceClosed = true
-        session.session.close()
         this.claudeSessions.delete(args.chatId)
         session.releasePublication()
         session.session.close()
@@ -2717,7 +2721,10 @@ export class AgentCoordinator {
       if (!createdSession || session.nextPromptSeq !== 0 || retiredUnsentSession) return
       retiredUnsentSession = true
       session.forceClosed = true
-      if (this.claudeSessions.get(args.chatId) === session) this.claudeSessions.delete(args.chatId)
+      if (this.claudeSessions.get(args.chatId) === session) {
+        this.claudeSessions.delete(args.chatId)
+        this.clearIdleSessionTimer(args.chatId)
+      }
       session.releasePublication()
       session.session.close()
     }
@@ -3319,10 +3326,10 @@ export class AgentCoordinator {
         attachments = plan.attachments
         sessionToken = await this.prepareCodexHistoryPlan(command.chatId, command.messageId, plan, project.localPath, settings)
         this.assertHistoryOperation(command.chatId)
-        pendingForkSessionToken = null
-        stopCodexSessionOnStartFailure = true
+        pendingForkSessionToken=null
+        stopCodexSessionOnStartFailure=true
         const prepared = sessionToken
-        onProviderReady = async (isCurrentTurn, outcome) => {
+        onProviderReady=async(isCurrentTurn,outcome)=> {
           if (!isCurrentTurn() || outcome.kind === "fresh") return
           this.assertHistoryOperation(command.chatId)
           if (!isCurrentTurn()) return
@@ -3330,10 +3337,9 @@ export class AgentCoordinator {
           this.assertHistoryOperation(command.chatId)
           if (!isCurrentTurn()) return
           const retained: Record<string, CodexPromptBinding> = {}
-          for (const entry of prefix) if (bindings[entry._id]) {
+          for(const entry of prefix) if(bindings[entry._id]) {
             const binding = bindings[entry._id]!
-            retained[entry._id] = { ...binding,
-              sessionToken: binding.sessionToken === plan.sessionToken ? prepared! : binding.sessionToken }
+            retained[entry._id]={...binding,sessionToken:binding.sessionToken===plan.sessionToken?prepared!:binding.sessionToken}
           }
           await this.codexPromptHistory.remember(command.chatId, retained)
           await this.retainCodexClassification(command.chatId, chat.codexHistoryIntegrity,
@@ -4073,23 +4079,27 @@ export class AgentCoordinator {
           : completedPromptSeqs.includes(active.claudePromptSeq)
         if (event.entry.kind === "result" && active && completesActive) {
           active.hasFinalResult = true
-          if (event.entry.isError) {
-            await this.restoreClaudeSessionTokenAfterFailedTurn(session, active)
-            session.forceClosed = true
-            session.session.close()
-            this.claudeSessions.delete(session.chatId)
-            await this.store.recordTurnFailed(session.chatId, event.entry.result || "Turn failed")
-          } else if (!active.cancelRequested) {
-            if (active.contextRestorationId && this.activeTurns.get(session.chatId) === active) {
+          active.customTools?.abort()
+          if (!active.cancelRequested) {
+            if (event.entry.isError) {
+              await this.restoreClaudeSessionTokenAfterFailedTurn(session, active)
+              session.forceClosed = true
+              session.session.close()
+              this.claudeSessions.delete(session.chatId)
+              await this.store.recordTurnFailed(session.chatId, event.entry.result || "Turn failed")
+            } else {
+              if (active.contextRestorationId && this.activeTurns.get(session.chatId) === active) {
                 await this.store.acknowledgeContextRestoration(session.chatId, active.contextRestorationId)
               }
-            if (!active.cancelRequested && this.activeTurns.get(session.chatId) === active) await this.store.recordTurnFinished(session.chatId)
-          }
-          active.customTools?.abort()
-          this.activeTurns.delete(session.chatId)
-          this.scheduleIdleSessionClose(session.chatId)
-          if (!active.cancelRequested) {
-            await this.maybeStartNextQueuedMessage(session.chatId)
+              if (!active.cancelRequested && this.activeTurns.get(session.chatId) === active) await this.store.recordTurnFinished(session.chatId)
+            }
+            if (this.activeTurns.get(session.chatId) === active) {
+              this.activeTurns.delete(session.chatId)
+              this.scheduleIdleSessionClose(session.chatId)
+              await this.maybeStartNextQueuedMessage(session.chatId)
+            }
+          } else if (this.activeTurns.get(session.chatId) === active) {
+            this.activeTurns.delete(session.chatId)
           }
         }
 
