@@ -2898,25 +2898,44 @@ export class AgentCoordinator {
 
         if (!event.entry || customToolEvents.skip(event.entry)) continue
 
-        const completedPromptSeqs = event.entry.kind === "result" || event.entry.kind === "interrupted"
-          ? this.takeAnsweredClaudePrompts(session, event.promptIds, event.entry.kind === "interrupted" || event.entry.isError)
+        const terminalOwner = this.activeTurns.get(session.chatId)
+        const isTerminalEntry = event.entry.kind === "result" || event.entry.kind === "interrupted"
+        const completedPromptSeqs = isTerminalEntry
+          ? this.takeAnsweredClaudePrompts(session, event.promptIds, event.entry.kind === "interrupted" || (event.entry.kind === "result" && event.entry.isError))
           : []
-
-        // After an escape/cancel or steer, the SDK ends the cancelled turn
-        // with a result of subtype error_during_execution (is_error, usually
-        // no text). The cancel already appended an "interrupted" entry, so
-        // persisting this would render a spurious "An unknown error
-        // occurred." in the UI. Attribute the result to the prompts it
-        // answers rather than relying on suppressResume, which a steered
-        // follow-up prompt clears before the interrupt error lands.
-        const isCancelledPromptErrorResult =
-          event.entry.kind === "result"
-          && event.entry.isError
-          && completedPromptSeqs.length > 0
+        // UUIDs may answer several prompts, including an interrupted prompt
+        // and the steered follow-up. Keep that result when it answers the
+        // current turn; drop terminals that only belong to cancelled/stale turns.
+        const onlyCancelledPrompts = completedPromptSeqs.length > 0
           && completedPromptSeqs.every((seq) => session.cancelledPromptSeqs.has(seq))
-        if (!isCancelledPromptErrorResult) {
+        const isCancelSettlingErrorResult =
+          session.suppressResume && event.entry.kind === "result" && event.entry.isError
+        const shouldAppendEntry = !isTerminalEntry
+          || (
+            !isCancelSettlingErrorResult
+            && !onlyCancelledPrompts
+            && (
+              completedPromptSeqs.length === 0
+              || (
+                terminalOwner !== undefined
+                && terminalOwner.claudePromptSeq !== undefined
+                && completedPromptSeqs.includes(terminalOwner.claudePromptSeq)
+                && !terminalOwner.cancelRequested
+              )
+            )
+          )
+        if (shouldAppendEntry) {
           await this.store.appendMessage(session.chatId, event.entry)
-        if (!isCurrentClaudeSession()) break
+        } else {
+          logClaudeSteer("claude_stale_terminal_event_suppressed", {
+            chatId: session.chatId,
+            sessionId: session.id,
+            entryKind: event.entry.kind,
+            activePromptSeq: terminalOwner?.claudePromptSeq ?? null,
+            activeCancelRequested: terminalOwner?.cancelRequested ?? null,
+            completedPromptSeqs,
+            pendingPromptSeqs: session.pendingPrompts.map((prompt) => prompt.seq),
+          })
         }
 
         if (!isCurrentClaudeSession()) break
@@ -2980,16 +2999,20 @@ export class AgentCoordinator {
           : completedPromptSeqs.includes(active.claudePromptSeq)
         if (event.entry.kind === "result" && active?.provider === "claude" && completesActive) {
           active.hasFinalResult = true
-          if (event.entry.isError) {
-            await this.store.recordTurnFailed(session.chatId, event.entry.result || "Turn failed")
-          } else if (!active.cancelRequested) {
-            await this.store.recordTurnFinished(session.chatId)
-          }
           active.customTools?.abort()
-          if (this.activeTurns.get(session.chatId) === active && isCurrentClaudeSession()) {
+          if (!active.cancelRequested) {
+            if (event.entry.isError) {
+              await this.store.recordTurnFailed(session.chatId, event.entry.result || "Turn failed")
+            } else {
+              await this.store.recordTurnFinished(session.chatId)
+            }
+            if (this.activeTurns.get(session.chatId) === active) {
+              this.activeTurns.delete(session.chatId)
+              this.scheduleIdleSessionClose(session.chatId)
+              await this.maybeStartNextQueuedMessage(session.chatId)
+            }
+          } else if (this.activeTurns.get(session.chatId) === active) {
             this.activeTurns.delete(session.chatId)
-            this.scheduleIdleSessionClose(session.chatId)
-            if (!active.cancelRequested) await this.maybeStartNextQueuedMessage(session.chatId)
           }
         }
 

@@ -15,6 +15,7 @@
 
 ### Fixes
 
+- Suppress stale Claude terminal results after steering.
 - Correct Claude chat lifecycle state after agent activity.
 - Preserve Claude plan transcript adjustments during rendering.
 

@@ -2966,6 +2966,229 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
       coordinator.dispose()
     }
   })
+
+
+  test("Claude cancel settles a late result before interrupted persistence finishes", async () => {
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    let failedTurns = 0
+    store.recordTurnFailed = async () => {
+      failedTurns += 1
+    }
+    const appendMessage = store.appendMessage.bind(store)
+    let resolveInterruptedAppendStarted: (() => void) | null = null
+    const interruptedAppendStarted = new Promise<void>((resolve) => {
+      resolveInterruptedAppendStarted = resolve
+    })
+    let releaseInterruptedAppend!: () => void
+    const interruptedAppendRelease = new Promise<void>((resolve) => {
+      releaseInterruptedAppend = resolve
+    })
+
+    store.appendMessage = async (chatId: string, entry: TranscriptEntry) => {
+      await appendMessage(chatId, entry)
+      if (entry.kind !== "interrupted") return
+
+      events.push({
+        type: "transcript" as const,
+        entry: timestamped({
+          kind: "result",
+          subtype: "error",
+          isError: true,
+          durationMs: 0,
+          result: "",
+        }),
+      })
+      resolveInterruptedAppendStarted?.()
+      await interruptedAppendRelease
+    }
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => ({
+        provider: "claude",
+        stream: events,
+        getAccountInfo: async () => null,
+        interrupt: async () => {},
+        close: () => {},
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        sendPrompt: async () => {},
+      }),
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "claude",
+      content: "first prompt",
+      model: "claude-opus-4-1",
+    })
+
+    const cancelPromise = coordinator.cancel("chat-1")
+    try {
+      await interruptedAppendStarted
+      await waitFor(() => !coordinator.getActiveStatuses().has("chat-1"))
+    } finally {
+      releaseInterruptedAppend()
+      await cancelPromise
+      events.close()
+    }
+
+    expect(store.messages.filter((entry) => entry.kind === "result")).toHaveLength(0)
+    expect(failedTurns).toBe(0)
+  })
+
+
+  for (const lateKind of ["success", "error", "interrupted"] as const) {
+    for (const currentFirst of [false, true]) {
+      test(`Claude UUID steering suppresses a late cancelled ${lateKind} (${currentFirst ? "current first" : "cancelled first"})`, async () => {
+        const events = new AsyncEventQueue<any>()
+        const store = createFakeStore()
+        const promptIds: string[] = []
+        let closed = false
+        const coordinator = new AgentCoordinator({
+          store: store as never,
+          onStateChange: () => {},
+          startClaudeSession: async () => ({
+            provider: "claude",
+            echoesPromptIds: true,
+            stream: events,
+            interrupt: async () => {},
+            close: () => { closed = true },
+            setModel: async () => {},
+            setPermissionMode: async () => {},
+            sendPrompt: async (_content: string, promptId?: string) => { promptIds.push(promptId!) },
+          }),
+        })
+        await coordinator.send({
+          type: "chat.send", chatId: "chat-1", provider: "claude", content: "first", model: "claude-opus-4-1",
+        })
+        await store.enqueueMessage("chat-1", {
+          id: "queued-1", content: "current", attachments: [], provider: "claude", model: "claude-opus-4-1", planMode: false,
+        })
+        await coordinator.steer({ type: "message.steer", chatId: "chat-1", queuedMessageId: "queued-1" })
+        const late = {
+          type: "transcript" as const,
+          promptIds: [promptIds[0]!],
+          entry: lateKind === "interrupted"
+            ? timestamped({ kind: "interrupted" })
+            : timestamped({ kind: "result", subtype: lateKind, isError: lateKind === "error", durationMs: 0, result: "stale" }),
+        }
+        const current = {
+          type: "transcript" as const,
+          promptIds: [promptIds[1]!],
+          entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "current" }),
+        }
+        for (const event of currentFirst ? [current, late] : [late, current]) events.push(event)
+        events.close()
+        await waitFor(() => closed)
+        expect(store.turnFinishedCount).toBe(1)
+        expect(store.messages.filter((entry) => entry.kind === "result").map((entry) => entry.result)).toEqual(["current"])
+        expect(store.messages.filter((entry) => entry.kind === "interrupted")).toHaveLength(1)
+      })
+    }
+  }
+
+
+  test("Claude result answering cancelled and current UUIDs completes the current prompt", async () => {
+    const events = new AsyncEventQueue<any>()
+    const store = createFakeStore()
+    const promptIds: string[] = []
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      startClaudeSession: async () => ({
+        provider: "claude", echoesPromptIds: true, stream: events,
+        interrupt: async () => {}, close: () => {},
+        setModel: async () => {}, setPermissionMode: async () => {},
+        sendPrompt: async (_content: string, promptId?: string) => { promptIds.push(promptId!) },
+      }),
+    })
+    await coordinator.send({
+      type: "chat.send", chatId: "chat-1", provider: "claude", content: "first", model: "claude-opus-4-1",
+    })
+    await store.enqueueMessage("chat-1", {
+      id: "queued-1", content: "current", attachments: [], provider: "claude", model: "claude-opus-4-1", planMode: false,
+    })
+    await coordinator.steer({ type: "message.steer", chatId: "chat-1", queuedMessageId: "queued-1" })
+    events.push({
+      type: "transcript" as const, promptIds,
+      entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "combined" }),
+    })
+    await waitFor(() => store.turnFinishedCount === 1)
+    expect(store.messages.some((entry) => entry.kind === "result" && entry.result === "combined")).toBe(true)
+    expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+    events.close()
+  })
+
+
+  for (const staleEvent of ["terminal", "stream error"] as const) {
+    test(`Claude replacement ignores the old session's late ${staleEvent}`, async () => {
+      const queues = [new AsyncEventQueue<any>(), new AsyncEventQueue<any>()]
+      const promptIds: string[] = []
+      const closeCounts = [0, 0]
+      let settleOldStream!: () => void
+      const oldStreamSettled = new Promise<void>((resolve) => { settleOldStream = resolve })
+      let starts = 0
+      const store = createFakeStore()
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => {},
+        startClaudeSession: async () => {
+          const index = starts++
+          const queue = queues[index]!
+          return {
+            provider: "claude",
+            echoesPromptIds: true,
+            stream: {
+              async *[Symbol.asyncIterator]() {
+                try {
+                  for await (const event of queue) {
+                    if (event.type === "throw") throw new Error("stale stream failure")
+                    yield event
+                  }
+                } finally {
+                  if (index === 0) settleOldStream()
+                }
+              },
+            },
+            interrupt: async () => {},
+            close: () => { closeCounts[index]! += 1 },
+            setModel: async () => {}, setPermissionMode: async () => {},
+            sendPrompt: async (_content: string, promptId?: string) => { promptIds.push(promptId!) },
+          }
+        },
+      })
+      const send = (autoPlan: boolean) => coordinator.send({
+        type: "chat.send", chatId: "chat-1", provider: "claude", content: "go", model: "claude-opus-4-1", autoPlan,
+      })
+      const result = (index: number, content: string) => ({
+        type: "transcript" as const, promptIds: [promptIds[index]!],
+        entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: content }),
+      })
+      await send(false)
+      queues[0]!.push(result(0, "first"))
+      await waitFor(() => store.turnFinishedCount === 1)
+      await send(true)
+      if (staleEvent === "stream error") {
+        queues[0]!.push({ type: "throw" })
+      } else {
+        queues[0]!.push({ type: "session_token", sessionToken: "stale-token" })
+        queues[0]!.push(result(0, "stale"))
+      }
+      queues[0]!.close()
+      await oldStreamSettled
+      expect(closeCounts[0]).toBe(1)
+      expect(coordinator.getActiveStatuses().get("chat-1")).toBe("running")
+      expect(store.chat.sessionToken).not.toBe("stale-token")
+      expect(store.messages.some((entry) => entry.kind === "result" && entry.result.includes("stale"))).toBe(false)
+      queues[1]!.push(result(1, "current"))
+      await waitFor(() => store.turnFinishedCount === 2)
+      queues[1]!.close()
+    })
+  }
 })
 
 describe("buildConcurrentAgentsNotice", () => {
@@ -3027,7 +3250,7 @@ describe("concurrent agents notice injection", () => {
     await coordinator.send({ type: "chat.send", chatId: "chat-2", provider: "claude", content: "second prompt", model: "claude-opus-4-1" })
 
     expect(prompts).toHaveLength(2)
-    // chat-1 started alone — nothing is appended.
+    // chat-1 started alone — no automatic instructions.
     expect(prompts[0]).toBe("first prompt")
     // chat-2 started while chat-1 was running in the same directory.
     expect(prompts[1]?.startsWith("second prompt")).toBe(true)
@@ -3706,7 +3929,7 @@ function createFakeStore(options?: {
     async recordTurnFinished() {
       this.turnFinishedCount += 1
     },
-    async recordTurnFailed() {
+    async recordTurnFailed(): Promise<void> {
       throw new Error("Did not expect turn failure")
     },
     async recordTurnCancelled() {},
