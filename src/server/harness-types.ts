@@ -15,7 +15,16 @@ export interface HarnessToolRequest {
   validateResult?: (result: unknown) => void
 }
 
+/** Report only verified native continuity; a requested token is not proof. */
+export type HarnessStartupOutcome =
+  | { kind: "reused" | "resumed" | "forked" | "fresh" }
+  | { kind: "unknown"; reason: string }
+
+export type PrepareHarnessContent = (outcome: HarnessStartupOutcome) => Promise<string>
+
 export interface HarnessTurn {
+  startupOutcome?: HarnessStartupOutcome
+  providerTurnId?: string
   provider: AgentProvider
   stream: AsyncIterable<HarnessEvent>
   getAccountInfo?: () => Promise<AccountInfo | null>
