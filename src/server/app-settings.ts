@@ -11,6 +11,7 @@ import {
 } from "../shared/transcript-window"
 import { getDefaultEditorCommandTemplate, isEditorPreset } from "../shared/editor-presets"
 import { formatDisplayPath } from "./paths"
+import { normalizeServerClaudeReasoningEffort } from "./provider-catalog"
 import {
   mergeProviderDefaultsPatch,
   normalizeProviderDefaults,
@@ -309,7 +310,9 @@ function normalizeAppSettings(
       terminal: normalizePaneVisibilityScope(source?.paneVisibility?.terminal),
     },
     defaultProvider: normalizeDefaultProvider(source?.defaultProvider),
-    providerDefaults: normalizeProviderDefaults(source?.providerDefaults),
+    providerDefaults: normalizeProviderDefaults(source?.providerDefaults, {
+      normalizeClaudeReasoningEffort: normalizeServerClaudeReasoningEffort,
+    }),
     newSidebarEnabled,
     ...(source?.projectIconsInChats === false ? { projectIconsInChats: false } : {}),
     ...(source?.chatTabsEnabled === true ? { chatTabsEnabled: true } : {}),
