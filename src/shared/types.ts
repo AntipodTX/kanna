@@ -217,7 +217,7 @@ export interface ProviderModelOption {
    * omitted (no picker).
    */
   contextWindowTokens?: number
-  supportsMaxReasoningEffort?: boolean
+  supportedEffortLevels?: readonly ClaudeReasoningEffort[]
 }
 
 export interface ProviderEffortOption {
@@ -267,7 +267,9 @@ export const CLAUDE_REASONING_OPTIONS = [
   { id: "low", label: "Low" },
   { id: "medium", label: "Medium" },
   { id: "high", label: "High" },
+  { id: "xhigh", label: "XHigh" },
   { id: "max", label: "Max" },
+  { id: "ultracode", label: "Ultracode" },
 ] as const satisfies readonly ProviderEffortOption[]
 
 export const CODEX_REASONING_OPTIONS = [
@@ -306,6 +308,24 @@ export type GrokReasoningEffort = (typeof GROK_REASONING_OPTIONS)[number]["id"]
 export type ClaudeReasoningEffort = (typeof CLAUDE_REASONING_OPTIONS)[number]["id"]
 export type ClaudeContextWindow = "200k" | "1m"
 export type ServiceTier = "fast"
+
+export const CLAUDE_STANDARD_REASONING_EFFORT_LEVELS: readonly ClaudeReasoningEffort[] = [
+  "low",
+  "medium",
+  "high",
+] as const
+
+export const CLAUDE_MAX_REASONING_EFFORT_LEVELS: readonly ClaudeReasoningEffort[] = [
+  ...CLAUDE_STANDARD_REASONING_EFFORT_LEVELS,
+  "max",
+] as const
+
+export const CLAUDE_XHIGH_REASONING_EFFORT_LEVELS: readonly ClaudeReasoningEffort[] = [
+  ...CLAUDE_STANDARD_REASONING_EFFORT_LEVELS,
+  "xhigh",
+  "max",
+  "ultracode",
+] as const
 
 export interface ClaudeModelOptions {
   reasoningEffort: ClaudeReasoningEffort
@@ -615,6 +635,7 @@ export const PROVIDERS: ProviderCatalogEntry[] = [
         id: "fable",
         label: deriveModelLabel("fable"),
         supportsEffort: true,
+        supportedEffortLevels: [...CLAUDE_XHIGH_REASONING_EFFORT_LEVELS],
         // Fable runs a fixed 1M window (no 200k/1m selector). The SDK reports a
         // 2M window for it, so pin the meter to the real 1M ceiling here.
         contextWindowTokens: 1_000_000,
@@ -624,7 +645,7 @@ export const PROVIDERS: ProviderCatalogEntry[] = [
         label: deriveModelLabel("opus"),
         supportsEffort: true,
         contextWindowOptions: [...CLAUDE_CONTEXT_WINDOW_OPTIONS],
-        supportsMaxReasoningEffort: true,
+        supportedEffortLevels: [...CLAUDE_XHIGH_REASONING_EFFORT_LEVELS],
         // Fast mode is available on the Opus family. The SDK confirms this at
         // runtime via supportedModels() (see applyClaudeSdkModels).
         supportsFastMode: true,
@@ -634,11 +655,13 @@ export const PROVIDERS: ProviderCatalogEntry[] = [
         label: deriveModelLabel("sonnet"),
         supportsEffort: true,
         contextWindowOptions: [...CLAUDE_CONTEXT_WINDOW_OPTIONS],
+        supportedEffortLevels: [...CLAUDE_MAX_REASONING_EFFORT_LEVELS],
       },
       {
         id: "haiku",
         label: deriveModelLabel("haiku"),
         supportsEffort: true,
+        supportedEffortLevels: [...CLAUDE_STANDARD_REASONING_EFFORT_LEVELS],
       },
     ],
     efforts: [...CLAUDE_REASONING_OPTIONS],
@@ -911,8 +934,31 @@ export function normalizeCodexReasoningEffort(
   return nearest?.id ?? fallback
 }
 
+export function isClaudeReasoningEffortSupported(
+  model: ProviderModelOption | undefined,
+  effort: ClaudeReasoningEffort,
+): boolean {
+  if (!model?.supportsEffort) return false
+  return (model.supportedEffortLevels ?? CLAUDE_STANDARD_REASONING_EFFORT_LEVELS).includes(effort)
+}
+
+export function normalizeClaudeReasoningEffort(
+  modelId: string,
+  effort?: unknown,
+  models?: readonly ProviderModelOption[],
+): ClaudeReasoningEffort {
+  const normalizedEffort = isClaudeReasoningEffort(effort)
+    ? effort
+    : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
+  const model = models?.find((candidate) => candidate.id === normalizeClaudeModelId(modelId))
+    ?? getClaudeModelOption(modelId)
+  return isClaudeReasoningEffortSupported(model, normalizedEffort)
+    ? normalizedEffort
+    : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
+}
+
 export function supportsClaudeMaxReasoningEffort(modelId: string): boolean {
-  return Boolean(getClaudeModelOption(modelId)?.supportsMaxReasoningEffort)
+  return isClaudeReasoningEffortSupported(getClaudeModelOption(modelId), "max")
 }
 
 export function supportsProviderFastMode(provider: AgentProvider, modelId: string): boolean {

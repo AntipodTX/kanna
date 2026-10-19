@@ -174,6 +174,29 @@ describe("deriveComposerOptionControls", () => {
     expect(max?.disabled).toBe(!supportsClaudeMaxReasoningEffort(modelWithWindow.id))
   })
 
+  test("claude disables efforts omitted by the selected live model", () => {
+    const liveConfig = {
+      ...claudeConfig,
+      models: [{
+        ...claudeConfig.models.find((model) => model.id === "sonnet")!,
+        supportedEffortLevels: ["low", "high", "xhigh", "ultracode"],
+      }],
+    } as typeof claudeConfig
+    const controls = deriveComposerOptionControls(
+      claudeState({ model: "sonnet" }),
+      liveConfig,
+    )
+
+    expect(controls.reasoning?.options.map((option) => [option.id, option.disabled])).toEqual([
+      ["low", false],
+      ["medium", true],
+      ["high", false],
+      ["xhigh", false],
+      ["max", true],
+      ["ultracode", false],
+    ])
+  })
+
   test("grok exposes reasoning and plan mode, not auto-plan or fast mode", () => {
     const grokModel = grokConfig.models[0]!
     const controls = deriveComposerOptionControls(
