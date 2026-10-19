@@ -22,6 +22,7 @@
 - Suppress stale Claude terminal results after steering.
 - Correct Claude chat lifecycle state after agent activity.
 - Route Codex subagent completion notifications to the correct turn.
+- Keep runtime-discovered models available in default-model settings after reading or saving preferences.
 - Avoid Codex thread initialization with an empty thread ID.
 - Emit Codex system initialization only once per session.
 - Preserve Claude plan transcript adjustments during rendering.

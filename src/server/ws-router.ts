@@ -31,12 +31,19 @@ import type { UpdateManager } from "./update-manager"
 import type { UsageLimitsManager } from "./usage-limits"
 import { deriveChatSnapshot, deriveChatTouchedFiles, deriveLocalProjectsSnapshot, deriveSidebarData } from "./read-models"
 import type {
+  AppSettingsSnapshot,
   ChatSnapshot,
   LlmProviderSnapshot,
   LlmProviderValidationResult,
   UsageLimitsSnapshot,
   ChatPreview,
 } from "../shared/types"
+
+// Subscriptions and command replies replace the same client-side state. Both
+// must carry the live catalog; it is computed here, never stored in settings.
+function withAvailableProviders(snapshot: AppSettingsSnapshot): AppSettingsSnapshot {
+  return { ...snapshot, availableProviders: [...SERVER_PROVIDERS] }
+}
 
 
 /**
@@ -477,7 +484,7 @@ export function createWsRouter({
           // The live provider catalog rides along so pickers outside a chat
           // (new-chat composer, settings defaults) see runtime-discovered
           // models; chat snapshots carry the same list.
-          data: { ...appSettings.getSnapshot(), availableProviders: [...SERVER_PROVIDERS] },
+          data: withAvailableProviders(appSettings.getSnapshot()),
         },
       }
     }
@@ -1299,7 +1306,7 @@ export function createWsRouter({
           return
         }
         case "settings.readAppSettings": {
-          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result: appSettings.getSnapshot() })
+          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result: withAvailableProviders(appSettings.getSnapshot()) })
           return
         }
         case "usage.refresh": {
@@ -1370,7 +1377,7 @@ export function createWsRouter({
             resolvedAnalytics.track("analytics_disabled")
           }
           const snapshot = await appSettings.write({ analyticsEnabled: command.analyticsEnabled })
-          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result: snapshot })
+          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result: withAvailableProviders(snapshot) })
           if (!previousAnalyticsEnabled && command.analyticsEnabled) {
             resolvedAnalytics.track("analytics_enabled")
           }
@@ -1379,7 +1386,7 @@ export function createWsRouter({
         case "settings.writeAppSettingsPatch": {
           const previousAnalyticsEnabled = appSettings.getSnapshot().analyticsEnabled
           const snapshot = await appSettings.writePatch(command.patch)
-          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result: snapshot })
+          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result: withAvailableProviders(snapshot) })
           if (command.patch.analyticsEnabled !== undefined && previousAnalyticsEnabled && !snapshot.analyticsEnabled) {
             resolvedAnalytics.track("analytics_disabled")
           }
