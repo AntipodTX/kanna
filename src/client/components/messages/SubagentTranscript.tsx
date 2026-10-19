@@ -2,11 +2,15 @@ import type { HydratedTranscriptMessage } from "../../../shared/types"
 import type { ProcessedToolCall } from "./types"
 import { TextMessage } from "./TextMessage"
 import { ToolCallMessage } from "./ToolCallMessage"
+import { cn } from "../../lib/utils"
+import { containsTranscriptEntry } from "./transcript-tree"
 
 interface Props {
   messages: HydratedTranscriptMessage[]
   isLoading: boolean
   localPath?: string | null
+  revealEntryId?: string | null
+  flashEntryId?: string | null
 }
 
 /**
@@ -17,21 +21,37 @@ interface Props {
  * order is enough. Anything that is not text or a tool call (a status, a
  * context update) has nothing to show here.
  */
-export function SubagentTranscript({ messages, isLoading, localPath }: Props) {
+export function SubagentTranscript({ messages, isLoading, localPath, revealEntryId, flashEntryId }: Props) {
   return (
     <div className="flex flex-col gap-3">
       {messages.map((message) => {
         if (message.kind === "assistant_text") {
-          return <TextMessage key={message.id} message={message} />
+          return (
+            <div
+              key={message.id}
+              id={`msg-${message.id}`}
+              className={cn("w-full", (message.id === revealEntryId || message.id === flashEntryId) && "kanna-jump-flash")}
+            >
+              <TextMessage message={message} />
+            </div>
+          )
         }
         if (message.kind === "tool") {
           return (
-            <ToolCallMessage
+            <div
               key={message.id}
-              message={message as ProcessedToolCall}
-              isLoading={isLoading}
-              localPath={localPath}
-            />
+              id={`msg-${message.id}`}
+              className={cn("w-full", (message.id === revealEntryId || message.id === flashEntryId) && "kanna-jump-flash")}
+            >
+              <ToolCallMessage
+                message={message as ProcessedToolCall}
+                isLoading={isLoading}
+                localPath={localPath}
+                forceExpanded={containsTranscriptEntry(message, revealEntryId)}
+                revealEntryId={revealEntryId}
+                flashEntryId={flashEntryId}
+              />
+            </div>
           )
         }
         return null

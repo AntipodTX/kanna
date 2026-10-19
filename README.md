@@ -5,6 +5,7 @@
 ### Features
 
 - Codex-style chat input semantics: `/` completes executable commands, `$` completes one or more skills (including plugin-qualified names), and `/compact` runs native thread compaction.
+- Search the complete current chat transcript from the widgets sidebar, with result snippets, exact-message navigation, and optional tool call and result matching.
 - Isolated Codex approval prompts with consistent plan-progress rendering.
 - Automatic cleanup of idle agent sessions without interrupting background work.
 - Claude XHigh and Ultracode effort options driven by current SDK metadata.
