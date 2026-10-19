@@ -187,7 +187,6 @@ export function useAppSettingsSync(params: {
   useEffect(() => {
     return socket.subscribe<KeybindingsSnapshot>({ type: "keybindings" }, (snapshot) => {
       setKeybindings(snapshot)
-      setCommandError(null)
     })
   }, [setCommandError, socket])
 
@@ -195,7 +194,6 @@ export function useAppSettingsSync(params: {
     return socket.subscribe<AppSettingsSnapshot>({ type: "app-settings" }, (snapshot) => {
       setAppSettings(snapshot)
       syncRuntimeStoresFromAppSettings(snapshot)
-      setCommandError(null)
     })
   }, [setCommandError, socket])
 
