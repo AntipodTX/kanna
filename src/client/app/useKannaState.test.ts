@@ -1,24 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import {
-  applySidebarProjectOrder,
-  countMatchingUserPrompts,
-  getActiveChatSnapshot,
-  getEditUserPromptSendOptions,
-  getForkUserPromptSendOptions,
-  getMostRecentlyActiveProjectId,
-  getNextMeasuredInputHeight,
-  getNewestRemainingChatId,
-  getPreviousPrompt,
-  getTranscriptPaddingBottom,
-  getUiUpdateReadinessPath,
-  getUserPromptSignature,
-  getUiUpdateRestartReconnectAction,
-  reconcileOptimisticUserPrompts,
-  resolveComposeIntent,
-  shouldHandleUiUpdateReloadRequest,
-  shouldMarkActiveChatRead,
-  shouldAutoFollowTranscript,
-} from "./useKannaState"
+import { applySidebarProjectOrder, countMatchingUserPrompts, getActiveChatSnapshot, getEditUserPromptSendOptions, getForkUserPromptSendOptions, getMostRecentlyActiveProjectId, getNextMeasuredInputHeight, getNewestRemainingChatId, getPreviousPrompt, getTranscriptPaddingBottom, getUiUpdateReadinessPath, getUserPromptSignature, getUiUpdateRestartReconnectAction, reconcileOptimisticUserPrompts, resolveComposeIntent, shouldHandleUiUpdateReloadRequest, shouldMarkActiveChatRead, shouldAutoFollowTranscript } from "./useKannaState"
 import type { ChatAttachment, ChatProviderPreferences, ChatSnapshot, SidebarData, UserPromptEntry } from "../../shared/types"
 
 function createSidebarData(): SidebarData {
