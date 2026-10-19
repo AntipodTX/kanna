@@ -11,6 +11,7 @@
 - Automatic cleanup of idle agent sessions without interrupting background work.
 - Claude XHigh and Ultracode effort options driven by current SDK metadata.
 - Local PostCSS configuration overrides for downstream development.
+- Custom embedded-terminal executables via `KANNA_TERMINAL_EXECUTABLE`, including wrappers that start a shell in an external execution context.
 
 ### Fixes
 
