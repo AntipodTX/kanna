@@ -1,3 +1,13 @@
+> This repository is a downstream fork of [jakemor/kanna](https://github.com/jakemor/kanna).
+
+## Differences from upstream
+
+### Features
+
+
+### Fixes
+
+
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
 </p>
@@ -6,10 +16,6 @@
 
 <p align="center">
   <strong>A beautiful web UI for the Claude Code & Codex CLIs</strong>
-</p>
-
-<p align="center">
-  <a href="https://www.npmjs.com/package/kanna-code"><img src="https://img.shields.io/npm/v/kanna-code.svg?style=flat&colorA=18181b&colorB=f472b6" alt="npm version" /></a>
 </p>
 
 <br />
@@ -24,19 +30,28 @@
 
 <br />
 
-## Quickstart
+## Install
 
-```bash
-bun install -g kanna-code
-```
-
-If Bun isn't installed, install it first:
+If [Bun](https://bun.sh) isn't installed, install it first:
 
 ```bash
 curl -fsSL https://bun.sh/install | bash
 ```
 
-Then run from any project directory:
+Then run:
+
+```bash
+git clone https://github.com/AntipodTX/kanna.git
+cd kanna
+bun install --frozen-lockfile
+bun run build
+package_dir="$(mktemp -d)"
+package_file="$(bun pm pack --quiet --destination "$package_dir")"
+bun install --global "$package_file"
+rm -rf "$package_dir"
+```
+
+Then run Kanna from any project directory:
 
 ```bash
 kanna
@@ -86,29 +101,6 @@ Local File System (~/.kanna/data/, project dirs)
 - _(Optional)_ [Codex CLI](https://github.com/openai/codex) for Codex provider support
 
 Embedded terminal support uses Bun's native PTY APIs and currently works on macOS/Linux.
-
-## Install
-
-Install Kanna globally:
-
-```bash
-bun install -g kanna-code
-```
-
-If Bun isn't installed, install it first:
-
-```bash
-curl -fsSL https://bun.sh/install | bash
-```
-
-Or clone and build from source:
-
-```bash
-git clone https://github.com/jakemor/kanna.git
-cd kanna
-bun install
-bun run build
-```
 
 ## Usage
 
@@ -266,20 +258,6 @@ All state is stored locally at `~/.kanna/data/`:
 | `snapshot.json`  | Compacted state snapshot for fast startup |
 
 Event logs are append-only JSONL. On startup, Kanna replays the log tail after the last snapshot, then compacts if the logs exceed 2 MB.
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=jakemor%2Fkanna&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=jakemor/kanna&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=jakemor/kanna&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=jakemor/kanna&type=date&legend=top-left" />
- </picture>
-</a>
-
-## Contributing
-
-Contributions are welcome! Feel free to open PRs
 
 ## License
 
