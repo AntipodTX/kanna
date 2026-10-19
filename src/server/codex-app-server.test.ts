@@ -4102,7 +4102,7 @@ describe("CodexAppServerManager", () => {
       model: "gpt-5.4",
       sessionToken: null,
     })
-    expect(replacementSession).toEqual({ sessionToken: "thread-2", resumeFellBack: false })
+    expect(replacementSession).toEqual({ sessionToken: "thread-2", resumeFellBack: false, startupOutcome: { kind: "fresh" } })
   })
 
 
