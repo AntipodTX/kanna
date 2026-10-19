@@ -2,7 +2,7 @@ import { describe, expect, test, afterAll } from "bun:test"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { AgentCoordinator, buildAttachmentHintText, buildConcurrentAgentsNotice, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, startClaudeSession, resolveClaudeRuntimeOptions, classifyClaudeBackgroundWorkState, createClaudeStopHook, type ClaudeBackgroundWorkState, buildClaudeSdkUserMessage } from "./agent"
+import { AgentCoordinator, buildAttachmentHintText, buildConcurrentAgentsNotice, buildPromptText, buildSteeredMessageContent, claudeToolset, formatQuestionAnswersFollowUp, classifyClaudeBackgroundWorkState, createClaudeStopHook, maxClaudeContextWindowFromModelUsage, normalizeClaudeContextUsage, normalizeClaudeStreamMessage, normalizeClaudeUsageSnapshot, RESUME_AFTER_RESTART_MESSAGE, type ClaudeBackgroundWorkState, startClaudeSession, resolveClaudeRuntimeOptions, buildClaudeSdkUserMessage } from "./agent"
 import type { HarnessTurn } from "./harness-types"
 import type { SubagentActivityUpdate } from "./background-tasks"
 import type { ChatAttachment, TranscriptEntry, AgentProvider } from "../shared/types"
@@ -2979,6 +2979,252 @@ describe("AgentCoordinator codex integration", () => {
       },
     })
   })
+
+
+  test("keeps an awaited Codex command alive until completion before starting a new idle timeout", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    let started = false
+    let release!: () => void
+    const commandReady = new Promise<void>((resolve) => { release = resolve })
+    const stopped: string[] = []
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        hasSession: () => true,
+        getSessionChatIds: () => ["chat-1"],
+        async runSlashCommand() { started = true; await commandReady },
+        stopSession(chatId: string) { stopped.push(chatId) },
+      } as never,
+    })
+    coordinator.setIdleSessionTimeoutMs(20)
+    const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+    try {
+      await waitFor(() => started)
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      expect(stopped).toEqual([])
+      // Updating the setting while the command is active must not arm a timer.
+      coordinator.setIdleSessionTimeoutMs(20)
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      expect(stopped).toEqual([])
+      release()
+      await command
+      expect(store.messages.at(-1)?.kind).toBe("compact_boundary")
+      await waitFor(() => stopped.length > 0)
+      expect(stopped).toEqual(["chat-1"])
+    } finally {
+      release()
+      await command
+      coordinator.setIdleSessionTimeoutMs(null)
+    }
+  })
+
+
+  for (const provider of ["codex", "claude"] as const) {
+    test(`preserves the chat when a ${provider} send arrives during an awaited Codex command`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "codex"
+      store.chat.sessionToken = "thread-1"
+      let started = false
+      let release!: () => void
+      const commandReady = new Promise<void>((resolve) => { release = resolve })
+      const nativeCalls: string[] = []
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => {},
+        startClaudeSession: () => { nativeCalls.push("startClaudeSession"); throw new Error("Unexpected native start") },
+        codexManager: {
+          hasSession: () => true,
+          async runSlashCommand() { started = true; await commandReady },
+          async startSession() { nativeCalls.push("startSession"); throw new Error("Unexpected native start") },
+          async startTurn() { nativeCalls.push("startTurn"); throw new Error("Unexpected native turn") },
+          stopSession() { nativeCalls.push("stopSession") },
+        } as never,
+      })
+      const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+      try {
+        await waitFor(() => started)
+        await expect(coordinator.send({ type: "chat.send", chatId: "chat-1", provider, content: "new request" }))
+          .rejects.toThrow("A Codex command is already running")
+        await expect((coordinator as any).startTurnForChat({
+          chatId: "chat-1", provider, content: "direct request", attachments: [], model: "test-model",
+          planMode: true, autoPlan: true, appendUserPrompt: true,
+        })).rejects.toThrow("A Codex command is already running")
+        expect(store.messages).toEqual([])
+        expect(store.chat.provider).toBe("codex")
+        expect(store.chat.sessionToken).toBe("thread-1")
+        expect(store.chat.planMode).toBe(false)
+        expect(store.chat.autoPlan).toBe(false)
+        expect(nativeCalls).toEqual([])
+      } finally {
+        release()
+        await command
+      }
+    })
+  }
+
+
+  test("keeps queued requests intact while an awaited Codex command owns the chat", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    const queued = await store.enqueueMessage("chat-1", { content: "queued request", provider: "codex" })
+    let started = false
+    let release!: () => void
+    const commandReady = new Promise<void>((resolve) => { release = resolve })
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        hasSession: () => true,
+        async runSlashCommand() { started = true; await commandReady },
+        async startSession() { throw new Error("Unexpected native start") },
+      } as never,
+    })
+    const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+    try {
+      await waitFor(() => started)
+      await expect((coordinator as any).maybeStartNextQueuedMessage("chat-1")).resolves.toBe(false)
+      await expect(coordinator.steer({ type: "message.steer", chatId: "chat-1", queuedMessageId: queued.id }))
+        .rejects.toThrow("A Codex command is already running")
+      expect(store.getQueuedMessages()).toEqual([queued])
+      expect(store.messages).toEqual([])
+    } finally {
+      release()
+      await command
+    }
+  })
+
+
+  test("does not fork a source chat while its native Codex compaction is pending", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    let started = false
+    let release!: () => void
+    const commandReady = new Promise<void>((resolve) => { release = resolve })
+    let forkCalls = 0
+    const forkChat = store.forkChat.bind(store)
+    store.forkChat = async () => { forkCalls += 1; return forkChat() }
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        hasSession: () => true,
+        async runSlashCommand() { started = true; await commandReady },
+      } as never,
+    })
+    const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+    try {
+      await waitFor(() => started)
+      await expect(coordinator.forkChat("chat-1")).rejects.toThrow("A Codex command is already running")
+      expect(forkCalls).toBe(0)
+    } finally {
+      release()
+      await command
+    }
+  })
+
+
+  for (const retirement of ["close", "dispose"] as const) {
+    test(`does not notify after ${retirement} while a completed Codex command boundary is being saved`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "codex"
+      store.chat.sessionToken = "thread-1"
+      let saving = false
+      let release!: () => void
+      const saved = new Promise<void>((resolve) => { release = resolve })
+      const appendMessage = store.appendMessage.bind(store)
+      store.appendMessage = async (chatId, entry) => {
+        await appendMessage(chatId, entry)
+        if (entry.kind === "compact_boundary") { saving = true; await saved }
+      }
+      const notifications: string[] = []
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => { notifications.push("state") },
+        codexManager: {
+          hasSession: () => true,
+          async runSlashCommand() {},
+          stopSession() {},
+          stopAll() {},
+        } as never,
+      })
+      const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+      try {
+        await waitFor(() => saving)
+        if (retirement === "close") await coordinator.closeChat("chat-1")
+        else coordinator.dispose()
+        const notificationCount = notifications.length
+        release()
+        await command
+        expect(notifications).toHaveLength(notificationCount)
+        expect(store.messages.filter((entry) => entry.kind === "compact_boundary")).toHaveLength(1)
+      } finally {
+        release()
+        await command
+      }
+    })
+  }
+
+
+  for (const outcome of ["failure", "explicit close", "dispose"] as const) {
+    test(`releases Codex command ownership after ${outcome}`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "codex"
+      store.chat.sessionToken = "thread-1"
+      let started = false
+      let sessionAlive = true
+      let release!: () => void
+      const commandReady = new Promise<void>((resolve) => { release = resolve })
+      const stopped: string[] = []
+      const notifications: string[] = []
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => { notifications.push("state") },
+        codexManager: {
+          hasSession: () => sessionAlive,
+          getSessionChatIds: () => ["chat-1"],
+          async runSlashCommand() {
+            started = true
+            await commandReady
+            if (outcome === "failure") throw new Error("compaction failed")
+          },
+          stopSession(chatId: string) { sessionAlive = false; stopped.push(chatId) },
+          stopAll() { sessionAlive = false; stopped.push("chat-1") },
+        } as never,
+      })
+      coordinator.setIdleSessionTimeoutMs(20)
+      const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+        .then(() => null, (error: unknown) => error)
+      try {
+        await waitFor(() => started)
+        await expect(coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" }))
+          .rejects.toThrow("A Codex command is already running")
+        if (outcome === "explicit close") await coordinator.closeChat("chat-1")
+        if (outcome === "dispose") coordinator.dispose()
+        const notificationCount = notifications.length
+        release()
+        const result = await command
+        if (outcome === "failure") {
+          expect(String(result)).toContain("compaction failed")
+          await waitFor(() => stopped.length > 0)
+        } else {
+          expect(result).toBeNull()
+          await new Promise((resolve) => setTimeout(resolve, 60))
+          expect(notifications).toHaveLength(notificationCount)
+        }
+        expect(stopped).toEqual(["chat-1"])
+        expect(store.messages.some((entry) => entry.kind === "compact_boundary")).toBe(false)
+      } finally {
+        release()
+        await command
+        coordinator.setIdleSessionTimeoutMs(null)
+      }
+    })
+  }
 })
 
 describe("AgentCoordinator claude integration", () => {
@@ -8974,5 +9220,25 @@ describe("Codex async question answers", () => {
     } finally { await f.coordinator.cancel("chat-1") }
   })
 })
+
+
+  for (const busyState of ["Claude startup", "pending Codex steer"] as const)
+test(`does not start a Codex command during ${busyState}`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "codex"
+      store.chat.sessionToken = "thread-1"
+      let commandCalls = 0
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => {},
+        codexManager: { async runSlashCommand() { commandCalls += 1 } } as never,
+      })
+      if (busyState === "Claude startup") (coordinator as any).startingClaudeTurns.set("chat-1", Symbol("startup"))
+      else (coordinator as any).pendingCodexSteers.set("chat-1", new Set(["queued-1"]))
+      await expect(coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" }))
+        .rejects.toThrow("/compact cannot run while a turn is active")
+      expect(commandCalls).toBe(0)
+      expect(store.messages).toEqual([])
+    })
 
 afterAll(() => {for(const dir of fakeStoreDirectories) rmSync(dir,{recursive:true,force:true})})
