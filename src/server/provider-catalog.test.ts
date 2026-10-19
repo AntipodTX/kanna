@@ -1,21 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import {
-  SERVER_PROVIDERS,
-  applyClaudeSdkModels,
-  applyCodexModels,
-  applyCursorModels,
-  applyGrokModels,
-  applyPiFaveModels,
-  cursorModelIdForOptions,
-  normalizeClaudeModelOptions,
-  normalizeCodexModelOptions,
-  normalizeCursorModelOptions,
-  normalizePiModelOptions,
-  normalizeServerModel,
-  resetServerProvidersForTests,
-  serviceTierFromModelOptions,
-} from "./provider-catalog"
-import { DEFAULT_PI_FAVE_MODELS, DEFAULT_PI_MODEL, resolveClaudeApiModelId } from "../shared/types"
+import { SERVER_PROVIDERS, applyClaudeSdkModels, applyCodexModels, applyCursorModels, applyGrokModels, applyPiFaveModels, cursorModelIdForOptions, normalizeClaudeModelOptions, normalizeCodexModelOptions, normalizeCursorModelOptions, normalizePiModelOptions, normalizeServerModel, resetServerProvidersForTests, serviceTierFromModelOptions, getServerClaudeRuntimeEffort } from "./provider-catalog"
+import { DEFAULT_PI_FAVE_MODELS, DEFAULT_PI_MODEL, resolveClaudeApiModelId, CLAUDE_REASONING_OPTIONS } from "../shared/types"
 
 describe("provider catalog normalization", () => {
   afterEach(() => {
@@ -442,7 +427,9 @@ describe("provider catalog normalization", () => {
     expect(claude?.defaultModel).toBe("sonnet")
     // Static per-family metadata the SDK doesn't report is preserved.
     const opus = claude?.models.find((model) => model.id === "opus")
-    expect(opus?.supportsMaxReasoningEffort).toBe(true)
+    expect(opus?.supportedEffortLevels).toEqual([
+      "low", "medium", "high", "xhigh", "max", "ultracode",
+    ])
     expect(opus?.supportsFastMode).toBe(true)
     expect(opus?.contextWindowOptions?.map((option) => option.id)).toEqual(["1m", "200k"])
     expect(claude?.models.find((model) => model.id === "haiku")?.contextWindowOptions).toBeUndefined()
@@ -478,5 +465,47 @@ describe("provider catalog normalization", () => {
       { value: "sonnet[1m]", resolvedModel: "claude-sonnet-5[1m]", displayName: "Sonnet (1M context)", supportsEffort: true },
       { value: "nova", resolvedModel: "claude-nova-2", displayName: "Nova" },
     ])).toBe(false)
+  })
+
+
+  test("Claude SDK effort stays native while recognized preferences are preserved", () => {
+    applyClaudeSdkModels([{
+      value: "opus",
+      supportsEffort: true,
+      supportedEffortLevels: CLAUDE_REASONING_OPTIONS.map((option) => option.id),
+    }])
+    for (const { id: effort } of CLAUDE_REASONING_OPTIONS) {
+      expect(normalizeClaudeModelOptions("opus", { claude: { reasoningEffort: effort } }).reasoningEffort).toBe(effort)
+      expect(String(getServerClaudeRuntimeEffort("opus", effort))).toBe(String(effort) === "ultracode" ? "xhigh" : String(effort))
+    }
+  })
+
+
+  test("normalizes Claude efforts against SDK-updated model metadata", () => {
+    expect(applyClaudeSdkModels([
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5",
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "medium", "high", "xhigh"],
+      },
+    ])).toBe(true)
+
+    const sonnet = SERVER_PROVIDERS.find((provider) => provider.id === "claude")
+      ?.models.find((model) => model.id === "sonnet") as
+        | { supportedEffortLevels?: readonly string[] }
+        | undefined
+    expect(sonnet?.supportedEffortLevels).toEqual([
+      "low", "medium", "high", "xhigh", "ultracode",
+    ])
+    expect(normalizeClaudeModelOptions("sonnet", {
+      claude: { reasoningEffort: "xhigh" as never },
+    }).reasoningEffort).toBe("xhigh")
+    expect(normalizeClaudeModelOptions("sonnet", {
+      claude: { reasoningEffort: "ultracode" as never },
+    }).reasoningEffort).toBe("ultracode")
+    expect(normalizeClaudeModelOptions("sonnet", {
+      claude: { reasoningEffort: "max" },
+    }).reasoningEffort).toBe("high")
   })
 })

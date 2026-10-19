@@ -1,12 +1,9 @@
+import { PROVIDERS, type AppSettingsSnapshot } from "../../shared/types"
+import { useAppSettingsStore } from "./appSettingsStore"
 import { useSidebarStore } from "./sidebarStore"
 import type { SidebarProjectGroup } from "../../shared/types"
 import { afterEach, describe, expect, test } from "bun:test"
-import {
-  composerStateFromModelSettings,
-  migrateChatPreferencesState,
-  NEW_CHAT_COMPOSER_ID,
-  useChatPreferencesStore,
-} from "./chatPreferencesStore"
+import { composerStateFromModelSettings, migrateChatPreferencesState, NEW_CHAT_COMPOSER_ID, useChatPreferencesStore } from "./chatPreferencesStore"
 
 const INITIAL_STATE = useChatPreferencesStore.getInitialState()
 
@@ -122,7 +119,7 @@ describe("migrateChatPreferencesState", () => {
       legacyComposerState: {
         provider: "claude",
         model: "sonnet",
-        modelOptions: { reasoningEffort: "high", contextWindow: "1m", fastMode: false },
+        modelOptions: { reasoningEffort: "max", contextWindow: "1m", fastMode: false },
         planMode: false,
         autoPlan: false,
       },
@@ -255,6 +252,38 @@ describe("migrateChatPreferencesState", () => {
       planMode: true,
       autoPlan: false,
     })
+  })
+
+
+  test("preserves Ultracode for Claude models that support xhigh", () => {
+    const migrated = migrateChatPreferencesState({
+      defaultProvider: "last_used",
+      providerDefaults: {
+        claude: {
+          model: "fable",
+          modelOptions: { reasoningEffort: "ultracode", contextWindow: "1m" },
+          planMode: false,
+        },
+      },
+    })
+
+    expect(migrated.providerDefaults.claude.modelOptions.reasoningEffort).toBe("ultracode")
+  })
+
+
+  test("downgrades unsupported Claude efforts during migration", () => {
+    const migrated = migrateChatPreferencesState({
+      defaultProvider: "last_used",
+      providerDefaults: {
+        claude: {
+          model: "haiku",
+          modelOptions: { reasoningEffort: "max", contextWindow: "200k" },
+          planMode: false,
+        },
+      },
+    })
+
+    expect(migrated.providerDefaults.claude.modelOptions.reasoningEffort).toBe("high")
   })
 })
 
@@ -845,5 +874,51 @@ describe("chat preference store", () => {
       planMode: true,
       autoPlan: false,
     })
+  })
+
+
+  test("live picker effort survives composer writes and programmatic chat copies", () => {
+    const liveClaude = { ...PROVIDERS.find((provider) => provider.id === "claude")!,
+      models: [{ id: "haiku", label: "Haiku", supportsEffort: true, supportedEffortLevels: ["low", "max"] as const }] }
+    useAppSettingsStore.setState({ settings: { availableProviders: [liveClaude] } as AppSettingsSnapshot })
+    const store = useChatPreferencesStore.getState()
+    const selection = { provider: "claude" as const, model: "haiku", modelOptions: {
+      reasoningEffort: "max" as const, contextWindow: "1m" as const, fastMode: false }, planMode: false, autoPlan: false }
+    store.setComposerState("chat-a", selection)
+    expect(store.getComposerState("chat-a").modelOptions.reasoningEffort).toBe("max")
+    store.setComposerState("chat-b", store.getComposerState("chat-a"))
+    expect(store.getComposerState("chat-b").modelOptions.reasoningEffort).toBe("max")
+    store.setChatComposerMode("chat-a", "plan")
+    expect(store.getComposerState("chat-a").modelOptions.reasoningEffort).toBe("max")
+  })
+
+
+  test("provider defaults use live effort metadata while cold fallback stays static", () => {
+    const store = useChatPreferencesStore.getState()
+    store.setProviderDefaultModel("claude", "haiku")
+    store.setProviderDefaultModelOptions("claude", { reasoningEffort: "max" })
+    expect(useChatPreferencesStore.getState().providerDefaults.claude.modelOptions.reasoningEffort).toBe("high")
+    const liveClaude = { ...PROVIDERS.find((provider) => provider.id === "claude")!,
+      models: [{ id: "haiku", label: "Haiku", supportsEffort: true, supportedEffortLevels: ["low", "max"] as const }] }
+    useAppSettingsStore.setState({ settings: { availableProviders: [liveClaude] } as AppSettingsSnapshot })
+    store.setProviderDefaultModelOptions("claude", { reasoningEffort: "max" })
+    expect(useChatPreferencesStore.getState().providerDefaults.claude.modelOptions.reasoningEffort).toBe("max")
+    store.setChatComposerModel("chat-a", "haiku")
+    store.setChatComposerModelOptions("chat-a", { reasoningEffort: "max" })
+    expect(store.getComposerState("chat-a").modelOptions.reasoningEffort).toBe("max")
+  })
+
+
+  test("the active picker catalog overrides an older settings catalog", () => {
+    const liveClaude = { ...PROVIDERS.find((provider) => provider.id === "claude")!,
+      models: [{ id: "haiku", label: "Haiku", supportsEffort: true, supportedEffortLevels: ["low", "max"] as const }] }
+    const store = useChatPreferencesStore.getState()
+    store.setComposerState("chat-a", { provider: "claude", model: "haiku", modelOptions: {
+      reasoningEffort: "max", contextWindow: "1m", fastMode: false }, planMode: false, autoPlan: false },
+    { providerConfig: liveClaude })
+    expect(store.getComposerState("chat-a").modelOptions.reasoningEffort).toBe("max")
+    store.setProviderDefaultModel("claude", "haiku", liveClaude)
+    store.setProviderDefaultModelOptions("claude", { reasoningEffort: "max" }, liveClaude)
+    expect(useChatPreferencesStore.getState().providerDefaults.claude.modelOptions.reasoningEffort).toBe("max")
   })
 })
