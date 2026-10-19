@@ -80,7 +80,6 @@ export function useUpdateRestart(params: {
   useEffect(() => {
     return socket.subscribe<UpdateSnapshot>({ type: "update" }, (snapshot) => {
       setUpdateSnapshot(snapshot)
-      setCommandError(null)
     })
   }, [setCommandError, socket])
 

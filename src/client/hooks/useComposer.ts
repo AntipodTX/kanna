@@ -111,7 +111,7 @@ export function useComposer(args: {
   )
 
   const updateEffectiveState = useCallback((transform: (state: ComposerState) => ComposerState) => {
-    useChatPreferencesStore.getState().setComposerState(view.composerChatId, transform(view.effectiveState), { providerConfig: view.providerConfig })
+    useChatPreferencesStore.getState().setComposerState(view.composerChatId, transform(view.effectiveState), { userEdit: true, providerConfig: view.providerConfig })
   }, [view.composerChatId, view.effectiveState, view.providerConfig])
 
   const selectProvider = useCallback((provider: AgentProvider) => {
@@ -135,7 +135,7 @@ export function useComposer(args: {
     useChatPreferencesStore.getState().setComposerState(
       view.composerChatId,
       applyModelToComposerState(view.effectiveState, modelId, view.providerConfig),
-      { providerConfig: view.providerConfig }
+      { userEdit: true, providerConfig: view.providerConfig }
     )
     return true
   }, [view])

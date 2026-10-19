@@ -136,7 +136,18 @@ function rowLightsItself(row: ResolvedTranscriptRow): boolean {
 
 type TranscriptRowItemProps = Pick<
   ComponentProps<typeof KannaTranscriptRow>,
-  "row" | "toolGroupExpanded" | "onToolGroupExpandedChange" | "onAskUserQuestionSubmit" | "onExitPlanModeConfirm" | "onCodexApprovalDecision" | "revealEntryId" | "flashEntryId"
+  | "row"
+  | "toolGroupExpanded"
+  | "onToolGroupExpandedChange"
+  | "onAskUserQuestionSubmit"
+  | "onExitPlanModeConfirm"
+  | "onEditUserPrompt"
+  | "isEditUserPromptDisabled"
+  | "onForkUserPrompt"
+  | "isForkUserPromptDisabled"
+  | "onCodexApprovalDecision"
+  | "revealEntryId"
+  | "flashEntryId"
 > & { flashBox: boolean; flashRow: boolean }
 
 /**
@@ -162,6 +173,10 @@ const TranscriptRowItem = memo(function TranscriptRowItem({
   onToolGroupExpandedChange,
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
+  onEditUserPrompt,
+  isEditUserPromptDisabled,
+  onForkUserPrompt,
+  isForkUserPromptDisabled,
   onCodexApprovalDecision,
 }: TranscriptRowItemProps) {
   return (
@@ -196,6 +211,10 @@ const TranscriptRowItem = memo(function TranscriptRowItem({
           onToolGroupExpandedChange={onToolGroupExpandedChange}
           onAskUserQuestionSubmit={onAskUserQuestionSubmit}
           onExitPlanModeConfirm={onExitPlanModeConfirm}
+          onEditUserPrompt={onEditUserPrompt}
+          isEditUserPromptDisabled={isEditUserPromptDisabled}
+          onForkUserPrompt={onForkUserPrompt}
+          isForkUserPromptDisabled={isForkUserPromptDisabled}
           onCodexApprovalDecision={onCodexApprovalDecision}
         />
       </div>
@@ -271,6 +290,10 @@ interface ChatTranscriptViewportProps {
   onOpenLocalLink: KannaState["handleOpenLocalLink"]
   onAskUserQuestionSubmit: KannaState["handleAskUserQuestion"]
   onExitPlanModeConfirm: KannaState["handleExitPlanMode"]
+  onEditUserPrompt?: KannaState["handleEditUserPrompt"]
+  isEditUserPromptDisabled?: boolean
+  onForkUserPrompt?: KannaState["handleForkUserPrompt"]
+  isForkUserPromptDisabled?: boolean
   onCodexApprovalDecision: KannaState["handleCodexApproval"]
   showScrollButton: boolean
   onIsAtEndChange: (isAtEnd: boolean) => void
@@ -483,6 +506,10 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
   onAskUserQuestionSubmit,
   onExitPlanModeConfirm,
   onCodexApprovalDecision,
+  onEditUserPrompt,
+  isEditUserPromptDisabled = false,
+  onForkUserPrompt,
+  isForkUserPromptDisabled = false,
   showScrollButton,
   onIsAtEndChange,
   scrollToBottom,
@@ -1222,6 +1249,10 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
                   onAskUserQuestionSubmit={onAskUserQuestionSubmit}
                   onExitPlanModeConfirm={onExitPlanModeConfirm}
                   onCodexApprovalDecision={onCodexApprovalDecision}
+                  onEditUserPrompt={onEditUserPrompt}
+                  isEditUserPromptDisabled={isEditUserPromptDisabled}
+                  onForkUserPrompt={onForkUserPrompt}
+                  isForkUserPromptDisabled={isForkUserPromptDisabled}
                 />
               ))}
               {listFooter}
