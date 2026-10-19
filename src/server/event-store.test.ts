@@ -2046,6 +2046,29 @@ describe("EventStore", () => {
     expect(store.getChat(chat.id)?.lastUserMessagePreview).toBe("Version? B")
     expect(store.getMessages(chat.id)).toEqual(messages)
   })
+
+
+  test("moves a redelivered prompt without losing concurrent writes or its payload", async () => {
+    const store = new EventStore(await createTempDataDir())
+    await store.initialize()
+    const project = await store.openProject(store.dataDir, "Project")
+    const chat = await store.createChat(project.id)
+    const answer: TranscriptEntry = { _id: "answer-1", createdAt: 1, kind: "user_prompt", content: "Saved answer",
+      attachments: [{ id: "attachment-1", kind: "file", displayName: "details.txt",
+        absolutePath: "/tmp/details.txt", relativePath: "details.txt", contentUrl: "/file",
+        mimeType: "text/plain", size: 12 }] }
+    await store.appendMessage(chat.id, answer)
+    const next = entry("user_prompt", 2, { content: "Next" })
+    const output = entry("assistant_text", 3, { text: "Concurrent output" })
+    await store.appendMessage(chat.id, next)
+    const moving = store.moveUserPromptToEnd(chat.id, answer._id)
+    const writing = store.appendMessage(chat.id, output)
+    await Promise.all([moving, writing])
+    expect(store.getMessages(chat.id)).toEqual([next, answer, output])
+    const replayed = new EventStore(store.dataDir)
+    await replayed.initialize()
+    expect(replayed.getMessages(chat.id)).toEqual([next, answer, output])
+  })
 })
 
 describe("on-demand tool payloads", () => {

@@ -151,6 +151,11 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
   const renderOptions = useTranscriptRenderOptions()
   const allQuestions = message.input.questions
   const savedAnswers = parseAnswersFromResult(message.result)
+  const retryAnswers = Object.entries(message.input.codexAsync?.replyMessageIds ?? {})
+    .filter(([, id]) => renderOptions.queuedMessageIds.includes(id) || renderOptions.historyMessages[id]
+      || renderOptions.historyActions[id] === "recover")
+    .map(([id]) => id)
+  const needsRedelivery = retryAnswers.length > 0
   const questions = message.input.codexAsync
     ? allQuestions.filter(question => !savedAnswers?.[getQuestionKey(question)]?.length)
     : allQuestions
@@ -267,6 +272,21 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
     }
   }
 
+  const handleResend = async () => {
+    if (submitting.current || renderOptions.readonly || !needsRedelivery) return
+    submitting.current = true
+    setIsSubmitting(true)
+    setSubmitError(null)
+    try {
+      await onSubmit(message.toolId, allQuestions, savedAnswers ?? submittedAnswers ?? {})
+    } catch (error) {
+      setSubmitError(error instanceof Error ? error.message : String(error))
+    } finally {
+      submitting.current = false
+      setIsSubmitting(false)
+    }
+  }
+
   const handleCustomInputEnter = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key !== "Enter") return
     if (!currentQuestion || !currentHasAnswer) return
@@ -314,6 +334,15 @@ export function AskUserQuestionMessage({ message, onSubmit, isLatest }: Props) {
               </div>
             )
           })}
+          {needsRedelivery ? (
+            <div className="border-t border-border p-3 text-sm">
+              <p className="text-muted-foreground">Answer delivery is not confirmed.</p>
+              {!renderOptions.readonly ? <Button type="button" onClick={handleResend} disabled={isSubmitting}>
+                {isSubmitting ? "Sending…" : "Resend answer"}
+              </Button> : null}
+              {submitError ? <p role="alert" className="text-destructive">{submitError}</p> : null}
+            </div>
+          ) : null}
         </div>
       </div>
     )
