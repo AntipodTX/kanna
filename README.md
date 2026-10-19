@@ -15,6 +15,7 @@
 
 ### Fixes
 
+- Correct Claude chat lifecycle state after agent activity.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
