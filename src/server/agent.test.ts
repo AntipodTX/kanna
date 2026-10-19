@@ -1420,6 +1420,418 @@ describe("AgentCoordinator codex integration", () => {
     expect(discardedResult.content).toEqual({ discarded: true })
     expect(startTurnCalls).toEqual(["plan this"])
   })
+
+  test("steers queued Codex messages sequentially while earlier steers settle", async () => {
+    const streams: AsyncEventQueue<any>[] = []
+    const startTurnCalls: Array<{ content: string }> = []
+    const steerTurnCalls: Array<{
+      chatId: string
+      expectedTurnId: string
+      content: string
+      clientUserMessageId: string
+      transcriptEntry: TranscriptEntry
+    }> = []
+    let acceptSteer!: () => void
+    const steerAccepted = new Promise<void>((resolve) => {
+      acceptSteer = resolve
+    })
+    let interruptCalls = 0
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.title = "Chat"
+    store.chat.sessionToken = "thread-1"
+    await store.enqueueMessage("chat-1", {
+      id: "queued-1",
+      content: "queued follow up",
+      attachments: [],
+      provider: "codex",
+      model: "gpt-5.4",
+      planMode: false,
+    })
+    await store.enqueueMessage("chat-1", {
+      id: "queued-2",
+      content: "another queued follow up",
+      attachments: [],
+      provider: "codex",
+      model: "gpt-5.4",
+      planMode: false,
+    })
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async startSession() {
+          return "thread-1"
+        },
+        async startTurn(args: { content: string }): Promise<HarnessTurn> {
+          startTurnCalls.push(args)
+          const stream = new AsyncEventQueue<any>()
+          streams.push(stream)
+          return {
+            provider: "codex",
+            providerTurnId: "turn-1",
+            stream,
+            interrupt: async () => {
+              interruptCalls += 1
+            },
+            close: () => stream.close(),
+          }
+        },
+        startSteerTurn(args: {
+          chatId: string
+          expectedTurnId: string
+          content: string
+          clientUserMessageId: string
+          transcriptEntry: TranscriptEntry
+        }) {
+          steerTurnCalls.push(args)
+          return { accepted: steerAccepted, settled: steerAccepted }
+        },
+      } as never,
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "codex",
+      content: "initial prompt",
+      model: "gpt-5.4",
+    })
+    streams[0]?.push({
+      type: "transcript" as const,
+      entry: timestamped({
+        kind: "system_init",
+        provider: "codex",
+        model: "gpt-5.4",
+        tools: [],
+        agents: [],
+        slashCommands: [],
+        mcpServers: [],
+      }),
+    })
+    await waitFor(() => coordinator.getActiveStatuses().get("chat-1") === "running")
+
+    try {
+      await coordinator.steer({
+        type: "message.steer",
+        chatId: "chat-1",
+        queuedMessageId: "queued-1",
+      })
+      await waitFor(() => steerTurnCalls.length === 1)
+
+      expect(store.getQueuedMessage("chat-1", "queued-1")).not.toBeNull()
+      expect(coordinator.getPendingCodexSteerIds("chat-1")).toEqual(new Set(["queued-1"]))
+
+      const second = coordinator.steer({
+        type: "message.steer",
+        chatId: "chat-1",
+        queuedMessageId: "queued-2",
+      })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(steerTurnCalls).toHaveLength(1)
+
+      expect(store.getQueuedMessage("chat-1", "queued-2")).not.toBeNull()
+      expect(coordinator.getPendingCodexSteerIds("chat-1")).toEqual(new Set(["queued-1"]))
+
+      acceptSteer()
+      await second
+      await waitFor(() => coordinator.getPendingCodexSteerIds("chat-1").size === 0)
+
+      expect(steerTurnCalls.map((call) => call.clientUserMessageId)).toEqual(["queued-1", "queued-2"])
+      expect(steerTurnCalls[0]).toMatchObject({
+        chatId: "chat-1",
+        expectedTurnId: "turn-1",
+        clientUserMessageId: "queued-1",
+        transcriptEntry: {
+          _id: "queued-1",
+          kind: "user_prompt",
+          attachments: [],
+          steered: true,
+        },
+      })
+      expect(steerTurnCalls[0]?.content).toContain("queued follow up")
+      expect(startTurnCalls).toHaveLength(1)
+      expect(interruptCalls).toBe(0)
+      expect(store.getQueuedMessage("chat-1", "queued-1")).toBeNull()
+      expect(store.getQueuedMessage("chat-1", "queued-2")).toBeNull()
+      expect(store.messages.some((entry) => entry.kind === "interrupted")).toBe(false)
+      expect(coordinator.getActiveStatuses().get("chat-1")).toBe("running")
+    } finally {
+      for (const stream of streams) stream.close()
+    }
+  })
+
+  test("does not promote a queued Codex message while its native steer is still settling", async () => {
+    const streams: AsyncEventQueue<any>[] = []
+    const startTurnCalls: Array<{ content: string }> = []
+    let rejectSteer!: (error: Error) => void
+    const steerSettled = new Promise<void>((_resolve, reject) => {
+      rejectSteer = reject
+    })
+    let steerTurnCalls = 0
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.title = "Chat"
+    store.chat.sessionToken = "thread-1"
+    await store.enqueueMessage("chat-1", {
+      id: "queued-race",
+      content: "follow up during completion",
+      attachments: [],
+      provider: "codex",
+      model: "gpt-5.4",
+      planMode: false,
+    })
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async startSession() {
+          return "thread-1"
+        },
+        async startTurn(args: { content: string }): Promise<HarnessTurn> {
+          startTurnCalls.push(args)
+          const stream = new AsyncEventQueue<any>()
+          streams.push(stream)
+          return {
+            provider: "codex",
+            providerTurnId: `turn-${startTurnCalls.length}`,
+            stream,
+            interrupt: async () => {},
+            close: () => stream.close(),
+          }
+        },
+        startSteerTurn() {
+          steerTurnCalls += 1
+          return { accepted: Promise.resolve(), settled: steerSettled }
+        },
+      } as never,
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "codex",
+      content: "initial prompt",
+      model: "gpt-5.4",
+    })
+    streams[0]?.push({
+      type: "transcript" as const,
+      entry: timestamped({
+        kind: "system_init",
+        provider: "codex",
+        model: "gpt-5.4",
+        tools: [],
+        agents: [],
+        slashCommands: [],
+        mcpServers: [],
+      }),
+    })
+    await waitFor(() => coordinator.getActiveStatuses().get("chat-1") === "running")
+
+    await coordinator.steer({
+      type: "message.steer",
+      chatId: "chat-1",
+      queuedMessageId: "queued-race",
+    })
+    await waitFor(() => steerTurnCalls === 1)
+
+    streams[0]?.push({
+      type: "transcript" as const,
+      entry: timestamped({
+        kind: "result",
+        subtype: "success",
+        isError: false,
+        durationMs: 0,
+        result: "",
+      }),
+    })
+    streams[0]?.close()
+    await waitFor(() => store.turnFinishedCount === 1)
+
+    expect(startTurnCalls).toHaveLength(1)
+    expect(store.getQueuedMessage("chat-1", "queued-race")).not.toBeNull()
+
+    rejectSteer(new Error("turn completed before steer acknowledgement"))
+    await waitFor(() => startTurnCalls.length === 2)
+
+    expect(store.getQueuedMessage("chat-1", "queued-race")).toBeNull()
+    expect(startTurnCalls[1]?.content).toContain("follow up during completion")
+
+    for (const stream of streams) stream.close()
+  })
+
+  test("removes a recovered steer queue record without submitting its persisted prompt again", async () => {
+    const startTurnCalls: Array<{ content: string }> = []
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.title = "Chat"
+    store.chat.sessionToken = "thread-1"
+    store.messages.push({
+      ...timestamped({
+        kind: "user_prompt",
+        content: "already accepted follow up",
+        steered: true,
+      }),
+      _id: "queued-persisted",
+    } as TranscriptEntry)
+    await store.enqueueMessage("chat-1", {
+      id: "queued-persisted",
+      content: "already accepted follow up",
+      attachments: [],
+      provider: "codex",
+      model: "gpt-5.4",
+      planMode: false,
+    })
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async startSession() {
+          return "thread-1"
+        },
+        async startTurn(args: { content: string }): Promise<HarnessTurn> {
+          startTurnCalls.push(args)
+          async function* stream() {
+            yield {
+              type: "transcript" as const,
+              entry: timestamped({
+                kind: "result",
+                subtype: "success",
+                isError: false,
+                durationMs: 0,
+                result: "",
+              }),
+            }
+          }
+          return {
+            provider: "codex",
+            providerTurnId: "turn-1",
+            stream: stream(),
+            interrupt: async () => {},
+            close: () => {},
+          }
+        },
+      } as never,
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "codex",
+      content: "initial prompt",
+      model: "gpt-5.4",
+    })
+    await waitFor(() => store.turnFinishedCount === 1)
+    await waitFor(() => store.getQueuedMessage("chat-1", "queued-persisted") === null)
+
+    expect(startTurnCalls).toHaveLength(1)
+    expect(startTurnCalls[0]?.content.split("\n", 1)[0]).toBe("initial prompt")
+    expect(startTurnCalls[0]?.content).not.toContain("already accepted follow up")
+  })
+
+  test("uses the restart fallback while a Codex plan response is pending", async () => {
+    const streams: AsyncEventQueue<any>[] = []
+    const startTurnCalls: Array<{ content: string }> = []
+    let requestToolInput: ((request: any) => Promise<unknown>) | undefined
+    let interruptCalls = 0
+    let nativeSteerCalls = 0
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.title = "Chat"
+    store.chat.sessionToken = "thread-1"
+    await store.enqueueMessage("chat-1", {
+      id: "queued-after-plan",
+      content: "change the plan",
+      attachments: [],
+      provider: "codex",
+      model: "gpt-5.4",
+      planMode: true,
+    })
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        async startSession() {
+          return "thread-1"
+        },
+        async startTurn(args: {
+          content: string
+          onToolRequest: (request: any) => Promise<unknown>
+        }): Promise<HarnessTurn> {
+          startTurnCalls.push(args)
+          requestToolInput ??= args.onToolRequest
+          const stream = new AsyncEventQueue<any>()
+          streams.push(stream)
+          return {
+            provider: "codex",
+            providerTurnId: `turn-${startTurnCalls.length}`,
+            stream,
+            interrupt: async () => {
+              interruptCalls += 1
+              stream.close()
+            },
+            close: () => stream.close(),
+          }
+        },
+        startSteerTurn() {
+          nativeSteerCalls += 1
+          return { accepted: Promise.resolve(), settled: Promise.resolve() }
+        },
+      } as never,
+    })
+
+    await coordinator.send({
+      type: "chat.send",
+      chatId: "chat-1",
+      provider: "codex",
+      content: "make a plan",
+      model: "gpt-5.4",
+      planMode: true,
+    })
+    streams[0]?.push({
+      type: "transcript" as const,
+      entry: timestamped({
+        kind: "system_init",
+        provider: "codex",
+        model: "gpt-5.4",
+        tools: [],
+        agents: [],
+        slashCommands: [],
+        mcpServers: [],
+      }),
+    })
+    await waitFor(() => coordinator.getActiveStatuses().get("chat-1") === "running")
+    if (!requestToolInput) throw new Error("missing Codex tool callback")
+    const toolResponse = requestToolInput({
+      tool: {
+        kind: "tool",
+        toolKind: "exit_plan_mode",
+        toolName: "ExitPlanMode",
+        toolId: "exit-plan-1",
+        input: { plan: "Initial plan" },
+      },
+    })
+    await waitFor(() => coordinator.getPendingTool("chat-1")?.toolKind === "exit_plan_mode")
+
+    await coordinator.steer({
+      type: "message.steer",
+      chatId: "chat-1",
+      queuedMessageId: "queued-after-plan",
+    })
+    await toolResponse
+
+    expect(nativeSteerCalls).toBe(0)
+    expect(interruptCalls).toBe(1)
+    expect(startTurnCalls).toHaveLength(2)
+    expect(startTurnCalls[1]?.content).toContain("change the plan")
+    expect(store.getQueuedMessage("chat-1", "queued-after-plan")).toBeNull()
+
+    for (const stream of streams) stream.close()
+  })
 })
 
 describe("AgentCoordinator claude integration", () => {
@@ -2257,7 +2669,7 @@ describe("concurrent agents notice injection", () => {
     await coordinator.send({ type: "chat.send", chatId: "chat-2", provider: "claude", content: "second prompt", model: "claude-opus-4-1" })
 
     expect(prompts).toHaveLength(2)
-    // chat-1 started alone — nothing is appended.
+    // chat-1 started alone — no automatic instructions.
     expect(prompts[0]).toBe("first prompt")
     // chat-2 started while chat-1 was running in the same directory.
     expect(prompts[1]?.startsWith("second prompt")).toBe(true)
