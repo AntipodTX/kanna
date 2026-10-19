@@ -84,6 +84,114 @@ describe("CodexAppServerManager", () => {
     expect((process.messages[2] as any).method).toBe("thread/start")
   })
 
+  test("waits for in-flight thread initialization before starting a turn", async () => {
+    let resolveThreadStartObserved!: () => void
+    const threadStartObserved = new Promise<void>((resolve) => {
+      resolveThreadStartObserved = resolve
+    })
+    let threadStartRequestId: string | undefined
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        threadStartRequestId = message.id
+        resolveThreadStartObserved()
+      } else if (message.method === "turn/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { turn: { id: "turn-1", status: "inProgress", error: null } },
+        })
+      }
+    })
+
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => process as never,
+    })
+    const sessionArgs = {
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    }
+
+    const firstSession = manager.startSession(sessionArgs)
+    const secondTurn = manager.startSession(sessionArgs).then(() => manager.startTurn({
+      chatId: "chat-1",
+      model: "gpt-5.4",
+      content: "Hello",
+      planMode: false,
+      onToolRequest: async () => ({}),
+    }))
+
+    await threadStartObserved
+    await Promise.resolve()
+    expect(process.messages.some((message: any) => message.method === "turn/start")).toBe(false)
+    process.writeServerMessage({
+      id: threadStartRequestId,
+      result: { thread: { id: "thread-1" }, model: "gpt-5.4", reasoningEffort: "high" },
+    })
+    await firstSession
+    await secondTurn
+
+    const turnStart = process.messages.find((message: any) => message.method === "turn/start") as any
+    expect(turnStart.params.threadId).toBe("thread-1")
+    expect(process.messages.filter((message: any) => message.method === "thread/start")).toHaveLength(1)
+  })
+
+  test("rejects in-flight thread initialization when the session is stopped", async () => {
+    let resolveThreadStartObserved!: () => void
+    const threadStartObserved = new Promise<void>((resolve) => {
+      resolveThreadStartObserved = resolve
+    })
+    const process = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        resolveThreadStartObserved()
+      }
+    })
+    const replacementProcess = new FakeCodexProcess((message, child) => {
+      if (message.method === "initialize") {
+        child.writeServerMessage({ id: message.id, result: { userAgent: "codex-test" } })
+      } else if (message.method === "thread/start") {
+        child.writeServerMessage({
+          id: message.id,
+          result: { thread: { id: "thread-2" }, model: "gpt-5.4", reasoningEffort: "high" },
+        })
+      }
+    })
+    let spawnCount = 0
+    const manager = new CodexAppServerManager({
+      spawnProcess: () => (spawnCount++ === 0 ? process : replacementProcess) as never,
+    })
+
+    const sessionStart = manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+    await threadStartObserved
+
+    let startError: unknown
+    const settledSessionStart = sessionStart.catch((error) => {
+      startError = error
+    })
+    manager.stopSession("chat-1")
+    await settledSessionStart
+
+    expect(startError).toBeInstanceOf(Error)
+    expect((startError as Error).message).toBe("Codex session closed")
+
+    const replacementSession = await manager.startSession({
+      chatId: "chat-1",
+      cwd: "/tmp/project",
+      model: "gpt-5.4",
+      sessionToken: null,
+    })
+    expect(replacementSession).toEqual({ sessionToken: "thread-2", resumeFellBack: false })
+  })
+
   test("falls back to thread/start when thread/resume is recoverably missing", async () => {
     const process = new FakeCodexProcess((message, child) => {
       if (message.method === "initialize") {

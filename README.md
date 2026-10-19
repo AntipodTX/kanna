@@ -7,6 +7,7 @@
 
 ### Fixes
 
+- Avoid Codex thread initialization with an empty thread ID.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
