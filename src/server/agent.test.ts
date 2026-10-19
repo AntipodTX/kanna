@@ -2921,6 +2921,51 @@ test("tracks analytics for new chats, queued messages, and forks", async () => {
       events.close()
     }
   })
+
+
+  test("stops reading a retired Claude stream without disturbing its replacement", async () => {
+    const store = createFakeStore()
+    const replacement = new AsyncEventQueue<any>()
+    let release!: () => void
+    const lateEvents = new Promise<void>(resolve => { release = resolve })
+    let exited!: () => void
+    const retired = new Promise<void>(resolve => { exited = resolve })
+    let starts = 0
+    let consumed = 0
+    const coordinator = new AgentCoordinator({ store: store as never, onStateChange: () => {},
+      startClaudeSession: async () => {
+        const first = ++starts === 1
+        return { provider: "claude", stream: first ? { async *[Symbol.asyncIterator]() {
+          try {
+            await lateEvents
+            for (let i = 0; i < 3; i++) {
+              consumed++
+              yield { type: "transcript" as const, entry: timestamped({ kind: "assistant_text", text: "stale" }) }
+            }
+          } finally { exited() }
+        } } : replacement,
+          interrupt: async () => {}, close: () => { if (!first) replacement.close() },
+          setModel: async () => {}, setPermissionMode: async () => {}, sendPrompt: async () => {},
+        }
+      },
+    })
+    try {
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "first", autoPlan: false })
+      await coordinator.cancel("chat-1")
+      await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "claude", content: "replacement", autoPlan: true })
+      expect(starts).toBe(2)
+      release()
+      await retired
+      expect(consumed).toBe(1)
+      expect(store.messages.some(entry => entry.kind === "assistant_text" && entry.text === "stale")).toBe(false)
+      expect(coordinator.getActiveStatuses().get("chat-1")).toBe("running")
+      expect((coordinator as any).claudeSessions.has("chat-1")).toBe(true)
+    } finally {
+      release()
+      replacement.close()
+      coordinator.dispose()
+    }
+  })
 })
 
 describe("buildConcurrentAgentsNotice", () => {
@@ -2982,7 +3027,7 @@ describe("concurrent agents notice injection", () => {
     await coordinator.send({ type: "chat.send", chatId: "chat-2", provider: "claude", content: "second prompt", model: "claude-opus-4-1" })
 
     expect(prompts).toHaveLength(2)
-    // chat-1 started alone — no automatic instructions.
+    // chat-1 started alone — nothing is appended.
     expect(prompts[0]).toBe("first prompt")
     // chat-2 started while chat-1 was running in the same directory.
     expect(prompts[1]?.startsWith("second prompt")).toBe(true)
