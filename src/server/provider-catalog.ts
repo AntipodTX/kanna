@@ -15,6 +15,7 @@ import type {
 import {
   CLAUDE_CONTEXT_WINDOW_OPTIONS,
   DEFAULT_CLAUDE_MODEL_OPTIONS,
+  DEFAULT_CODEX_MODEL_OPTIONS,
   DEFAULT_CURSOR_MODEL_OPTIONS,
   PROVIDERS,
   codexReasoningEffortLabel,
@@ -353,17 +354,27 @@ export function normalizeServerModel(provider: AgentProvider, model?: string): s
 export function normalizeClaudeModelOptions(
   model: string,
   modelOptions?: ModelOptions,
-  legacyEffort?: string
+  legacyEffort?: string,
+  fallbackModelOptions?: ModelOptions,
 ): ClaudeModelOptions {
   const reasoningEffort = modelOptions?.claude?.reasoningEffort
+  const fallbackReasoningEffort = fallbackModelOptions?.claude?.reasoningEffort
   return {
     reasoningEffort: isClaudeReasoningEffort(reasoningEffort)
       ? reasoningEffort
       : isClaudeReasoningEffort(legacyEffort)
         ? legacyEffort
-        : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort,
-    contextWindow: normalizeClaudeContextWindow(model, modelOptions?.claude?.contextWindow as ClaudeContextWindow | undefined),
-    fastMode: normalizeClaudeFastMode(model, modelOptions?.claude?.fastMode),
+        : isClaudeReasoningEffort(fallbackReasoningEffort)
+          ? fallbackReasoningEffort
+          : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort,
+    contextWindow: normalizeClaudeContextWindow(
+      model,
+      (modelOptions?.claude?.contextWindow ?? fallbackModelOptions?.claude?.contextWindow) as ClaudeContextWindow | undefined,
+    ),
+    fastMode: normalizeClaudeFastMode(
+      model,
+      modelOptions?.claude?.fastMode ?? fallbackModelOptions?.claude?.fastMode,
+    ),
   }
 }
 
@@ -371,23 +382,34 @@ export function normalizeCodexModelOptions(
   model: string,
   modelOptions?: ModelOptions,
   legacyEffort?: string,
+  fallbackModelOptions?: ModelOptions,
 ): CodexModelOptions {
   const reasoningEffort = modelOptions?.codex?.reasoningEffort
+  const fallbackReasoningEffort = fallbackModelOptions?.codex?.reasoningEffort
   // The live catalog (applyCodexModels) decides what each model supports; a
   // model it does not list keeps the static row's rules, or the shared
   // defaults when there is none.
   const liveModels = getServerProviderCatalog("codex").models
   const liveOption = liveModels.find((candidate) => candidate.id === normalizeProviderModelId("codex", model))
+  const fastMode = typeof modelOptions?.codex?.fastMode === "boolean"
+    ? modelOptions.codex.fastMode
+    : typeof fallbackModelOptions?.codex?.fastMode === "boolean"
+      ? fallbackModelOptions.codex.fastMode
+      : DEFAULT_CODEX_MODEL_OPTIONS.fastMode
   return {
     reasoningEffort: normalizeCodexReasoningEffort(
       model,
-      isCodexReasoningEffort(reasoningEffort) ? reasoningEffort : legacyEffort,
+      isCodexReasoningEffort(reasoningEffort)
+        ? reasoningEffort
+        : isCodexReasoningEffort(legacyEffort)
+          ? legacyEffort
+          : fallbackReasoningEffort,
       liveModels,
     ),
     // Spawn-time gating: fast mode only reaches models that advertise the
     // tier, so a stale preference never fails a turn on a model without it.
     fastMode: (liveOption ? Boolean(liveOption.supportsFastMode) : supportsProviderFastMode("codex", model))
-      && modelOptions?.codex?.fastMode === true,
+      && fastMode,
   }
 }
 
@@ -399,11 +421,17 @@ export function serviceTierFromModelOptions(modelOptions: { fastMode: boolean })
 export function normalizePiModelOptions(
   modelOptions?: ModelOptions,
   legacyEffort?: string,
+  fallbackModelOptions?: ModelOptions,
 ): PiModelOptions {
   const reasoningEffort = modelOptions?.pi?.reasoningEffort
+  const fallbackReasoningEffort = fallbackModelOptions?.pi?.reasoningEffort
   return {
     reasoningEffort: normalizePiReasoningEffort(
-      isPiReasoningEffort(reasoningEffort) ? reasoningEffort : legacyEffort,
+      isPiReasoningEffort(reasoningEffort)
+        ? reasoningEffort
+        : isPiReasoningEffort(legacyEffort)
+          ? legacyEffort
+          : fallbackReasoningEffort,
     ),
   }
 }
@@ -411,20 +439,31 @@ export function normalizePiModelOptions(
 export function normalizeGrokModelOptions(
   modelOptions?: ModelOptions,
   legacyEffort?: string,
+  fallbackModelOptions?: ModelOptions,
 ): GrokModelOptions {
   const reasoningEffort = modelOptions?.grok?.reasoningEffort
+  const fallbackReasoningEffort = fallbackModelOptions?.grok?.reasoningEffort
   return {
     reasoningEffort: normalizeGrokReasoningEffort(
-      isGrokReasoningEffort(reasoningEffort) ? reasoningEffort : legacyEffort,
+      isGrokReasoningEffort(reasoningEffort)
+        ? reasoningEffort
+        : isGrokReasoningEffort(legacyEffort)
+          ? legacyEffort
+          : fallbackReasoningEffort,
     ),
   }
 }
 
-export function normalizeCursorModelOptions(modelOptions?: ModelOptions): CursorModelOptions {
+export function normalizeCursorModelOptions(
+  modelOptions?: ModelOptions,
+  fallbackModelOptions?: ModelOptions,
+): CursorModelOptions {
   return {
     fastMode: typeof modelOptions?.cursor?.fastMode === "boolean"
       ? modelOptions.cursor.fastMode
-      : DEFAULT_CURSOR_MODEL_OPTIONS.fastMode,
+      : typeof fallbackModelOptions?.cursor?.fastMode === "boolean"
+        ? fallbackModelOptions.cursor.fastMode
+        : DEFAULT_CURSOR_MODEL_OPTIONS.fastMode,
   }
 }
 

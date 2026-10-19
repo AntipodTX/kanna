@@ -287,8 +287,8 @@ function createWorld(options?: { projectPath?: string }) {
     getPendingTool: () => null,
     cancel: async () => {},
     closeChat: async () => {},
-    forkChat: async (chatId: string) => {
-      requireChat(chatId)
+    forkChat: async (command: { chatId: string }) => {
+      requireChat(command.chatId)
       nextId += 1
       const fork = { ...makeChat(`chat-fork-${nextId}`, Date.now()), title: "Fork" }
       state.chatsById.set(fork.id, fork as never)
@@ -325,7 +325,9 @@ function createWorld(options?: { projectPath?: string }) {
       const queue = state.queuedMessagesByChatId.get(command.chatId) ?? []
       state.queuedMessagesByChatId.set(command.chatId, queue.filter((entry) => entry.id !== command.queuedMessageId))
     },
-  }
+  
+getPendingCodexSteerIds: () => new Set(),
+}
 
   const appSettingsListeners = new Set<(snapshot: unknown) => void>()
   let appSettingsSnapshot: Record<string, unknown> = {

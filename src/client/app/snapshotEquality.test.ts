@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { ChatSnapshot, TranscriptEntry } from "../../shared/types"
-import { applyIncrementalChatSnapshot, foldChatSnapshot } from "./snapshotEquality"
+import { applyIncrementalChatSnapshot, foldChatSnapshot, sameChatSnapshotCore } from "./snapshotEquality"
 
 function entry(id: string): TranscriptEntry {
   return { _id: id, createdAt: 0, kind: "assistant_text", text: id } as TranscriptEntry
@@ -16,6 +16,8 @@ function snapshot(startIndex: number, ids: string[], incremental?: boolean): Cha
       status: "idle",
       isDraining: false,
       provider: "claude",
+      model: null,
+      modelOptions: null,
       planMode: false,
       autoPlan: false,
       sessionToken: null,
@@ -224,6 +226,16 @@ describe("foldChatSnapshot providers", () => {
   })
 })
 
+test("history classification and progress changes reach the UI without transcript changes", () => {
+  for (const change of [
+    { historyRevision: "new" }, { historyIntegrityRevision: "new" },
+    { historyRepair: { phase: "running" as const, message: "Checking history" } },
+  ]) {
+    const current = snapshot(0, ["a"]), incoming = { ...current, runtime: { ...current.runtime, ...change } }
+    expect(foldChatSnapshot(current, null, incoming)).not.toBe(current)
+  }
+})
+
 describe("applyIncrementalChatSnapshot carried fields", () => {
   test("an incremental body without providers or anchor keeps the held ones", () => {
     const current = snapshot(0, ["a"])
@@ -236,5 +248,25 @@ describe("applyIncrementalChatSnapshot carried fields", () => {
     expect(next?.availableProviders).toBe(current.availableProviders)
     expect(next?.readAnchor).toBe(current.readAnchor)
     expect(ids(next)).toEqual(["a", "b"])
+  })
+})
+
+
+describe("sameChatSnapshotCore", () => {
+  test("detects a queued message entering the transient steering state", () => {
+    const before = snapshot(0, [])
+    before.queuedMessages = [{
+      id: "queued-1",
+      content: "follow up",
+      attachments: [],
+      createdAt: 1,
+      steering: false,
+    }]
+    const after = {
+      ...before,
+      queuedMessages: before.queuedMessages.map((message) => ({ ...message, steering: true })),
+    }
+
+    expect(sameChatSnapshotCore(before, after)).toBe(false)
   })
 })
