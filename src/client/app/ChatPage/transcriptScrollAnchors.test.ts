@@ -119,6 +119,12 @@ describe("resolveJumpTarget", () => {
     expect(resolveJumpTarget(withIds, { toolId: "call-2" })).toEqual({ kind: "pin", rowId: withIds[1]!.id })
     expect(resolveJumpTarget(withIds, { toolId: "missing" })).toBeNull()
   })
+
+  test("a named transcript entry lands on its row, including inside a tool group", () => {
+    expect(resolveJumpTarget(rows, { entryId: "m1" })).toEqual({ kind: "pin", rowId: rows[0]!.id })
+    expect(resolveJumpTarget(rows, { entryId: "t2" })).toEqual({ kind: "pin", rowId: rows[1]!.id })
+    expect(resolveJumpTarget(rows, { entryId: "missing" })).toBeNull()
+  })
 })
 
 describe("getRowAnchorMessageId", () => {
