@@ -4,10 +4,13 @@
 
 ### Features
 
+- Codex-style chat input semantics: `/` completes executable commands, `$` completes one or more skills (including plugin-qualified names), and `/compact` runs native thread compaction.
+- Isolated Codex approval prompts with consistent plan-progress rendering.
 
 ### Fixes
 
 - Avoid Codex thread initialization with an empty thread ID.
+- Emit Codex system initialization only once per session.
 
 <p align="center">
   <img src="assets/icon.png" alt="Kanna" width="80" />
