@@ -76,7 +76,7 @@ import {
   normalizeServerModel,
   serviceTierFromModelOptions,
 } from "./provider-catalog"
-import { resolveClaudeApiModelId } from "../shared/types"
+import { CODEX_SLASH_COMMANDS, resolveClaudeApiModelId } from "../shared/types"
 import { fallbackTitleFromMessage } from "./generate-title"
 import { asNumber, asRecord } from "../shared/json"
 import { buildHandoffContext, buildHandoffMessageContent, type HandoffContext } from "./handoff"
@@ -316,6 +316,13 @@ export const RESUME_AFTER_RESTART_MESSAGE = `<system-message>
 Kanna restarted while you were working on this, so your process was stopped mid-task and is now back up. Continue the task you were on from where it left off.
 Whatever you were doing last may not have completed — re-check the state of any file you were editing and any command you had running before assuming it finished.
 </system-message>`
+
+function parseCodexSlashCommand(content: string): typeof CODEX_SLASH_COMMANDS[number] | null {
+  const command = content.trim()
+  return CODEX_SLASH_COMMANDS.includes(command as typeof CODEX_SLASH_COMMANDS[number])
+    ? command as typeof CODEX_SLASH_COMMANDS[number]
+    : null
+}
 
 interface SendMessageOptions {
   provider?: AgentProvider
@@ -1889,8 +1896,8 @@ export class AgentCoordinator {
     // Skills: every "/name" in the prompt, translated per provider:
     //   claude/grok/pi — a leading "/name" passes through (they expand it);
     //                    the rest get the <system-message> failsafe.
-    //   codex          — structured skill input item each + failsafe (added
-    //                    by the codex manager, after attachments).
+    //   codex          — every "$name" becomes a structured skill input item
+    //                    plus a failsafe (added by the codex manager).
     //   cursor         — <system-message> failsafe only (no headless expansion).
     const skills = await this.resolvePromptSkills(args.provider, args.chatId, args.content)
     let wireContent = args.steered ? buildSteeredMessageContent(args.content) : args.content
@@ -2178,6 +2185,12 @@ export class AgentCoordinator {
   async send(command: Extract<ClientCommand, { type: "chat.send" }>) {
     let chatId = command.chatId
 
+    const requestedNewChatCommand = command.provider === "codex"
+      ? parseCodexSlashCommand(command.content)
+      : null
+    if (!chatId && requestedNewChatCommand) {
+      throw new Error(`${requestedNewChatCommand} requires an existing Codex chat`)
+    }
 
     if (!chatId) {
       if (!command.projectId) {
@@ -2194,6 +2207,24 @@ export class AgentCoordinator {
     if (chat.archivedAt) {
       await this.store.unarchiveChat(chatId)
     }
+    const provider = this.resolveProvider(command, chat.provider)
+    const slashCommand = provider === "codex" ? parseCodexSlashCommand(command.content) : null
+    if (slashCommand) {
+      if (command.attachments?.length) throw new Error(`${slashCommand} cannot be used with attachments`)
+      if (this.activeTurns.has(chatId)) throw new Error(`${slashCommand} cannot run while a turn is active`)
+      if (!chat.sessionToken) throw new Error(`${slashCommand} requires an existing Codex thread`)
+      const project = this.store.getProject(chat.projectId)
+      if (!project) throw new Error("Project not found")
+      await this.codexManager.runSlashCommand({
+        chatId,
+        cwd: project.localPath,
+        threadId: chat.sessionToken,
+        command: slashCommand,
+      })
+      await this.store.appendMessage(chatId, timestamped({ kind: "compact_boundary" }))
+      this.emitStateChange(chatId)
+      return { chatId }
+    }
     if (this.activeTurns.has(chatId)) {
       this.analytics.track("message_sent")
       const queuedMessage = await this.enqueueMessage(chatId, command.content, command.attachments ?? [], {
@@ -2207,7 +2238,6 @@ export class AgentCoordinator {
       return { chatId, queuedMessageId: queuedMessage.id, queued: true as const }
     }
 
-    const provider = this.resolveProvider(command, chat.provider)
     const settings = this.getProviderSettings(provider, command)
     this.analytics.track("message_sent")
     await this.startTurnForChat({
@@ -2329,6 +2359,11 @@ export class AgentCoordinator {
         return { provider: "claude", skills: scanClaudeSkills({ cwd }), origin: "filesystem" }
       }
       case "codex": {
+        const commands: HarnessSkill[] = CODEX_SLASH_COMMANDS.map((slashCommand) => ({
+          name: slashCommand.slice(1),
+          description: "Compact the current Codex thread",
+          source: "command",
+        }))
         const live = command.chatId
           ? await this.codexManager.listSkills({ chatId: command.chatId, cwd })
           : null
@@ -2339,9 +2374,9 @@ export class AgentCoordinator {
             source: "skill" as const,
             path: skill.path,
           }))
-          return { provider: "codex", skills, origin: "live" }
+          return { provider: "codex", skills: [...commands, ...skills], origin: "live" }
         }
-        return { provider: "codex", skills: scanCodexSkills({ cwd }), origin: "filesystem" }
+        return { provider: "codex", skills: [...commands, ...scanCodexSkills({ cwd })], origin: "filesystem" }
       }
       case "cursor":
         // Cursor has no enumeration protocol; the scan mirrors the CLI's own
@@ -2384,7 +2419,8 @@ export class AgentCoordinator {
    */
   private async resolvePromptSkills(provider: AgentProvider, chatId: string, content: string): Promise<SkillReference[]> {
     const expandsLeading = provider === "claude" || provider === "grok" || provider === "pi"
-    const mentions = findSkillMentions(content).filter((mention) => !(expandsLeading && mention.leading))
+    const mentions = findSkillMentions(content, provider === "codex" ? "$" : "/")
+      .filter((mention) => !(expandsLeading && mention.leading))
     if (mentions.length === 0) return []
     const { skills } = await this.listSkills({ type: "chat.listSkills", provider, chatId })
     return resolveSkillMentions(mentions, skills)
