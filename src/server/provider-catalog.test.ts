@@ -10,6 +10,7 @@ import {
   normalizeClaudeModelOptions,
   normalizeCodexModelOptions,
   normalizeCursorModelOptions,
+  normalizePiModelOptions,
   normalizeServerModel,
   resetServerProvidersForTests,
   serviceTierFromModelOptions,
@@ -75,6 +76,51 @@ describe("provider catalog normalization", () => {
     }).fastMode).toBe(false)
 
     expect(serviceTierFromModelOptions(normalizeClaudeModelOptions("claude-opus-4-8", undefined))).toBeUndefined()
+  })
+
+  test("prefers explicit options, then legacy effort, then persisted options", () => {
+    const persistedClaudeOptions = {
+      claude: { reasoningEffort: "max" as const, contextWindow: "1m" as const, fastMode: true },
+    }
+    expect(normalizeClaudeModelOptions(
+      "claude-opus-4-8",
+      undefined,
+      "low",
+      persistedClaudeOptions,
+    )).toEqual({
+      reasoningEffort: "low",
+      contextWindow: "1m",
+      fastMode: true,
+    })
+    expect(normalizeClaudeModelOptions(
+      "claude-opus-4-8",
+      { claude: { reasoningEffort: "medium" } },
+      "low",
+      persistedClaudeOptions,
+    )).toEqual({
+      reasoningEffort: "medium",
+      contextWindow: "1m",
+      fastMode: true,
+    })
+
+    const persistedCodexOptions = {
+      codex: { reasoningEffort: "ultra" as const, fastMode: true },
+    }
+    expect(normalizeCodexModelOptions(
+      "gpt-5.6-sol",
+      { codex: { fastMode: false } },
+      "low",
+      persistedCodexOptions,
+    )).toEqual({
+      reasoningEffort: "low",
+      fastMode: false,
+    })
+    expect(normalizeCursorModelOptions(undefined, {
+      cursor: { fastMode: true },
+    })).toEqual({ fastMode: true })
+    expect(normalizePiModelOptions(undefined, undefined, {
+      pi: { reasoningEffort: "high" },
+    })).toEqual({ reasoningEffort: "high" })
   })
 
   test("normalizes Claude context window only for supported models", () => {

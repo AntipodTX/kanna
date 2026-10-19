@@ -14,7 +14,19 @@ import {
 const ROW_WRAPPER_CLASS = "mx-auto max-w-[800px] pb-5"
 
 // Minimal test harness mirroring how ChatTranscriptViewport renders resolved rows.
-function TestTranscript({ messages }: { messages: HydratedTranscriptMessage[] }) {
+function TestTranscript({
+  messages,
+  onEditUserPrompt,
+  isEditUserPromptDisabled,
+  onForkUserPrompt,
+  isForkUserPromptDisabled,
+}: {
+  messages: HydratedTranscriptMessage[]
+  onEditUserPrompt?: (messageId: string, content: string) => void
+  isEditUserPromptDisabled?: boolean
+  onForkUserPrompt?: (messageId: string) => void
+  isForkUserPromptDisabled?: boolean
+}) {
   const rows = buildResolvedTranscriptRows(messages, {
     isLoading: false,
     latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null },
@@ -33,6 +45,11 @@ function TestTranscript({ messages }: { messages: HydratedTranscriptMessage[] })
             onToolGroupExpandedChange={() => undefined}
             onAskUserQuestionSubmit={() => undefined}
             onExitPlanModeConfirm={() => undefined}
+            {...{ onCodexApprovalDecision: () => undefined }}
+            onEditUserPrompt={onEditUserPrompt}
+            isEditUserPromptDisabled={isEditUserPromptDisabled}
+            onForkUserPrompt={onForkUserPrompt}
+            isForkUserPromptDisabled={isForkUserPromptDisabled}
           />
         </div>
       ))}
@@ -40,8 +57,24 @@ function TestTranscript({ messages }: { messages: HydratedTranscriptMessage[] })
   )
 }
 
-function renderTranscript(messages: HydratedTranscriptMessage[]) {
-  return renderToStaticMarkup(<TestTranscript messages={messages} />)
+function renderTranscript(
+  messages: HydratedTranscriptMessage[],
+  options: {
+    onEditUserPrompt?: (messageId: string, content: string) => void
+    isEditUserPromptDisabled?: boolean
+    onForkUserPrompt?: (messageId: string) => void
+    isForkUserPromptDisabled?: boolean
+  } = {},
+) {
+  return renderToStaticMarkup(
+    <TestTranscript
+      messages={messages}
+      onEditUserPrompt={options.onEditUserPrompt}
+      isEditUserPromptDisabled={options.isEditUserPromptDisabled}
+      onForkUserPrompt={options.onForkUserPrompt}
+      isForkUserPromptDisabled={options.isForkUserPromptDisabled}
+    />
+  )
 }
 
 function countRowWrappers(html: string) {
@@ -87,6 +120,91 @@ describe("KannaTranscript", () => {
     expect(html).toContain("spec.pdf")
     expect(html).toContain("application/pdf")
     expect(html).toContain("What are these files about?")
+  })
+
+  test("renders an edit control for editable user prompts", () => {
+    const html = renderTranscript([
+      {
+        id: "user-edit-1",
+        kind: "user_prompt",
+        content: "Adjust this",
+        attachments: [],
+        timestamp: new Date().toISOString(),
+      },
+    ], {
+      onEditUserPrompt: () => undefined,
+    })
+
+    expect(html).toContain("Edit message")
+  })
+
+  test("renders a fork control for forkable user prompts", () => {
+    const html = renderTranscript([
+      {
+        id: "user-fork-1",
+        kind: "user_prompt",
+        content: "Branch from here",
+        attachments: [],
+        timestamp: new Date().toISOString(),
+      },
+    ], {
+      onForkUserPrompt: () => undefined,
+    })
+
+    expect(html).toContain("Fork message")
+  })
+
+  test("keeps the edit control visible while temporarily disabled", () => {
+    const html = renderTranscript([
+      {
+        id: "user-edit-disabled-1",
+        kind: "user_prompt",
+        content: "Keep the edit affordance in place",
+        attachments: [],
+        timestamp: new Date().toISOString(),
+      },
+    ], {
+      onEditUserPrompt: () => undefined,
+      isEditUserPromptDisabled: true,
+    })
+
+    expect(html).toContain("Edit message")
+    expect(html).toContain("disabled")
+  })
+
+  test("renders the edit control visibly without requiring hover", () => {
+    const html = renderTranscript([
+      {
+        id: "user-edit-visible-1",
+        kind: "user_prompt",
+        content: "Make the control discoverable",
+        attachments: [],
+        timestamp: new Date().toISOString(),
+      },
+    ], {
+      onEditUserPrompt: () => undefined,
+    })
+
+    expect(html).toContain("Edit message")
+    expect(html).not.toContain("opacity-0")
+  })
+
+  test("keeps the fork control visible while temporarily disabled", () => {
+    const html = renderTranscript([
+      {
+        id: "user-fork-disabled-1",
+        kind: "user_prompt",
+        content: "Keep the fork affordance in place",
+        attachments: [],
+        timestamp: new Date().toISOString(),
+      },
+    ], {
+      onForkUserPrompt: () => undefined,
+      isForkUserPromptDisabled: true,
+    })
+
+    expect(html).toContain("Fork message")
+    expect(html).toContain("disabled")
   })
 
   test("renders uploaded image attachments using the server content URL", () => {

@@ -8,9 +8,11 @@ import {
   type CodexModelOptions,
   type CursorModelOptions,
   type DefaultProviderPreference,
+  type ModelOptions,
   type PiModelOptions,
   type ProviderPreference,
   type ProviderModelOptionsByProvider,
+  type ProviderCatalogEntry,
 } from "../../shared/types"
 import {
   createDefaultProviderDefaults,
@@ -56,10 +58,26 @@ export function normalizeDefaultProvider(value?: string): DefaultProviderPrefere
   return "last_used"
 }
 
-function composerStateForProvider(provider: AgentProvider, value?: ProviderPreferenceInput): ComposerState {
+export function composerStateForProvider(provider: AgentProvider, value?: ProviderPreferenceInput, _providerConfig?: ProviderCatalogEntry): ComposerState {
   // The normalizer record is keyed by provider, so the provider tag always matches
   // its normalized modelOptions shape; TS can't prove that across the union.
   return { provider, ...normalizeProviderPreference(provider, value) } as ComposerState
+}
+
+export function composerStateFromModelSettings(settings?: {
+  provider?: AgentProvider | null
+  model?: string | null
+  modelOptions?: ModelOptions | null
+  planMode?: boolean
+  autoPlan?: boolean
+} | null, providerConfig?: ProviderCatalogEntry): ComposerState | null {
+  if (!settings?.provider || !settings.model) return null
+  return composerStateForProvider(settings.provider, {
+    model: settings.model,
+    modelOptions: settings.modelOptions?.[settings.provider],
+    planMode: settings.planMode,
+    autoPlan: settings.autoPlan,
+  }, providerConfig)
 }
 
 type PersistedComposerState = ProviderPreferenceInput & { provider: AgentProvider }
@@ -225,16 +243,21 @@ function getStoredComposerState(
 }
 
 function withChatComposerState(
-  state: Pick<ChatPreferencesState, "chatStates" | "defaultProvider" | "providerDefaults" | "legacyComposerState">,
+  state: Pick<ChatPreferencesState, "chatStates" | "defaultProvider" | "providerDefaults" | "legacyComposerState" | "pendingComposerEdits">,
   chatId: string,
-  transform: (composerState: ComposerState) => ComposerState
+  transform: (composerState: ComposerState) => ComposerState,
+  userEdit = true
 ) {
   const currentComposerState = getStoredComposerState(state, chatId)
+  const nextComposerState = transform(currentComposerState)
   return {
     chatStates: {
       ...state.chatStates,
-      [chatId]: transform(currentComposerState),
+      [chatId]: nextComposerState,
     },
+    ...(userEdit && !sameComposerState(currentComposerState, nextComposerState)
+      ? { pendingComposerEdits: { ...state.pendingComposerEdits, [chatId]: true as const } }
+      : {}),
   }
 }
 
@@ -249,6 +272,9 @@ interface ChatPreferencesState {
    * defaults must never read as an intentional switch.
    */
   pendingProviderSwitches: Record<string, true>
+  /** Explicit choices waiting for the runtime to acknowledge the same settings. */
+  pendingComposerEdits: Record<string, true>
+  runtimeHydratedChatIds: Record<string, true>
   legacyComposerState: ComposerState | null
   setDefaultProvider: (provider: DefaultProviderPreference) => void
   syncProviderDefaults: (defaultProvider: DefaultProviderPreference, providerDefaults: ChatProviderPreferences) => void
@@ -261,7 +287,8 @@ interface ChatPreferencesState {
   /** `seed` is the chat's own record (see ComposerSeed); used only when nothing is stored for it. */
   getComposerState: (chatId: string, seed?: ComposerSeed | null) => ComposerState
   initializeComposerForChat: (chatId: string, options?: { sourceState?: ComposerState | null }) => void
-  setComposerState: (chatId: string, composerState: ComposerState) => void
+  setComposerState: (chatId: string, composerState: ComposerState, options?: { userEdit?: boolean; providerConfig?: ProviderCatalogEntry }) => void
+  hydrateComposerFromRuntime: (chatId: string, composerState: ComposerState, options?: { providerConfig?: ProviderCatalogEntry }) => void
   setChatComposerProvider: (chatId: string, provider: AgentProvider) => void
   setChatComposerModel: (chatId: string, model: string) => void
   setChatComposerModelOptions: (
@@ -311,6 +338,8 @@ export const useChatPreferencesStore = create<ChatPreferencesState>()(
     providerDefaults: createDefaultProviderDefaults(),
     chatStates: {},
     pendingProviderSwitches: {},
+    pendingComposerEdits: {},
+    runtimeHydratedChatIds: {},
     legacyComposerState: null,
     setDefaultProvider: (defaultProvider) => set({ defaultProvider }),
     syncProviderDefaults: (defaultProvider, providerDefaults) =>
@@ -392,17 +421,32 @@ export const useChatPreferencesStore = create<ChatPreferencesState>()(
             },
           }
         }),
-      setComposerState: (chatId, composerState) =>
-        set((state) => ({
-          chatStates: {
-            ...state.chatStates,
-            // Claude/Codex states are re-normalized (model aliases, effort clamps);
-            // Cursor/Pi states are historically stored as provided.
-            [chatId]: composerState.provider === "claude" || composerState.provider === "codex"
-              ? composerStateForProvider(composerState.provider, composerState)
-              : cloneComposerState(composerState),
-          },
-        })),
+      setComposerState: (chatId, composerState, options) =>
+        set((state) => withChatComposerState(state, chatId,
+          () => composerStateForProvider(composerState.provider, composerState, options?.providerConfig), options?.userEdit === true)),
+      hydrateComposerFromRuntime: (chatId, composerState, options) =>
+        set((state) => {
+          const current = state.chatStates[chatId]
+          if (state.pendingProviderSwitches[chatId] && current && current.provider !== composerState.provider) {
+            return state
+          }
+          const incoming = composerStateForProvider(composerState.provider, composerState, options?.providerConfig)
+          if (state.pendingComposerEdits[chatId] && current && !sameComposerState(current, incoming)) {
+            return state
+          }
+          const { [chatId]: _acknowledged, ...pendingComposerEdits } = state.pendingComposerEdits
+          return {
+            chatStates: {
+              ...state.chatStates,
+              [chatId]: incoming,
+            },
+            pendingComposerEdits,
+            runtimeHydratedChatIds: {
+              ...state.runtimeHydratedChatIds,
+              [chatId]: true,
+            },
+          }
+        }),
       setChatComposerProvider: (chatId, provider) =>
         set((state) => withChatComposerState(state, chatId, () => composerFromProviderDefaults(provider, state.providerDefaults))),
       setChatComposerModel: (chatId, model) =>
@@ -425,14 +469,9 @@ export const useChatPreferencesStore = create<ChatPreferencesState>()(
         set((state) => withChatComposerState(state, chatId, (composerState) => ({
           ...composerState,
           planMode: false,
-        }))),
+        }), false)),
       resetChatComposerFromProvider: (chatId, provider) =>
-        set((state) => ({
-          chatStates: {
-            ...state.chatStates,
-            [chatId]: composerFromProviderDefaults(provider, state.providerDefaults),
-          },
-        })),
+        set((state) => withChatComposerState(state, chatId, () => composerFromProviderDefaults(provider, state.providerDefaults))),
       markPendingProviderSwitch: (chatId) =>
         set((state) => (
           state.pendingProviderSwitches[chatId]
