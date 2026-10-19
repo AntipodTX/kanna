@@ -1155,6 +1155,8 @@ export class AgentCoordinator {
   private readonly foregroundTasks = new Map<string, Map<string, { task: TaskStart; startedAt: number }>>()
   readonly claudeSessions = new Map<string, ClaudeSessionState>()
   private readonly idleSessionTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private readonly pendingCodexSteers = new Map<string, Set<string>>()
+  private readonly activeCodexCommands = new Map<string, symbol>()
   private idleSessionTimeoutMs: number | null = null
 
   constructor(args: AgentCoordinatorArgs) {
@@ -1250,6 +1252,7 @@ export class AgentCoordinator {
   }
 
   dispose() {
+    this.activeCodexCommands.clear()
     for (const session of this.claudeSessions.values()) {
       session.forceClosed = true
       session.session.close()
@@ -1569,6 +1572,7 @@ export class AgentCoordinator {
 
   async closeChat(chatId: string) {
     this.clearIdleSessionTimer(chatId)
+    this.activeCodexCommands.delete(chatId)
     await this.stopDraining(chatId)
     const claudeSession = this.claudeSessions.get(chatId)
     if (claudeSession) {
@@ -1590,7 +1594,8 @@ export class AgentCoordinator {
 
   private isIdleSessionCloseEligible(chatId: string) {
     if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId)
-      || this.claudeReadinessCommits.has(chatId) || this.drainingStreams.has(chatId)) return false
+      || this.claudeReadinessCommits.has(chatId) || this.activeCodexCommands.has(chatId)
+      || this.drainingStreams.has(chatId)) return false
 
     const claudeSession = this.claudeSessions.get(chatId)
     if (claudeSession) {
@@ -1706,7 +1711,13 @@ export class AgentCoordinator {
     return queued
   }
 
+  private hasPendingCodexSteer(chatId: string, queuedMessageId?: string) {
+    const pending = this.pendingCodexSteers.get(chatId)
+    return queuedMessageId ? Boolean(pending?.has(queuedMessageId)) : Boolean(pending?.size)
+  }
+
   private async dequeueAndStartQueuedMessage(chatId: string, queuedMessage: QueuedChatMessage, options?: { steered?: boolean }) {
+    if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
     await this.store.removeQueuedMessage(chatId, queuedMessage.id)
     const chat = this.store.requireChat(chatId)
     const provider = this.resolveProvider(queuedMessage, chat.provider)
@@ -1727,7 +1738,7 @@ export class AgentCoordinator {
   }
 
   private async maybeStartNextQueuedMessage(chatId: string) {
-    if (this.activeTurns.has(chatId)) return false
+    if (this.activeTurns.has(chatId) || this.activeCodexCommands.has(chatId)) return false
     const nextQueuedMessage = typeof this.store.getQueuedMessages === "function"
       ? this.store.getQueuedMessages(chatId)[0]
       : undefined
@@ -1900,6 +1911,7 @@ export class AgentCoordinator {
     appendUserPrompt: boolean
     steered?: boolean
   }) {
+    if (this.activeCodexCommands.has(args.chatId)) throw new Error("A Codex command is already running")
     this.clearIdleSessionTimer(args.chatId)
 
     // Close any lingering draining stream before starting a new turn.
@@ -2342,6 +2354,7 @@ export class AgentCoordinator {
       this.analytics.track("chat_created")
     }
 
+    if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
     const chat = this.store.requireChat(chatId)
     // Sending a message to an archived chat resurrects it (viewing alone
     // never unarchives).
@@ -2352,18 +2365,31 @@ export class AgentCoordinator {
     const slashCommand = provider === "codex" ? parseCodexSlashCommand(command.content) : null
     if (slashCommand) {
       if (command.attachments?.length) throw new Error(`${slashCommand} cannot be used with attachments`)
-      if (this.activeTurns.has(chatId)) throw new Error(`${slashCommand} cannot run while a turn is active`)
+      if (this.activeTurns.has(chatId) || this.startingClaudeTurns.has(chatId) || this.hasPendingCodexSteer(chatId)) throw new Error(`${slashCommand} cannot run while a turn is active`)
+      if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
       if (!chat.sessionToken) throw new Error(`${slashCommand} requires an existing Codex thread`)
       const project = this.store.getProject(chat.projectId)
       if (!project) throw new Error("Project not found")
-      await this.codexManager.runSlashCommand({
-        chatId,
-        cwd: project.localPath,
-        threadId: chat.sessionToken,
-        command: slashCommand,
-      })
-      await this.store.appendMessage(chatId, timestamped({ kind: "compact_boundary" }))
-      this.emitStateChange(chatId)
+      const operation = Symbol(slashCommand)
+      this.activeCodexCommands.set(chatId, operation)
+      this.clearIdleSessionTimer(chatId)
+      try {
+        await this.codexManager.runSlashCommand({
+          chatId,
+          cwd: project.localPath,
+          threadId: chat.sessionToken,
+          command: slashCommand,
+        })
+        if (this.activeCodexCommands.get(chatId) !== operation) return { chatId }
+        await this.store.appendMessage(chatId, timestamped({ kind: "compact_boundary" }))
+        if (this.activeCodexCommands.get(chatId) !== operation) return { chatId }
+        this.emitStateChange(chatId)
+      } finally {
+        if (this.activeCodexCommands.get(chatId) === operation) {
+          this.activeCodexCommands.delete(chatId)
+          this.scheduleIdleSessionClose(chatId)
+        }
+      }
       return { chatId }
     }
     if (this.activeTurns.has(chatId)) {
@@ -2644,6 +2670,7 @@ export class AgentCoordinator {
   }
 
   async forkChat(chatId: string) {
+    if (this.activeCodexCommands.has(chatId)) throw new Error("A Codex command is already running")
     const chat = this.store.requireChat(chatId)
     if (!chat.provider) {
       throw new Error("Chat must have a provider before forking")
