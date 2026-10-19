@@ -3241,6 +3241,61 @@ describe("AgentCoordinator codex integration", () => {
       }
     })
   }
+
+
+  for (const busyState of ["Claude startup", "pending Codex steer"] as const) {
+    test(`does not start a Codex command during ${busyState}`, async () => {
+      const store = createFakeStore()
+      store.chat.provider = "codex"
+      store.chat.sessionToken = "thread-1"
+      let commandCalls = 0
+      const coordinator = new AgentCoordinator({
+        store: store as never,
+        onStateChange: () => {},
+        codexManager: { async runSlashCommand() { commandCalls += 1 } } as never,
+      })
+      if (busyState === "Claude startup") (coordinator as any).startingClaudeTurns.set("chat-1", Symbol("startup"))
+      else (coordinator as any).pendingCodexSteers.set("chat-1", new Set(["queued-1"]))
+      await expect(coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" }))
+        .rejects.toThrow("/compact cannot run while a turn is active")
+      expect(commandCalls).toBe(0)
+      expect(store.messages).toEqual([])
+    })
+  }
+
+
+  test("does not fork or edit a source chat while its native Codex compaction is pending", async () => {
+    const store = createFakeStore()
+    store.chat.provider = "codex"
+    store.chat.sessionToken = "thread-1"
+    let started = false
+    let release!: () => void
+    const commandReady = new Promise<void>((resolve) => { release = resolve })
+    let forkCalls = 0
+    const forkChat = store.forkChat.bind(store)
+    store.forkChat = async () => { forkCalls += 1; return forkChat() }
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: {
+        hasSession: () => true,
+        async runSlashCommand() { started = true; await commandReady },
+      } as never,
+    })
+    const command = coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" })
+    try {
+      await waitFor(() => started)
+      await expect(coordinator.forkChat("chat-1")).rejects.toThrow("A Codex command is already running")
+      await expect(coordinator.forkChat({ type: "chat.fork", chatId: "chat-1", messageId: "prompt-1" }))
+        .rejects.toThrow("A Codex command is already running")
+      await expect(coordinator.editUserPrompt({ type: "chat.editUserPrompt", chatId: "chat-1", messageId: "prompt-1", content: "edited request" }))
+        .rejects.toThrow("A Codex command is already running")
+      expect(forkCalls).toBe(0)
+    } finally {
+      release()
+      await command
+    }
+  })
 })
 
 describe("AgentCoordinator claude integration", () => {
@@ -9237,25 +9292,5 @@ describe("Codex async question answers", () => {
     } finally { await f.coordinator.cancel("chat-1") }
   })
 })
-
-
-  for (const busyState of ["Claude startup", "pending Codex steer"] as const)
-test(`does not start a Codex command during ${busyState}`, async () => {
-      const store = createFakeStore()
-      store.chat.provider = "codex"
-      store.chat.sessionToken = "thread-1"
-      let commandCalls = 0
-      const coordinator = new AgentCoordinator({
-        store: store as never,
-        onStateChange: () => {},
-        codexManager: { async runSlashCommand() { commandCalls += 1 } } as never,
-      })
-      if (busyState === "Claude startup") (coordinator as any).startingClaudeTurns.set("chat-1", Symbol("startup"))
-      else (coordinator as any).pendingCodexSteers.set("chat-1", new Set(["queued-1"]))
-      await expect(coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "/compact" }))
-        .rejects.toThrow("/compact cannot run while a turn is active")
-      expect(commandCalls).toBe(0)
-      expect(store.messages).toEqual([])
-    })
 
 afterAll(() => {for(const dir of fakeStoreDirectories) rmSync(dir,{recursive:true,force:true})})
