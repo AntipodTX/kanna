@@ -1,41 +1,7 @@
-import type {
-  AgentProvider,
-  ClaudeReasoningEffort,
-  ClaudeModelOptions,
-  CodexModelOptions,
-  CursorModelOptions,
-  ClaudeContextWindow,
-  FaveModel,
-  GrokModelOptions,
-  ModelOptions,
-  PiModelOptions,
-  ProviderCatalogEntry,
-  ProviderModelOption,
-  ServiceTier,
-} from "../shared/types"
-import {
-  CLAUDE_REASONING_OPTIONS,
-  CLAUDE_CONTEXT_WINDOW_OPTIONS,
-  DEFAULT_CLAUDE_MODEL_OPTIONS,
-  DEFAULT_CURSOR_MODEL_OPTIONS,
-  PROVIDERS,
-  codexReasoningEffortLabel,
-  deriveModelLabel,
-  withPiFaveModels,
-  normalizeClaudeContextWindow,
-  normalizeClaudeFastMode,
-  normalizeCodexReasoningEffort,
-  normalizeGrokReasoningEffort,
-  normalizePiReasoningEffort,
-  normalizeProviderModelId,
-  isClaudeReasoningEffort,
-  isClaudeReasoningEffortSupported,
-  isCodexReasoningEffort,
-  isGrokReasoningEffort,
-  isPiReasoningEffort,
-  modelIdFamily,
-  supportsProviderFastMode,
-} from "../shared/types"
+import type { AgentProvider, ClaudeModelOptions, CodexModelOptions, CursorModelOptions, ClaudeContextWindow, FaveModel, GrokModelOptions, ModelOptions, PiModelOptions, ProviderCatalogEntry, ProviderModelOption, ServiceTier, ClaudeReasoningEffort } from "../shared/types"
+import { CLAUDE_CONTEXT_WINDOW_OPTIONS, DEFAULT_CLAUDE_MODEL_OPTIONS, DEFAULT_CURSOR_MODEL_OPTIONS, PROVIDERS, codexReasoningEffortLabel, deriveModelLabel, withPiFaveModels, normalizeClaudeContextWindow, normalizeClaudeFastMode, normalizeCodexReasoningEffort, normalizeGrokReasoningEffort, normalizePiReasoningEffort, normalizeProviderModelId, isClaudeReasoningEffort, isCodexReasoningEffort, isGrokReasoningEffort, isPiReasoningEffort, modelIdFamily, supportsProviderFastMode, CLAUDE_REASONING_OPTIONS, isClaudeReasoningEffortSupported, CLAUDE_STANDARD_REASONING_EFFORT_LEVELS } from "../shared/types"
+
+
 
 export interface ClaudeSdkModelInfo {
   value: string
@@ -380,15 +346,21 @@ export function getServerProviderModelOption(
 }
 
 /** Undefined means that the SDK must receive no effort override for this model. */
+
+
 function resolveServerClaudeReasoningEffort(modelId: string, effort?: unknown): ClaudeReasoningEffort | undefined {
   const model = getServerProviderModelOption("claude", modelId)
   if (model && !model.supportsEffort) return undefined
-  const normalizedEffort = isClaudeReasoningEffort(effort)
-    ? effort
-    : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
-  return isClaudeReasoningEffortSupported(model, normalizedEffort)
-    ? normalizedEffort
-    : DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
+  const supported = model?.supportedEffortLevels
+    ?? CLAUDE_STANDARD_REASONING_EFFORT_LEVELS
+  if (supported.length === 0) return undefined
+  if (isClaudeReasoningEffort(effort) && supported.includes(effort)) return effort
+  const fallback = DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
+  if (supported.includes(fallback)) return fallback
+  const order = CLAUDE_REASONING_OPTIONS.map((option) => option.id)
+  const target = order.indexOf(fallback)
+  return supported.reduce((nearest, candidate) =>
+    Math.abs(order.indexOf(candidate) - target) < Math.abs(order.indexOf(nearest) - target) ? candidate : nearest)
 }
 
 export function getServerClaudeRuntimeEffort(modelId: string, effort?: unknown): Exclude<ClaudeReasoningEffort, "ultracode"> | undefined {
@@ -401,7 +373,6 @@ export function normalizeServerClaudeReasoningEffort(modelId: string, effort?: u
   // effort control. The runtime boundary omits that override in this case.
   return resolveServerClaudeReasoningEffort(modelId, effort) ?? DEFAULT_CLAUDE_MODEL_OPTIONS.reasoningEffort
 }
-
 export function normalizeClaudeModelOptions(
   model: string,
   modelOptions?: ModelOptions,

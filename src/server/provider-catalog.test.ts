@@ -1,22 +1,6 @@
-import { CLAUDE_REASONING_OPTIONS } from "../shared/types"
-import { getServerClaudeRuntimeEffort } from "./provider-catalog"
+import { CLAUDE_REASONING_OPTIONS, DEFAULT_PI_FAVE_MODELS, DEFAULT_PI_MODEL, resolveClaudeApiModelId } from "../shared/types"
+import { getServerClaudeRuntimeEffort, SERVER_PROVIDERS, applyClaudeSdkModels, applyCodexModels, applyCursorModels, applyGrokModels, applyPiFaveModels, cursorModelIdForOptions, normalizeClaudeModelOptions, normalizeCodexModelOptions, normalizeCursorModelOptions, normalizeServerModel, resetServerProvidersForTests, serviceTierFromModelOptions } from "./provider-catalog"
 import { afterEach, describe, expect, test } from "bun:test"
-import {
-  SERVER_PROVIDERS,
-  applyClaudeSdkModels,
-  applyCodexModels,
-  applyCursorModels,
-  applyGrokModels,
-  applyPiFaveModels,
-  cursorModelIdForOptions,
-  normalizeClaudeModelOptions,
-  normalizeCodexModelOptions,
-  normalizeCursorModelOptions,
-  normalizeServerModel,
-  resetServerProvidersForTests,
-  serviceTierFromModelOptions,
-} from "./provider-catalog"
-import { DEFAULT_PI_FAVE_MODELS, DEFAULT_PI_MODEL, resolveClaudeApiModelId } from "../shared/types"
 
 describe("provider catalog normalization", () => {
   test("Claude SDK effort stays native while recognized preferences are preserved", () => {
@@ -476,5 +460,30 @@ describe("provider catalog normalization", () => {
       { value: "sonnet[1m]", resolvedModel: "claude-sonnet-5[1m]", displayName: "Sonnet (1M context)", supportsEffort: true },
       { value: "nova", resolvedModel: "claude-nova-2", displayName: "Nova" },
     ])).toBe(false)
+  })
+
+
+  test("Claude fallback belongs to the SDK's supported effort set", () => {
+    applyClaudeSdkModels([{ value: "opus", supportsEffort: true, supportedEffortLevels: ["low", "medium"] }])
+    expect(normalizeClaudeModelOptions("opus").reasoningEffort).toBe("medium")
+    expect(normalizeClaudeModelOptions("opus", { claude: { reasoningEffort: "max" } }).reasoningEffort).toBe("medium")
+    expect(normalizeClaudeModelOptions("opus", undefined, "low").reasoningEffort).toBe("low")
+  })
+
+
+  test("Claude fallback supports a max-only SDK model and normalized aliases", () => {
+    applyClaudeSdkModels([{ value: "opus", resolvedModel: "claude-opus-4-8", supportsEffort: true, supportedEffortLevels: ["max"] }])
+    expect(normalizeClaudeModelOptions("claude-opus-4-8").reasoningEffort).toBe("max")
+    expect(normalizeClaudeModelOptions("opus", undefined, "low").reasoningEffort).toBe("max")
+  })
+
+
+  test("Claude wire options omit effort when the SDK disables or cannot support it", () => {
+    applyClaudeSdkModels([{ value: "haiku", supportsEffort: false, supportedEffortLevels: ["low"] }])
+    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
+    applyClaudeSdkModels([{ value: "haiku", supportsEffort: true, supportedEffortLevels: [] }])
+    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
+    applyClaudeSdkModels([{ value: "haiku", supportsEffort: true, supportedEffortLevels: ["future-effort"] }])
+    expect(getServerClaudeRuntimeEffort("haiku", "high")).toBeUndefined()
   })
 })
