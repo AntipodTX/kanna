@@ -28,7 +28,7 @@ export function useChatCommands(params: {
   // Wraps socket.command with the shared error handling. Most handlers clear
   // the command error on success; a few (cancel, stop-draining, tool responses)
   // historically leave it untouched — they pass keepCommandError.
-  const wrapCommand = useCallback(async (command: SocketCommand, options?: { keepCommandError?: boolean }) => {
+  const wrapCommand = useCallback(async (command: SocketCommand, options?: { keepCommandError?: boolean; throwOnError?: boolean }) => {
     try {
       await socket.command(command)
       if (!options?.keepCommandError) {
@@ -36,6 +36,7 @@ export function useChatCommands(params: {
       }
     } catch (error) {
       setCommandError(error instanceof Error ? error.message : String(error))
+      if (options?.throwOnError) throw error
     }
   }, [setCommandError, socket])
 
@@ -89,13 +90,13 @@ export function useChatCommands(params: {
     questions: AskUserQuestionItem[],
     answers: AskUserQuestionAnswerMap
   ) => {
-    if (!activeChatId) return
+    if (!activeChatId) throw new Error("No active chat")
     await wrapCommand({
       type: "chat.respondTool",
       chatId: activeChatId,
       toolUseId,
       result: { questions, answers },
-    }, { keepCommandError: true })
+    }, { throwOnError: true })
   }, [activeChatId, wrapCommand])
 
   const handleExitPlanMode = useCallback(async (toolUseId: string, confirmed: boolean, clearContext?: boolean, message?: string) => {

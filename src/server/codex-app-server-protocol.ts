@@ -719,20 +719,8 @@ export interface AgentMessageItem {
   text: string
   phase?: string
   delivery?: "async" | null
+  questions?: import("../shared/codex-questions").CodexAsyncQuestion[] | null
 }
-
-export type RawResponseItem =
-  | {
-      type: "message"
-      role: string
-      content: Array<{
-        type: "input_text" | "input_image" | "output_text"
-        text?: string
-        image_url?: string
-      }>
-      phase?: string | null
-    }
-  | Record<string, unknown>
 
 export interface PlanItem {
   type: "plan"
@@ -958,3 +946,16 @@ export function isServerNotification(value: unknown): value is ServerNotificatio
     || candidate.method === "account/rateLimits/updated"
     || candidate.method === "error"
 }
+
+export type RawResponseItem =
+  | {
+      type: "message"
+      role: string
+      content: Array<{
+        type: "input_text" | "input_image" | "output_text"
+        text?: string
+        image_url?: string
+      }>
+      phase?: string | null
+    }
+  | Record<string, unknown>

@@ -1794,7 +1794,11 @@ interface ToolCallBase<TKind extends string, TInput> {
 }
 
 export interface AskUserQuestionToolCall
-  extends ToolCallBase<"ask_user_question", { questions: AskUserQuestionItem[] }> { }
+  extends ToolCallBase<"ask_user_question", {
+    questions: AskUserQuestionItem[]
+    /** A non-blocking Codex message, answered by ordinary user input. */
+    codexAsync?: { threadId: string }
+  }> { }
 
 export interface ExitPlanModeToolCall
   extends ToolCallBase<"exit_plan_mode", { plan?: string; summary?: string }> { }
