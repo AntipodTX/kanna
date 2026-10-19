@@ -22,18 +22,34 @@ export interface InitializeParams {
   }
   capabilities: {
     experimentalApi: boolean
+    requestAttestation: boolean
   }
 }
+
+export type CodexApprovalPolicy =
+  | "never"
+  | "on-request"
+  | "on-failure"
+  | "untrusted"
+  | {
+      granular: {
+        sandbox_approval: boolean
+        rules: boolean
+        skill_approval: boolean
+        request_permissions: boolean
+        mcp_elicitations: boolean
+      }
+    }
 
 export interface ThreadStartParams {
   config?: Record<string, unknown>
   model?: string | null
   cwd?: string | null
   serviceTier?: ServiceTier | null
-  approvalPolicy?: "never" | "on-request" | "on-failure" | "untrusted" | null
+  approvalPolicy?: CodexApprovalPolicy | null
   sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null
-  experimentalRawEvents: boolean
-  persistExtendedHistory: boolean
+  experimentalRawEvents?: boolean
+  persistExtendedHistory?: boolean
 }
 
 export interface ThreadResumeParams {
@@ -42,9 +58,9 @@ export interface ThreadResumeParams {
   model?: string | null
   cwd?: string | null
   serviceTier?: ServiceTier | null
-  approvalPolicy?: "never" | "on-request" | "on-failure" | "untrusted" | null
+  approvalPolicy?: CodexApprovalPolicy | null
   sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null
-  persistExtendedHistory: boolean
+  persistExtendedHistory?: boolean
 }
 
 export interface ThreadForkParams {
@@ -53,10 +69,10 @@ export interface ThreadForkParams {
   model?: string | null
   cwd?: string | null
   serviceTier?: ServiceTier | null
-  approvalPolicy?: "never" | "on-request" | "on-failure" | "untrusted" | null
+  approvalPolicy?: CodexApprovalPolicy | null
   sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null
   ephemeral?: boolean
-  persistExtendedHistory: boolean
+  persistExtendedHistory?: boolean
 }
 
 export interface TextUserInput {
@@ -93,7 +109,7 @@ export type ReasoningEffort = CodexReasoningEffort
 export interface TurnStartParams {
   threadId: string
   input: CodexUserInput[]
-  approvalPolicy?: "never" | "on-request" | "on-failure" | "untrusted" | null
+  approvalPolicy?: CodexApprovalPolicy | null
   model?: string | null
   effort?: ReasoningEffort | null
   serviceTier?: ServiceTier | null
@@ -234,7 +250,7 @@ export interface TurnCompletedNotification {
 
 export interface TurnPlanStep {
   step: string
-  status: "pending" | "inProgress" | "completed"
+  status: "pending" | "inProgress" | "in_progress" | "completed"
 }
 
 export interface TurnPlanUpdatedNotification {
@@ -325,6 +341,40 @@ export interface FileChangeRequestApprovalParams {
   grantRoot?: string | null
 }
 
+export interface AdditionalNetworkPermissions {
+  enabled: boolean | null
+}
+
+export interface AdditionalFileSystemPermissions {
+  read: string[] | null
+  write: string[] | null
+  globScanMaxDepth?: number
+  entries?: unknown[]
+}
+
+export interface RequestPermissionProfile {
+  network: AdditionalNetworkPermissions | null
+  fileSystem: AdditionalFileSystemPermissions | null
+}
+
+export interface GrantedPermissionProfile {
+  network?: AdditionalNetworkPermissions
+  fileSystem?: AdditionalFileSystemPermissions
+}
+
+export type PermissionGrantScope = "turn" | "session"
+
+export interface PermissionsRequestApprovalParams {
+  threadId: string
+  turnId: string
+  itemId: string
+  environmentId: string | null
+  startedAtMs: number
+  cwd: string
+  reason?: string | null
+  permissions: RequestPermissionProfile
+}
+
 export type CommandExecutionApprovalDecision =
   | "accept"
   | "acceptForSession"
@@ -343,6 +393,107 @@ export interface CommandExecutionRequestApprovalResponse {
 
 export interface FileChangeRequestApprovalResponse {
   decision: FileChangeApprovalDecision
+}
+
+export type McpServerElicitationAction = "accept" | "decline" | "cancel"
+
+interface McpServerElicitationRequestBase {
+  threadId: string
+  turnId: string | null
+  serverName: string
+}
+
+export type McpServerElicitationRequestParams = McpServerElicitationRequestBase & (
+  | {
+      mode: "form"
+      _meta: unknown | null
+      message: string
+      requestedSchema: unknown
+    }
+  | {
+      mode: "openai/form"
+      _meta: unknown | null
+      message: string
+      requestedSchema: unknown
+    }
+  | {
+      mode: "url"
+      _meta: unknown | null
+      message: string
+      url: string
+      elicitationId: string
+    }
+)
+
+export interface McpServerElicitationRequestResponse {
+  action: McpServerElicitationAction
+  content: unknown | null
+  _meta: unknown | null
+}
+
+export interface PermissionsRequestApprovalResponse {
+  permissions: GrantedPermissionProfile
+  scope: PermissionGrantScope
+  strictAutoReview?: boolean
+}
+
+export interface ParsedCommand {
+  type: string
+  cmd?: string
+  args?: string[]
+  name?: string
+  [key: string]: unknown
+}
+
+export type ReviewDecision =
+  | "approved"
+  | { approved_execpolicy_amendment: unknown }
+  | "approved_for_session"
+  | "approved_mcp_policy_amendment"
+  | { network_policy_amendment: unknown }
+  | { denied: { rejection: string } }
+  | "timed_out"
+  | "abort"
+
+export interface ExecCommandApprovalParams {
+  conversationId: string
+  callId: string
+  approvalId: string | null
+  command: string[]
+  cwd: string
+  reason: string | null
+  parsedCmd: ParsedCommand[]
+}
+
+export interface ExecCommandApprovalResponse {
+  decision: ReviewDecision
+}
+
+export type ApplyPatchFileChange =
+  | {
+      type: "add"
+      content: string
+    }
+  | {
+      type: "delete"
+      content: string
+    }
+  | {
+      type: "update"
+      unified_diff: string
+      move_path: string | null
+    }
+
+export interface ApplyPatchApprovalParams {
+  conversationId: string
+  callId: string
+  fileChanges: Record<string, ApplyPatchFileChange>
+  reason: string | null
+  grantRoot: string | null
+}
+
+export interface ApplyPatchApprovalResponse {
+  decision: ReviewDecision
 }
 
 export interface ToolRequestUserInputRequest {
@@ -388,11 +539,39 @@ export interface FileChangeRequestApprovalRequest {
   params: FileChangeRequestApprovalParams
 }
 
+export interface McpServerElicitationRequest {
+  id: CodexRequestId
+  method: "mcpServer/elicitation/request"
+  params: McpServerElicitationRequestParams
+}
+
+export interface PermissionsRequestApprovalRequest {
+  id: CodexRequestId
+  method: "item/permissions/requestApproval"
+  params: PermissionsRequestApprovalParams
+}
+
+export interface ExecCommandApprovalRequest {
+  id: CodexRequestId
+  method: "execCommandApproval"
+  params: ExecCommandApprovalParams
+}
+
+export interface ApplyPatchApprovalRequest {
+  id: CodexRequestId
+  method: "applyPatchApproval"
+  params: ApplyPatchApprovalParams
+}
+
 export type ServerRequest =
   | ToolRequestUserInputRequest
   | DynamicToolCallRequest
   | CommandExecutionRequestApprovalRequest
   | FileChangeRequestApprovalRequest
+  | McpServerElicitationRequest
+  | PermissionsRequestApprovalRequest
+  | ExecCommandApprovalRequest
+  | ApplyPatchApprovalRequest
 
 export interface UserMessageItem {
   type: "userMessage"
@@ -416,6 +595,7 @@ export interface AgentMessageItem {
   id: string
   text: string
   phase?: string
+  delivery?: "async" | null
 }
 
 export interface PlanItem {
@@ -597,6 +777,10 @@ export function isServerRequest(value: unknown): value is ServerRequest {
     || candidate.method === "item/tool/call"
     || candidate.method === "item/commandExecution/requestApproval"
     || candidate.method === "item/fileChange/requestApproval"
+    || candidate.method === "mcpServer/elicitation/request"
+    || candidate.method === "item/permissions/requestApproval"
+    || candidate.method === "execCommandApproval"
+    || candidate.method === "applyPatchApproval"
 }
 
 export function isServerNotification(value: unknown): value is ServerNotification {
