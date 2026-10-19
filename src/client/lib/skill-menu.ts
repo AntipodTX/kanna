@@ -1,4 +1,4 @@
-import type { HarnessSkill } from "../../shared/types"
+import type { AgentProvider, HarnessSkill } from "../../shared/types"
 
 /**
  * Helpers for the composer's "/" skill menu. Pure functions so they can be
@@ -7,7 +7,7 @@ import type { HarnessSkill } from "../../shared/types"
  * The menu opens while the caret sits inside a trigger token ("/name", or
  * "$name" on codex) that opens the message or follows whitespace, so a skill
  * can go anywhere in the prompt and a prompt can name several. The server
- * finds every "/name" at send time and hands each one to the harness
+ * finds every provider-specific mention at send time and hands each one to the harness
  * (harness-skills.ts).
  */
 
@@ -73,8 +73,16 @@ function isSubsequence(needle: string, haystack: string): boolean {
  * quality: the best match sits at the BOTTOM, adjacent to the input bar, so
  * the default selection is the item closest to where the user is typing.
  */
-export function filterSkillMenuItems(skills: HarnessSkill[], query: string): HarnessSkill[] {
+export function filterSkillMenuItems(
+  skills: HarnessSkill[],
+  query: string,
+  options?: { provider: AgentProvider; trigger: string }
+): HarnessSkill[] {
   return skills
+    .filter((skill) => {
+      if (options?.provider !== "codex") return true
+      return options.trigger === "/" ? skill.source === "command" : skill.source !== "command"
+    })
     .map((skill, index) => ({ skill, index, score: scoreSkill(skill, query) }))
     .filter((entry) => entry.score > 0)
     .sort((left, right) =>
@@ -87,10 +95,9 @@ export function filterSkillMenuItems(skills: HarnessSkill[], query: string): Har
 }
 
 /**
- * Swap the trigger token under the caret for "/name", keeping the text around
- * it, and put the caret after the space that follows. Always completes to the
- * "/" form — "$" is only an input convenience; "/" is the canonical
- * invocation the server-side translation understands on every harness.
+ * Swap the trigger token under the caret for the selected name, keeping both
+ * the provider-native trigger and the text around it, then put the caret after
+ * the following space.
  */
 export function applySkillCompletion(
   value: string,
@@ -99,7 +106,8 @@ export function applySkillCompletion(
 ): { value: string; caret: number } {
   const tokenEnd = mention.start + 1 + (value.slice(mention.start + 1).match(/^[^\s]*/)?.[0].length ?? 0)
   const rest = value.slice(tokenEnd)
-  const inserted = rest.startsWith(" ") || rest.startsWith("\n") ? `/${skillName}` : `/${skillName} `
+  const trigger = value[mention.start] === "$" ? "$" : "/"
+  const inserted = rest.startsWith(" ") || rest.startsWith("\n") ? `${trigger}${skillName}` : `${trigger}${skillName} `
   return {
     value: `${value.slice(0, mention.start)}${inserted}${rest}`,
     caret: mention.start + skillName.length + 2,
